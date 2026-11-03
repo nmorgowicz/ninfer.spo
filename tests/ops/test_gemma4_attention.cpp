@@ -120,14 +120,16 @@ int run_case(const char* label, int head_dim, int q_heads, int kv_heads, int tok
     const std::size_t capacity =
         ops::gemma4_attention_workspace_capacity_bytes(head_dim, q_heads, kv_heads, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
-    ops::gemma4_attention(q_tensor, k_tensor, v_tensor, table_tensor, pos_tensor, window, 1.0f,
+    const ops::Gemma4CacheView cache{ops::Gemma4KvFormat::BFloat16, &k_tensor, &v_tensor,
+                                    nullptr, nullptr, &table_tensor};
+    ops::gemma4_attention(q_tensor, cache, pos_tensor, window, 1.0f,
                           out_tensor, workspace, nullptr);
     cuda_synchronize();
     std::vector<std::uint16_t> first_bits(q_count), second_bits(q_count);
     dout.copy_to_host(first_bits.data(), dout.bytes());
     int failures =
         verify_pointwise(label, from_device_bf16(dout.data(), q_count), expected, kCriterion);
-    ops::gemma4_attention(q_tensor, k_tensor, v_tensor, table_tensor, pos_tensor, window, 1.0f,
+    ops::gemma4_attention(q_tensor, cache, pos_tensor, window, 1.0f,
                           out_tensor, workspace, nullptr);
     cuda_synchronize();
     dout.copy_to_host(second_bits.data(), dout.bytes());

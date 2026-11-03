@@ -269,6 +269,7 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
     sequence_memory = memory.get("sequence", {})
     workspace_memory = memory.get("workspace", {})
     vision_workspace = memory.get("vision_workspace") or {}
+    gemma4_kv = memory.get("gemma4_kv") or {}
     rows = []
     for test in report.get("tests", []):
         speculative = test.get("speculative", {})
@@ -310,6 +311,11 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "host_to_device_bytes": load.get("host_to_device_bytes"),
             "peak_staging_bytes": load.get("peak_staging_bytes"),
             "kv_payload_bytes": memory.get("kv_payload_bytes"),
+            "gemma4_kv_requested": gemma4_kv.get("requested"),
+            "gemma4_kv_global": gemma4_kv.get("global"),
+            "gemma4_kv_sliding": gemma4_kv.get("sliding"),
+            "gemma4_global_payload_bytes": gemma4_kv.get("global_payload_bytes"),
+            "gemma4_sliding_payload_bytes": gemma4_kv.get("sliding_payload_bytes"),
             "weights_capacity_bytes": weights_memory.get("capacity_bytes"),
             "sequence_capacity_bytes": sequence_memory.get("capacity_bytes"),
             "workspace_capacity_bytes": workspace_memory.get("capacity_bytes"),

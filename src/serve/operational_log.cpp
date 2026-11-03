@@ -460,6 +460,14 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_count(memory.kv_capacity_max_page_groups),
                   product::format_pretty_bytes(memory.runtime_reservation_bytes),
                   product::format_pretty_bytes(memory.available_after_startup_bytes));
+    if (memory.gemma4_kv) {
+        const auto& kv = *memory.gemma4_kv;
+        logger_->info("Gemma KV | requested {} | global {} ({}) | sliding {} ({})",
+                      kv_cache_name(kv.requested), kv_cache_name(kv.global),
+                      product::format_pretty_bytes(kv.global_payload_bytes),
+                      kv_cache_name(kv.sliding),
+                      product::format_pretty_bytes(kv.sliding_payload_bytes));
+    }
 
     logger_->info("context | history {} | {} active + {} extra device states | host {}",
                   cache.enabled ? "on" : "off", engine.max_concurrency, *cache.device_state_slots,

@@ -149,8 +149,10 @@ int run_case(const Case& c) {
     Tensor k_pages_ref(dk_pages_ref.data(), DType::BF16, {d, kPage, c.kv_heads, pages});
     Tensor v_pages_ref(dv_pages_ref.data(), DType::BF16, {d, kPage, c.kv_heads, pages});
 
+    const ops::Gemma4CacheView cache{ops::Gemma4KvFormat::BFloat16, &k_pages, &v_pages,
+                                    nullptr, nullptr, &table_tensor};
     ops::gemma4_qkv_prep(qkv_tensor, q_norm_tensor, k_norm_tensor, pos_tensor, c.rotary_dim,
-                         c.theta, kEps, c.v_from_k, q_out, k_pages, v_pages, table_tensor, nullptr);
+                         c.theta, kEps, c.v_from_k, q_out, cache, nullptr);
 
     Tensor q_in(dq.data(), DType::BF16, {d, c.q_heads, c.tokens});
     Tensor k_in(dk.data(), DType::BF16, {d, c.kv_heads, c.tokens});

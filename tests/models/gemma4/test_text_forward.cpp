@@ -110,7 +110,9 @@ int main() {
     Tensor block(dtable.data(), DType::I32, {1});
     Tensor k_pages(dk.data(), DType::BF16, {kDim, 64, kKv, 1});
     Tensor v_pages(dv.data(), DType::BF16, {kDim, 64, kKv, 1});
-    models::gemma4::gemma4_layer(x, weights, pos, k_pages, v_pages, block, gemm, workspace, stream);
+    const ops::Gemma4CacheView cache{.k_pages = &k_pages, .v_pages = &v_pages,
+                                     .block_table = &block};
+    models::gemma4::gemma4_layer(x, weights, pos, cache, gemm, workspace, stream);
     if (cudaStreamSynchronize(stream) != cudaSuccess) {
         std::cerr << "FAIL sync\n";
         return 1;
@@ -138,8 +140,7 @@ int main() {
         Tensor column(static_cast<std::uint16_t*>(dx.data()) + token * kHidden, DType::BF16,
                       {kHidden, 1});
         Tensor one_pos(static_cast<std::int32_t*>(dpos.data()) + token, DType::I32, {1});
-        models::gemma4::gemma4_layer(column, weights, one_pos, k_pages, v_pages, block, gemm,
-                                     workspace, stream);
+        models::gemma4::gemma4_layer(column, weights, one_pos, cache, gemm, workspace, stream);
     }
     if (cudaStreamSynchronize(stream) != cudaSuccess) {
         std::cerr << "FAIL sync stepwise\n";
@@ -180,7 +181,7 @@ int main() {
     dk.copy_from_host(std::vector<std::uint16_t>(page, 0).data(), dk.bytes());
     dv.copy_from_host(std::vector<std::uint16_t>(page, 0).data(), dv.bytes());
     workspace.reset();
-    models::gemma4::gemma4_layer(x, weights, pos, k_pages, v_pages, block, gemm, workspace, stream);
+    models::gemma4::gemma4_layer(x, weights, pos, cache, gemm, workspace, stream);
     if (cudaStreamSynchronize(stream) != cudaSuccess) {
         std::cerr << "FAIL sync zero\n";
         cudaStreamDestroy(stream);

@@ -120,7 +120,10 @@ struct Cache {
             k_pages.emplace_back(k_store.back().p, ninfer::DType::BF16, shape);
             v_pages.emplace_back(v_store.back().p, ninfer::DType::BF16, shape);
         }
-        for (std::size_t i = 0; i < count; ++i) { layers.push_back({&k_pages[i], &v_pages[i], &table}); }
+        for (std::size_t i = 0; i < count; ++i) {
+            layers.push_back({.k_pages = &k_pages[i], .v_pages = &v_pages[i],
+                               .block_table = &table});
+        }
     }
 
     // K then V of `layer` for positions [first, last] as BF16 [kv][positions][D].

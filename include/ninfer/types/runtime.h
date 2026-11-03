@@ -72,6 +72,16 @@ struct VisionWorkspaceMemorySummary {
     std::size_t handoff_peak_bytes        = 0;
 };
 
+// Present only for Gemma4's mixed global/sliding cache. Payloads include scale planes and all
+// allocated pool pages, but exclude ring checkpoint snapshots and workspace.
+struct Gemma4KvMemorySummary {
+    KvCacheStorage requested = KvCacheStorage::BFloat16;
+    KvCacheStorage global    = KvCacheStorage::BFloat16;
+    KvCacheStorage sliding   = KvCacheStorage::BFloat16;
+    std::size_t global_payload_bytes = 0;
+    std::size_t sliding_payload_bytes = 0;
+};
+
 struct MemorySummary {
     std::size_t activation_capacity_bytes     = 0;
     int device                                = 0;
@@ -95,6 +105,7 @@ struct MemorySummary {
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
     std::size_t kv_payload_bytes                  = 0;
+    std::optional<Gemma4KvMemorySummary> gemma4_kv;
     // One shared physical Host context backing. Reserved bytes are included in occupied bytes;
     // State/KV occupancy below is a breakdown and must not be added to this ledger again.
     std::uint32_t host_state_capacity_slots = 0;

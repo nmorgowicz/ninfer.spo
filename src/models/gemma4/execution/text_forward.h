@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/gemma4_cache.h"
 #include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
@@ -47,7 +48,7 @@ struct Gemma4LayerWeights {
 };
 
 void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& positions,
-                  Tensor& k_pages, Tensor& v_pages, const Tensor& block_table,
+                  const ops::Gemma4CacheView& cache,
                   ops::Bf16GemmContext& gemm, WorkspaceArena& workspace, cudaStream_t stream);
 
 // Workspace bytes gemma4_layer and gemma4_logits need for at most `tokens` columns.
@@ -63,11 +64,7 @@ struct Gemma4Embedding {
     float scale = 1.0f;
 };
 
-struct Gemma4CacheLayer {
-    Tensor* k_pages           = nullptr;
-    Tensor* v_pages           = nullptr;
-    const Tensor* block_table = nullptr;
-};
+using Gemma4CacheLayer = ops::Gemma4CacheView;
 
 // Embed ids into `hidden` [hidden,T] and run every layer, appending K/V at `positions`.
 // visual_embeddings [hidden,V] and visual_indices [V] overwrite those columns after embed.

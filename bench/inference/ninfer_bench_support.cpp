@@ -704,6 +704,14 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
                 ? std::to_string(env.decode_graph_prime_output_tokens) + " outputs"
                 : "n/a")
         << " repetitions=" << env.repetitions << " warmup=" << env.warmup << "\n\n";
+    if (env.memory.gemma4_kv) {
+        const auto& kv = *env.memory.gemma4_kv;
+        out << "  Gemma4 KV: requested=" << kv_cache_name(kv.requested)
+            << " global=" << kv_cache_name(kv.global) << " sliding=" << kv_cache_name(kv.sliding)
+            << " global_payload=" << format_bytes(kv.global_payload_bytes)
+            << " sliding_payload=" << format_bytes(kv.sliding_payload_bytes)
+            << " resolved_capacity=" << env.memory.kv_capacity << " tokens\n\n";
+    }
 
     constexpr std::size_t cols                   = 10;
     const std::array<std::string, cols> headings = {
@@ -791,6 +799,14 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"kv_capacity_max_page_groups\": " << env.memory.kv_capacity_max_page_groups
         << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.memory.kv_cache) << "\",\n";
+    if (env.memory.gemma4_kv) {
+        const auto& kv = *env.memory.gemma4_kv;
+        out << "    \"gemma4_kv\": {\"requested\": \"" << kv_cache_name(kv.requested)
+            << "\", \"global\": \"" << kv_cache_name(kv.global)
+            << "\", \"sliding\": \"" << kv_cache_name(kv.sliding)
+            << "\", \"global_payload_bytes\": " << kv.global_payload_bytes
+            << ", \"sliding_payload_bytes\": " << kv.sliding_payload_bytes << "},\n";
+    }
     append_arena_json(out, "weights", env.memory.weights, "    ", true);
     append_arena_json(out, "sequence", env.memory.sequence, "    ", true);
     append_arena_json(out, "workspace", env.memory.workspace, "    ", true);
@@ -925,7 +941,9 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
            "constraint_choices,mixed_constraints,"
            "speculative_"
            "backend,draft_tokens,"
-           "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
+           "proposal_head,decode_path,kv_cache,kv_capacity,gemma4_kv_requested,gemma4_kv_global,"
+           "gemma4_kv_sliding,gemma4_global_payload_bytes,gemma4_sliding_payload_bytes,"
+           "kv_payload_bytes,load_host_to_device_bytes,"
            "weights_capacity_bytes,sequence_capacity_bytes,workspace_capacity_bytes,"
            "workspace_general_capacity_bytes,vision_handoff_capacity_bytes,"
            "cuda_graph_allowance_bytes,"
@@ -963,7 +981,15 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << ','
             << proposal_head_name(env.speculative.proposal_head) << ','
             << decode_path_name(env.use_cuda_graph, env.speculative) << ','
-            << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
+            << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_capacity << ','
+            << (env.memory.gemma4_kv ? kv_cache_name(env.memory.gemma4_kv->requested) : "") << ','
+            << (env.memory.gemma4_kv ? kv_cache_name(env.memory.gemma4_kv->global) : "") << ','
+            << (env.memory.gemma4_kv ? kv_cache_name(env.memory.gemma4_kv->sliding) : "") << ','
+            << (env.memory.gemma4_kv
+                    ? std::to_string(env.memory.gemma4_kv->global_payload_bytes) : "") << ','
+            << (env.memory.gemma4_kv
+                    ? std::to_string(env.memory.gemma4_kv->sliding_payload_bytes) : "") << ','
+            << env.memory.kv_payload_bytes << ','
             << env.load.host_to_device_bytes << ',' << env.memory.weights.capacity_bytes << ','
             << env.memory.sequence.capacity_bytes << ',' << env.memory.workspace.capacity_bytes
             << ','

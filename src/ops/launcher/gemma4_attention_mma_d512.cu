@@ -39,9 +39,11 @@ static_assert(kPagedKVPageSize % kBc == 0);
 // the same softmax state; warp w writes output columns [256 (w / 4), 256 (w / 4) + 256). One
 // staged K and V tile serves both halves. The arithmetic per row and column is the same as a
 // 4-warp CTA per output half, so the result does not depend on the split.
+template <bool Fp8>
 __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
-    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pages,
-    const __nv_bfloat16* __restrict__ v_pages, const std::int32_t* __restrict__ block_table,
+    const __nv_bfloat16* __restrict__ q, const void* __restrict__ k_pages,
+    const void* __restrict__ v_pages, const __half* __restrict__ k_scales,
+    const __half* __restrict__ v_scales, const std::int32_t* __restrict__ block_table,
     const std::int32_t* __restrict__ positions, __nv_bfloat16* __restrict__ out, int tokens,
     int q_heads, int kv_heads, int window, float scale, std::int32_t logical_pages,
     std::int32_t physical_pages) {
@@ -146,11 +148,23 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
     };
     const bool all_rows = rows == kRows;
 
+    const auto stage = [&](auto* dst, const void* pages, const __half* scales,
+                            int mapped, int k0) {
+        if constexpr (Fp8) {
+            gemma4_stage_fp8_keys<kD, kBc, kThreads>(
+                dst, static_cast<const std::uint8_t*>(pages), scales,
+                kv_heads, kvh, mapped, k0, last_key, 0, tid);
+        } else {
+            gemma4_stage_keys<kD, kD, kBc, kThreads>(
+                dst, static_cast<const __nv_bfloat16*>(pages),
+                kv_heads, kvh, mapped, k0, last_key, 0, tid);
+        }
+    };
+
     int physical = block_begin < block_end ? physical_of(block_begin) : -1;
     cp_commit();
     if (block_begin < block_end) {
-        gemma4_stage_keys<kD, kD, kBc, kThreads>(k_s, k_pages, kv_heads, kvh, physical,
-                                                 block_begin * kBc, last_key, 0, tid);
+        stage(k_s, k_pages, k_scales, physical, block_begin * kBc);
     }
     cp_commit();
 
@@ -161,8 +175,7 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
 
         cp_wait<0>();
         __syncthreads();
-        gemma4_stage_keys<kD, kD, kBc, kThreads>(v_s, v_pages, kv_heads, kvh, physical, k0,
-                                                 last_key, 0, tid);
+        stage(v_s, v_pages, v_scales, physical, k0);
         cp_commit();
 
         float score[kQkNt][4];
@@ -199,8 +212,7 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
         __syncthreads();
         if (block + 1 < block_end) {
             physical = next_physical;
-            gemma4_stage_keys<kD, kD, kBc, kThreads>(k_s, k_pages, kv_heads, kvh, physical,
-                                                     (block + 1) * kBc, last_key, 0, tid);
+            stage(k_s, k_pages, k_scales, physical, (block + 1) * kBc);
             cp_commit();
         }
 
@@ -335,14 +347,14 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
     }
 }
 
-} // namespace
-
-void gemma4_attention_mma_d512_launch(const Tensor& q, const Tensor& k_pages, const Tensor& v_pages,
-                                      const Tensor& block_table, const Tensor& positions,
-                                      int window, float scale, Tensor& out, cudaStream_t stream) {
+template <bool Fp8>
+void launch_d512(const Tensor& q, const Gemma4CacheView& cache, const Tensor& positions,
+                  int window, float scale, Tensor& out, cudaStream_t stream) {
+    const Tensor& k_pages = *cache.k_pages;
+    const Tensor& block_table = *cache.block_table;
     static bool configured = false;
     if (!configured) {
-        CUDA_CHECK(cudaFuncSetAttribute(gemma4_attention_d512_kernel,
+        CUDA_CHECK(cudaFuncSetAttribute(gemma4_attention_d512_kernel<Fp8>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         static_cast<int>(kSharedBytes)));
         configured = true;
@@ -350,13 +362,26 @@ void gemma4_attention_mma_d512_launch(const Tensor& q, const Tensor& k_pages, co
     const int tokens = q.ne[2];
     const dim3 grid(static_cast<unsigned>((tokens + kRows - 1) / kRows),
                     static_cast<unsigned>(q.ne[1]));
-    gemma4_attention_d512_kernel<<<grid, kThreads, kSharedBytes, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k_pages.data),
-        static_cast<const __nv_bfloat16*>(v_pages.data),
+    gemma4_attention_d512_kernel<Fp8><<<grid, kThreads, kSharedBytes, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), k_pages.data, cache.v_pages->data,
+        Fp8 ? static_cast<const __half*>(cache.k_scales->data) : nullptr,
+        Fp8 ? static_cast<const __half*>(cache.v_scales->data) : nullptr,
         static_cast<const std::int32_t*>(block_table.data),
         static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(out.data),
         tokens, q.ne[1], k_pages.ne[2], window, scale, block_table.ne[0], k_pages.ne[3]);
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void gemma4_attention_mma_d512_launch(const Tensor& q, const Gemma4CacheView& cache,
+                                      const Tensor& positions, int window, float scale,
+                                      Tensor& out, cudaStream_t stream) {
+    if (cache.format == Gemma4KvFormat::Fp8E4m3Row256) {
+        launch_d512<true>(q, cache, positions, window, scale, out, stream);
+    } else {
+        launch_d512<false>(q, cache, positions, window, scale, out, stream);
+    }
 }
 
 } // namespace ninfer::ops::detail

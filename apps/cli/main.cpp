@@ -194,6 +194,14 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
     print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
+    if (memory.gemma4_kv) {
+        const auto& kv = *memory.gemma4_kv;
+        print_metric("requested KV dtype", format_kv_cache(kv.requested));
+        print_metric("global KV dtype", format_kv_cache(kv.global));
+        print_metric("sliding KV dtype", format_kv_cache(kv.sliding));
+        print_metric("global KV payload", format_bytes(kv.global_payload_bytes));
+        print_metric("sliding KV payload", format_bytes(kv.sliding_payload_bytes));
+    }
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
     print_metric("free after weights", format_bytes(memory.available_after_weights_bytes));

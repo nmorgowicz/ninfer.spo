@@ -7,6 +7,7 @@
 #include "models/gemma4/execution/text_forward.h"
 #include "models/gemma4/execution/vision.h"
 #include "models/gemma4/program/prefill_graphs.h"
+#include "models/gemma4/program/kv_layout.h"
 #include "models/gemma4/program/prefix_cache.h"
 #include "models/gemma4/program/sliding_ring.h"
 #include "models/gemma4/program/top_tokens.h"
@@ -88,9 +89,10 @@ int sliding_window(const LoadedText& model) {
     return window;
 }
 
-std::size_t layer_kv_bytes(const Gemma4LayerWeights& layer, int pages) {
-    return 2U * static_cast<std::size_t>(layer.head_dim) * kKvPageTokens *
-           static_cast<std::size_t>(layer.kv_heads) * static_cast<std::size_t>(pages) * 2U;
+std::size_t layer_kv_bytes(const Gemma4LayerWeights& layer, int pages,
+                           KvCacheStorage format = KvCacheStorage::BFloat16) {
+    return kv_layer_layout(format, layer.global_layer, layer.head_dim, layer.kv_heads)
+               .page_bytes() * static_cast<std::size_t>(pages);
 }
 
 } // namespace
@@ -103,6 +105,9 @@ struct Program::Impl {
     int vocab              = 0;
     int hidden             = 0;
     std::uint32_t capacity = 0;
+    KvCacheStorage kv_storage = KvCacheStorage::BFloat16;
+    std::size_t global_payload_bytes = 0;
+    std::size_t sliding_payload_bytes = 0;
     std::uint32_t chunk    = 0;
     DeviceArena workspace;
     DeviceBuffer id_buf;
@@ -123,6 +128,10 @@ struct Program::Impl {
     std::vector<DeviceBuffer> v_store;
     std::vector<Tensor> k_pages;
     std::vector<Tensor> v_pages;
+    std::vector<DeviceBuffer> k_scale_store;
+    std::vector<DeviceBuffer> v_scale_store;
+    std::vector<Tensor> k_scales;
+    std::vector<Tensor> v_scales;
     // Global layers: `pool_pages` pages behind the live page table `block` (see PrefixCache).
     // Sliding layers: `ring_pages` physical pages behind `ring_block`.
     Tensor block;
@@ -208,14 +217,16 @@ struct Program::Impl {
     }
 
     Impl(LoadedText& loaded, std::uint32_t token_capacity, std::uint32_t prefill_chunk,
-         std::uint32_t drafts, cudaStream_t device_stream, const CacheBudget& budget)
+         std::uint32_t drafts, cudaStream_t device_stream, const CacheBudget& budget,
+         KvCacheStorage format)
         : model(&loaded), stream(device_stream), gemm(device_stream), vocab(loaded.vocab),
-          hidden(loaded.hidden), capacity(token_capacity),
+          hidden(loaded.hidden), capacity(token_capacity), kv_storage(format),
           chunk(std::clamp<std::uint32_t>(prefill_chunk, kMinChunk, kMaxChunk)),
           workspace(workspace_bytes(loaded, chunk)), draft_tokens(drafts) {
         if (vocab <= 0 || hidden <= 0 || loaded.layers.empty() || capacity == 0) {
             throw std::invalid_argument("gemma4 program: model is empty");
         }
+        (void)gemma4_kv_format(kv_storage);
         if (draft_tokens > kMaxDraftTokens || (draft_tokens > 0 && loaded.draft == nullptr)) {
             throw std::invalid_argument("gemma4 program: MTP needs the assistant and 1..15 drafts");
         }
@@ -244,30 +255,65 @@ struct Program::Impl {
         v_store.reserve(loaded.layers.size());
         k_pages.reserve(loaded.layers.size());
         v_pages.reserve(loaded.layers.size());
+        k_scale_store.reserve(loaded.layers.size());
+        v_scale_store.reserve(loaded.layers.size());
+        k_scales.reserve(loaded.layers.size());
+        v_scales.reserve(loaded.layers.size());
         caches.reserve(loaded.layers.size());
         for (const Gemma4LayerWeights& layer : loaded.layers) {
             const int layer_pages   = layer.global_layer ? pool_pages : ring_pages;
-            const std::size_t bytes = layer_kv_bytes(layer, layer_pages) / 2U;
+            const auto layout = kv_layer_layout(kv_storage, layer.global_layer, layer.head_dim,
+                                                 layer.kv_heads);
+            const std::size_t bytes = layout.code_page_bytes * layer_pages;
+            (layer.global_layer ? global_payload_bytes : sliding_payload_bytes) +=
+                layout.page_bytes() * layer_pages;
             k_store.emplace_back(bytes);
             v_store.emplace_back(bytes);
             k_store.back().fill(0);
             v_store.back().fill(0);
             const std::initializer_list<std::int32_t> shape{layer.head_dim, kKvPageTokens,
                                                             layer.kv_heads, layer_pages};
-            k_pages.emplace_back(k_store.back().p, DType::BF16, shape);
-            v_pages.emplace_back(v_store.back().p, DType::BF16, shape);
+            k_pages.emplace_back(k_store.back().p, layout.code_dtype, shape);
+            v_pages.emplace_back(v_store.back().p, layout.code_dtype, shape);
+            k_scale_store.emplace_back();
+            v_scale_store.emplace_back();
+            k_scales.emplace_back();
+            v_scales.emplace_back();
+            if (layout.scale_groups != 0) {
+                const auto scale_bytes = layout.scale_page_bytes * layer_pages;
+                k_scale_store.back() = DeviceBuffer(scale_bytes);
+                v_scale_store.back() = DeviceBuffer(scale_bytes);
+                k_scale_store.back().fill(0);
+                v_scale_store.back().fill(0);
+                const std::initializer_list<std::int32_t> scales_shape{
+                    layout.scale_groups, kKvPageTokens, layer.kv_heads, layer_pages};
+                k_scales.back() = Tensor(k_scale_store.back().p, DType::FP16, scales_shape);
+                v_scales.back() = Tensor(v_scale_store.back().p, DType::FP16, scales_shape);
+            }
         }
         PrefixCache::Config setup{.table_pages = pages,
                                   .table       = static_cast<std::int32_t*>(table_buf.p),
                                   .history     = budget.history};
         for (std::size_t index = 0; index < loaded.layers.size(); ++index) {
-            const bool global      = loaded.layers[index].global_layer;
+            const auto& layer = loaded.layers[index];
+            const bool global = layer.global_layer;
+            const auto layout = kv_layer_layout(kv_storage, global, layer.head_dim, layer.kv_heads);
             const Tensor* table_of = global ? &block : &ring_block;
-            caches.push_back({&k_pages[index], &v_pages[index], table_of});
-            const std::size_t page_bytes = layer_kv_bytes(loaded.layers[index], 1) / 2U;
+            caches.push_back({.format = layout.format,
+                              .k_pages = &k_pages[index],
+                              .v_pages = &v_pages[index],
+                              .k_scales = layout.scale_groups ? &k_scales[index] : nullptr,
+                              .v_scales = layout.scale_groups ? &v_scales[index] : nullptr,
+                              .block_table = table_of});
+            auto& regions = global ? setup.store.global : setup.store.ring;
             for (const DeviceBuffer* store : {&k_store[index], &v_store[index]}) {
-                (global ? setup.store.global : setup.store.ring)
-                    .push_back({static_cast<std::uint8_t*>(store->p), page_bytes});
+                regions.push_back({static_cast<std::uint8_t*>(store->p), layout.code_page_bytes});
+            }
+            if (layout.scale_groups != 0) {
+                for (const DeviceBuffer* store : {&k_scale_store[index], &v_scale_store[index]}) {
+                    regions.push_back({static_cast<std::uint8_t*>(store->p),
+                                       layout.scale_page_bytes});
+                }
             }
         }
         setup.store.pool_pages   = pool_pages;
@@ -717,16 +763,18 @@ struct Program::Impl {
 };
 
 Program::Program(LoadedText& model, std::uint32_t capacity, std::uint32_t prefill_chunk,
-                 std::uint32_t draft_tokens, cudaStream_t stream, const CacheBudget& cache)
-    : impl_(std::make_unique<Impl>(model, capacity, prefill_chunk, draft_tokens, stream, cache)) {}
+                 std::uint32_t draft_tokens, cudaStream_t stream, const CacheBudget& cache,
+                 KvCacheStorage kv_cache)
+    : impl_(std::make_unique<Impl>(model, capacity, prefill_chunk, draft_tokens, stream, cache,
+                                  kv_cache)) {}
 
 Program::~Program() = default;
 
-std::size_t Program::kv_bytes_per_token(const LoadedText& model) {
+std::size_t Program::kv_bytes_per_token(const LoadedText& model, KvCacheStorage kv_cache) {
     std::size_t bytes = 0;
     for (const Gemma4LayerWeights& layer : model.layers) {
         if (layer.global_layer) {
-            bytes += 2U * static_cast<std::size_t>(layer.head_dim) * layer.kv_heads * 2U;
+            bytes += layer_kv_bytes(layer, 1, kv_cache) / ops::kGemma4KvPageTokens;
         }
     }
     return bytes;
@@ -1128,7 +1176,15 @@ MemorySummary Program::memory_summary() const noexcept {
     MemorySummary summary;
     summary.max_context              = impl_->capacity;
     summary.kv_capacity              = impl_->capacity;
-    summary.kv_cache                 = KvCacheStorage::BFloat16;
+    // kv_cache is the global format; gemma4_kv explicitly describes the BF16 sliding ring.
+    summary.kv_cache                 = impl_->kv_storage;
+    summary.gemma4_kv = Gemma4KvMemorySummary{
+        .requested = impl_->kv_storage,
+        .global = impl_->kv_storage,
+        .sliding = KvCacheStorage::BFloat16,
+        .global_payload_bytes = impl_->global_payload_bytes,
+        .sliding_payload_bytes = impl_->sliding_payload_bytes};
+    summary.kv_payload_bytes = impl_->global_payload_bytes + impl_->sliding_payload_bytes;
     summary.workspace.capacity_bytes = impl_->workspace.capacity();
     return summary;
 }

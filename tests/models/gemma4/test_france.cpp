@@ -77,7 +77,8 @@ int main() {
             v_pages.emplace_back(
                 v_store[i].p, ninfer::DType::BF16,
                 std::initializer_list<std::int32_t>{layer.head_dim, 64, layer.kv_heads, 1});
-            caches.push_back({&k_pages[i], &v_pages[i], &block});
+            caches.push_back({.k_pages = &k_pages[i], .v_pages = &v_pages[i],
+                               .block_table = &block});
         }
 
         ninfer::DeviceBuffer hidden_buf(static_cast<std::size_t>(hidden) * tokens * 2);

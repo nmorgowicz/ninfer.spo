@@ -116,8 +116,8 @@ struct Cache {
             v_pages.emplace_back(v_store.back().p, ninfer::DType::BF16, shape);
         }
         for (std::size_t i = 0; i < count; ++i) {
-            layers.push_back(
-                {&k_pages[i], &v_pages[i], loaded.layers[i].global_layer ? &table : &ring});
+            layers.push_back({.k_pages = &k_pages[i], .v_pages = &v_pages[i],
+                               .block_table = loaded.layers[i].global_layer ? &table : &ring});
         }
     }
 };
@@ -241,8 +241,8 @@ bool bisect(Runner& runner, const fs::path& dir, const std::string& name,
             report(0, "embed", hidden_buf);
         }
         auto scope = runner.workspace.scope();
-        g4::gemma4_layer(hidden, one[0], pos_tensor, *one_cache[0].k_pages, *one_cache[0].v_pages,
-                         *one_cache[0].block_table, runner.gemm, runner.workspace, runner.stream);
+        g4::gemma4_layer(hidden, one[0], pos_tensor, one_cache[0], runner.gemm, runner.workspace,
+                         runner.stream);
         if (layer + 1 < loaded.layers.size()) { report(layer + 1, "layer", hidden_buf); }
     }
     {

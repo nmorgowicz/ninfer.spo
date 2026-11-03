@@ -44,6 +44,18 @@ ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_gemma4_fp8_kv_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gemma4_fp8_kv.cu"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_gemma4_fp8_kv_runtime_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../models/gemma4/test_fp8_kv_runtime.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_ops)
+
+ninfer_add_test(ninfer_gemma4_capacity_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_gemma4_capacity.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_ops)
+
 ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
   LIBRARIES ninfer_ops)

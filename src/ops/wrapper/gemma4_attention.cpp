@@ -1,6 +1,7 @@
 #include "ninfer/ops/gemma4_attention.h"
 
 #include "ops/launcher/gemma4_attention.h"
+#include "ops/wrapper/gemma4_cache_validation.h"
 
 #include <algorithm>
 #include <cmath>
@@ -43,12 +44,13 @@ std::size_t gemma4_attention_workspace_capacity_bytes(std::int32_t head_dim, std
     return widest;
 }
 
-void gemma4_attention(const Tensor& q, const Tensor& k_pages, const Tensor& v_pages,
-                      const Tensor& block_table, const Tensor& positions, int window, float scale,
+void gemma4_attention(const Tensor& q, const Gemma4CacheView& cache,
+                      const Tensor& positions, int window, float scale,
                       Tensor& out, WorkspaceArena& workspace, cudaStream_t stream) {
     require_bf16(q, "q");
-    require_bf16(k_pages, "k_pages");
-    require_bf16(v_pages, "v_pages");
+    detail::validate_gemma4_cache(cache, q.ne[0], window == 0, "gemma4_attention");
+    const Tensor& k_pages = *cache.k_pages;
+    const Tensor& block_table = *cache.block_table;
     require_bf16(out, "out");
     if (positions.dtype != DType::I32 || block_table.dtype != DType::I32 ||
         !positions.is_contiguous() || !block_table.is_contiguous() || positions.data == nullptr ||
@@ -73,11 +75,7 @@ void gemma4_attention(const Tensor& q, const Tensor& k_pages, const Tensor& v_pa
     if (positions.ne[0] != tokens || positions.ne[1] != 1) {
         throw std::invalid_argument("gemma4_attention: positions must be [T]");
     }
-    if (k_pages.ne[0] != head_dim || k_pages.ne[1] != kPage || k_pages.ne[3] <= 0 ||
-        v_pages.ne[0] != k_pages.ne[0] || v_pages.ne[1] != k_pages.ne[1] ||
-        v_pages.ne[2] != k_pages.ne[2] || v_pages.ne[3] != k_pages.ne[3]) {
-        throw std::invalid_argument("gemma4_attention: k/v pages must be [D,64,Hkv,pages]");
-    }
+    // Plane geometry and represented storage are validated together above.
     if (block_table.ne[0] <= 0) {
         throw std::invalid_argument("gemma4_attention: block_table must be nonempty");
     }
@@ -98,7 +96,7 @@ void gemma4_attention(const Tensor& q, const Tensor& k_pages, const Tensor& v_pa
         stats =
             static_cast<float*>(workspace.alloc(DType::FP32, {2, chunks, q_heads, tokens}).data);
     }
-    detail::gemma4_attention_launch(q, k_pages, v_pages, block_table, positions, window, scale, out,
+    detail::gemma4_attention_launch(q, cache, positions, window, scale, out,
                                     partial, stats, stream);
 }
 

@@ -387,14 +387,14 @@ void launch(const Tensor& q, const Tensor& k_pages, const Tensor& v_pages,
 
 } // namespace
 
-void gemma4_attention_mma_launch(const Tensor& q, const Tensor& k_pages, const Tensor& v_pages,
-                                 const Tensor& block_table, const Tensor& positions, int window,
-                                 float scale, Tensor& out, cudaStream_t stream) {
+void gemma4_attention_mma_launch(const Tensor& q, const Gemma4CacheView& cache,
+                                 const Tensor& positions, int window, float scale,
+                                 Tensor& out, cudaStream_t stream) {
     if (q.ne[0] == 256) {
-        launch<256, 64>(q, k_pages, v_pages, block_table, positions, window, scale, out, stream);
+        launch<256, 64>(q, *cache.k_pages, *cache.v_pages, *cache.block_table,
+                        positions, window, scale, out, stream);
     } else if (q.ne[0] == 512) {
-        gemma4_attention_mma_d512_launch(q, k_pages, v_pages, block_table, positions, window, scale,
-                                         out, stream);
+        gemma4_attention_mma_d512_launch(q, cache, positions, window, scale, out, stream);
     } else {
         throw std::invalid_argument("gemma4_attention: the tensor-core path needs D=256 or 512");
     }

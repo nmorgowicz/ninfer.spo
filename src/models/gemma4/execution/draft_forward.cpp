@@ -49,8 +49,7 @@ void draft_layer(Tensor& x, Tensor& hn, const Gemma4LayerWeights& layer,
     project(hn, layer.qkv, layer.qkv_policy, q_column, gemm, workspace, stream);
     ops::rmsnorm(q, norm_weight(layer.q_norm, dim), layer.rms_eps, false, qn, stream);
     ops::rope(position, layer.rotary_dim, layer.rope_theta, qn, stream);
-    ops::gemma4_attention(qn, *cache.k_pages, *cache.v_pages, *cache.block_table, position,
-                          layer.window, 1.0f, attn, workspace, stream);
+    ops::gemma4_attention(qn, cache, position, layer.window, 1.0f, attn, workspace, stream);
     Tensor attn_column(attn.data, DType::BF16, {heads * dim, width});
     project(attn_column, layer.o_proj, layer.o_policy, projected, gemm, workspace, stream);
     const Tensor pre_ff_norm = norm_weight(layer.pre_ff_norm, hidden);

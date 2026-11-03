@@ -10,6 +10,7 @@
 #include "models/qwen3_8_flash_next/impl/activation_control.h"
 #include "models/qwen3_5/measurement.h"
 #include "models/registry.h"
+#include "models/gemma4/program/kv_layout.h"
 
 #include <algorithm>
 #include <chrono>
@@ -312,9 +313,10 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
     // One lane until the program batches. Global layers keep full-length KV; sliding layers use a
     // fixed ring, counted in the fixed bytes.
     options.max_concurrency = 1;
-    if (options.kv_cache != KvCacheStorage::BFloat16) {
-        throw std::invalid_argument("gemma4 KV cache is bf16 only");
-    }
+    (void)models::gemma4::gemma4_kv_format(options.kv_cache);
+    const auto native_context = reader.directory().component("text").config
+                                    .at("max_position_embeddings").get<std::uint64_t>();
+    models::gemma4::validate_native_context(options.max_context, native_context);
     // MTP drafts a fixed count per round; `auto` takes the count that measured best.
     constexpr std::uint32_t kGemma4AutoDraftTokens = 6;
     const SpeculativeOptions& speculative = options.speculative;
@@ -353,40 +355,43 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
     const std::size_t free_bytes = current_free_device_bytes();
     const std::size_t fixed =
         models::gemma4::Program::fixed_bytes(*loaded, options.prefill_chunk, slots);
-    const std::size_t per_token = models::gemma4::Program::kv_bytes_per_token(*loaded);
-    const std::size_t fit =
-        free_bytes > fixed + kHeadroom ? (free_bytes - fixed - kHeadroom) / per_token : 0;
-    std::uint64_t tokens = std::min<std::uint64_t>(options.max_context, fit / 64U * 64U);
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit) {
-        if (options.kv_capacity.explicit_tokens > fit) {
-            throw std::invalid_argument(
-                "gemma4 explicit KV capacity does not fit in device memory");
-        }
-        tokens = std::min<std::uint64_t>(tokens, options.kv_capacity.explicit_tokens);
+    const std::size_t per_token =
+        models::gemma4::Program::kv_bytes_per_token(*loaded, options.kv_cache);
+    if (per_token == 0) {
+        throw std::invalid_argument("gemma4 needs at least one global KV layer");
     }
-    if (tokens < 64) {
-        throw std::invalid_argument("gemma4 KV capacity does not fit in device memory");
-    }
-    options.max_context = static_cast<std::uint32_t>(tokens);
-    const std::uint64_t spare = fit > tokens ? fit - tokens : 0U;
-    const auto extra_tokens   = static_cast<std::uint32_t>(
-        std::min<std::uint64_t>({tokens * slots, std::uint64_t{65536}, spare}) / 64U * 64U);
+    // Headroom also covers lazy prefill/decode/MTP graph instantiation and small allocations.
+    const std::size_t fit = free_bytes > fixed && free_bytes - fixed > kHeadroom
+                               ? (free_bytes - fixed - kHeadroom) / per_token : 0;
+    const std::uint32_t requested_context = options.max_context;
+    const auto capacity = models::gemma4::kv_page_capacity(
+        options.kv_capacity, requested_context, native_context, fit, slots);
+    options.max_context = capacity.tokens;
+    const auto extra_tokens = capacity.extra_tokens;
     auto program = std::make_unique<models::gemma4::Program>(
         *loaded, options.max_context, options.prefill_chunk, draft_tokens, device.stream,
         models::gemma4::CacheBudget{.history      = history.enabled,
                                     .device_slots = slots,
                                     .host_bytes   = host_bytes,
-                                    .extra_tokens = extra_tokens});
+                                    .extra_tokens = extra_tokens}, options.kv_cache);
     device.synchronize();
     auto instance                         = std::make_unique<Gemma4Instance>(std::move(loaded),
                                                                              models::gemma4::Frontend(tokenizer, chat, options.max_context),
                                                                              std::move(program), options.max_context);
-    instance->kv_capacity_resolution.mode = options.kv_capacity.mode;
-    instance->kv_capacity_resolution.resolved_tokens  = options.max_context;
-    instance->kv_capacity_resolution.main_page_groups = (options.max_context + 63U) / 64U;
-    instance->kv_capacity_resolution.maximum_main_page_groups =
-        instance->kv_capacity_resolution.main_page_groups;
-    instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
+    auto& resolution = instance->kv_capacity_resolution;
+    resolution.mode = options.kv_capacity.mode;
+    resolution.resolved_tokens = capacity.tokens;
+    resolution.main_page_groups = capacity.pages;
+    resolution.maximum_main_page_groups =
+        static_cast<std::uint32_t>((static_cast<std::uint64_t>(requested_context) + 63U) / 64U);
+    resolution.minimum_runtime_reservation_bytes = fixed + 64U * per_token;
+    resolution.bytes_per_additional_main_page_group = 64U * per_token;
+    resolution.runtime_reservation_bytes =
+        fixed + (static_cast<std::size_t>(capacity.tokens) + extra_tokens) * per_token;
+    resolution.available_after_weights_bytes = free_bytes;
+    resolution.automatic_headroom_bytes = kHeadroom;
+    resolution.planned_slack_bytes = free_bytes - resolution.runtime_reservation_bytes;
+    resolution.available_after_startup_bytes = current_free_device_bytes();
     const std::string signature                                    = "gemma4-prefill-1";
     auto context_cost                                              = resolve_context_machine_cost(
         {.hardware_class =

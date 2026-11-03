@@ -611,6 +611,15 @@ std::string format_server_start_json(
              {"host_context_reserved_bytes", memory.host_context_reserved_bytes},
              {"host_state_occupied_slots", memory.host_state_occupied_slots},
              {"host_kv_occupied_bytes", memory.host_kv_occupied_bytes}};
+    if (memory.gemma4_kv) {
+        const auto& kv = *memory.gemma4_kv;
+        record["memory"]["gemma4_kv"] =
+            Json{{"requested", kv_cache_name(kv.requested)},
+                 {"global", kv_cache_name(kv.global)},
+                 {"sliding", kv_cache_name(kv.sliding)},
+                 {"global_payload_bytes", kv.global_payload_bytes},
+                 {"sliding_payload_bytes", kv.sliding_payload_bytes}};
+    }
     record["environment"] =
         Json{{"device", environment.device},
              {"gpu_name", environment.gpu_name},

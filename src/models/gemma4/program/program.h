@@ -32,11 +32,13 @@ public:
     // A nonzero `draft_tokens` (1..15, needs model.draft) drafts that many tokens per decode
     // round with the MTP assistant.
     Program(LoadedText& model, std::uint32_t capacity, std::uint32_t prefill_chunk,
-            std::uint32_t draft_tokens, cudaStream_t stream, const CacheBudget& cache = {});
+            std::uint32_t draft_tokens, cudaStream_t stream, const CacheBudget& cache = {},
+            KvCacheStorage kv_cache = KvCacheStorage::BFloat16);
     ~Program();
 
     // KV bytes per position of the global layers; the sliding layers' ring is in fixed_bytes.
-    [[nodiscard]] static std::size_t kv_bytes_per_token(const LoadedText& model);
+    [[nodiscard]] static std::size_t kv_bytes_per_token(
+        const LoadedText& model, KvCacheStorage kv_cache = KvCacheStorage::BFloat16);
     // Device bytes the Program needs besides the global layers' KV, with `device_slots`
     // checkpoint snapshots.
     [[nodiscard]] static std::size_t fixed_bytes(const LoadedText& model,

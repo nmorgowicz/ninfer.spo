@@ -1,11 +1,13 @@
 #pragma once
 
+#include "ninfer/ops/gemma4_cache.h"
+
 #include <cstdint>
 #include <vector>
 
 namespace ninfer::models::gemma4 {
 
-constexpr int kKvPageTokens = 64;
+constexpr int kKvPageTokens = ops::kGemma4KvPageTokens;
 
 // Sliding layers keep their K/V in a ring of pages: logical page p lives in physical page
 // p % ring. A forward of up to `chunk` tokens appends its K/V before it attends, so the ring

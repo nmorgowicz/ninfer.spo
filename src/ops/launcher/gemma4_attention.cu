@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/kernel/gemma4_fp8_kv.cuh"
 
 #include <cuda_bf16.h>
 
@@ -41,6 +42,26 @@ __device__ __forceinline__ void load_row(const __nv_bfloat16* row, float (&out)[
     }
 }
 
+template <int E, bool Fp8>
+__device__ __forceinline__ void load_cache(const void* pages, const __half* scales,
+                                          std::int64_t base, float (&out)[E]) {
+    if constexpr (Fp8) {
+        const auto* codes = static_cast<const std::uint8_t*>(pages) + base;
+        const __half scale = scales[(base / 512) * 2 + (base % 512) / kGemma4KvFp8Group];
+#pragma unroll
+        for (int chunk = 0; chunk < E / 8; ++chunk) {
+            const uint2 packed = reinterpret_cast<const uint2*>(codes)[chunk];
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(&packed);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                out[chunk * 8 + i] = __bfloat162float(gemma4_fp8_expand(bytes[i], scale));
+            }
+        }
+    } else {
+        load_row<E>(static_cast<const __nv_bfloat16*>(pages) + base, out);
+    }
+}
+
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
     for (int offset = kWarp / 2; offset > 0; offset >>= 1) {
@@ -55,10 +76,11 @@ __device__ __forceinline__ float warp_sum(float value) {
 // softmax, holding D / 32 contiguous dimensions per lane. The splits of one head are merged in
 // shared memory. With one chunk the block writes the BF16 output; otherwise it writes its
 // normalized FP32 result and (max, sum) for gemma4_attention_combine_kernel.
-template <int D>
+template <int D, bool Fp8>
 __global__ void gemma4_attention_kernel(
-    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_pages,
-    const __nv_bfloat16* __restrict__ v_pages, const std::int32_t* __restrict__ block_table,
+    const __nv_bfloat16* __restrict__ q, const void* __restrict__ k_pages,
+    const void* __restrict__ v_pages, const __half* __restrict__ k_scales,
+    const __half* __restrict__ v_scales, const std::int32_t* __restrict__ block_table,
     const std::int32_t* __restrict__ positions, __nv_bfloat16* __restrict__ out,
     float* __restrict__ partial, float* __restrict__ partial_stats, std::int32_t q_heads,
     std::int32_t kv_heads, int group, int splits, int chunks, int window, float scale,
@@ -105,7 +127,7 @@ __global__ void gemma4_attention_kernel(
                 (static_cast<std::int64_t>(kvh) + static_cast<std::int64_t>(kv_heads) * physical) +
             static_cast<std::int64_t>(D) * (key & kPagedKVPageMask) + lane * E;
         float kv[E];
-        load_row<E>(k_pages + base, kv);
+        load_cache<E, Fp8>(k_pages, k_scales, base, kv);
         float dot = 0.0f;
 #pragma unroll
         for (int dim = 0; dim < E; ++dim) { dot = fmaf(qv[dim], kv[dim], dot); }
@@ -115,7 +137,7 @@ __global__ void gemma4_attention_kernel(
         const float weight   = expf(score - next_max);
         running_sum          = running_sum * rescale + weight;
         running_max          = next_max;
-        load_row<E>(v_pages + base, kv);
+        load_cache<E, Fp8>(v_pages, v_scales, base, kv);
 #pragma unroll
         for (int dim = 0; dim < E; ++dim) { acc[dim] = fmaf(acc[dim], rescale, weight * kv[dim]); }
     }
@@ -200,10 +222,12 @@ __global__ void gemma4_attention_combine_kernel(const float* __restrict__ partia
     }
 }
 
-template <int D>
-void launch(const Tensor& q, const Tensor& k_pages, const Tensor& v_pages,
-            const Tensor& block_table, const Tensor& positions, int window, float scale,
-            Tensor& out, float* partial, float* partial_stats, cudaStream_t stream) {
+template <int D, bool Fp8>
+void launch(const Tensor& q, const Gemma4CacheView& cache,
+            const Tensor& positions, int window, float scale, Tensor& out,
+            float* partial, float* partial_stats, cudaStream_t stream) {
+    const Tensor& k_pages = *cache.k_pages;
+    const Tensor& block_table = *cache.block_table;
     const int q_heads        = q.ne[1];
     const int tokens         = q.ne[2];
     const int kv_heads       = k_pages.ne[2];
@@ -228,9 +252,10 @@ void launch(const Tensor& q, const Tensor& k_pages, const Tensor& v_pages,
     if (chunks > 1 && (partial == nullptr || partial_stats == nullptr)) {
         throw std::invalid_argument("gemma4_attention: split keys need workspace");
     }
-    gemma4_attention_kernel<D><<<grid, threads, shared, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k_pages.data),
-        static_cast<const __nv_bfloat16*>(v_pages.data),
+    gemma4_attention_kernel<D, Fp8><<<grid, threads, shared, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), k_pages.data, cache.v_pages->data,
+        Fp8 ? static_cast<const __half*>(cache.k_scales->data) : nullptr,
+        Fp8 ? static_cast<const __half*>(cache.v_scales->data) : nullptr,
         static_cast<const std::int32_t*>(block_table.data),
         static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(out.data),
         partial, partial_stats, q_heads, kv_heads, group, splits, chunks, window, scale,
@@ -251,24 +276,22 @@ int gemma4_attention_chunks(std::int32_t tokens, std::int32_t kv_heads) {
     return static_cast<int>(std::min<std::int64_t>(kMaxChunks, kTargetBlocks / blocks));
 }
 
-void gemma4_attention_launch(const Tensor& q, const Tensor& k_pages, const Tensor& v_pages,
-                             const Tensor& block_table, const Tensor& positions, int window,
-                             float scale, Tensor& out, float* partial, float* stats,
-                             cudaStream_t stream) {
-    if (q.ne[1] / k_pages.ne[2] * kWarp > kMaxThreads) {
+void gemma4_attention_launch(const Tensor& q, const Gemma4CacheView& cache,
+                             const Tensor& positions, int window, float scale, Tensor& out,
+                             float* partial, float* stats, cudaStream_t stream) {
+    if (q.ne[1] / cache.k_pages->ne[2] * kWarp > kMaxThreads) {
         throw std::invalid_argument("gemma4_attention: at most 32 query heads per KV head");
     }
     if (q.ne[2] >= kMmaMinTokens) {
-        gemma4_attention_mma_launch(q, k_pages, v_pages, block_table, positions, window, scale, out,
-                                    stream);
+        gemma4_attention_mma_launch(q, cache, positions, window, scale, out, stream);
         return;
     }
     if (q.ne[0] == 256) {
-        launch<256>(q, k_pages, v_pages, block_table, positions, window, scale, out, partial, stats,
-                    stream);
+        launch<256, false>(q, cache, positions, window, scale, out, partial, stats, stream);
+    } else if (cache.format == Gemma4KvFormat::Fp8E4m3Row256) {
+        launch<512, true>(q, cache, positions, window, scale, out, partial, stats, stream);
     } else {
-        launch<512>(q, k_pages, v_pages, block_table, positions, window, scale, out, partial, stats,
-                    stream);
+        launch<512, false>(q, cache, positions, window, scale, out, partial, stats, stream);
     }
 }
 

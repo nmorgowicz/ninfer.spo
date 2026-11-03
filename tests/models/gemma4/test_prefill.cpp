@@ -89,7 +89,8 @@ int main() {
     Tensor block(dtable.data(), DType::I32, {1});
     Tensor k_pages(dk.data(), DType::BF16, {kDim, 64, kKv, 1});
     Tensor v_pages(dv.data(), DType::BF16, {kDim, 64, kKv, 1});
-    models::gemma4::Gemma4CacheLayer cache{&k_pages, &v_pages, &block};
+    models::gemma4::Gemma4CacheLayer cache{.k_pages = &k_pages, .v_pages = &v_pages,
+                                           .block_table = &block};
     const models::gemma4::Gemma4LayerWeights layers[] = {layer};
     const models::gemma4::Gemma4CacheLayer caches[]   = {cache};
     const models::gemma4::Gemma4Embedding embedding{bf16_matrix(dembed.data(), kVocab, kHidden)};
