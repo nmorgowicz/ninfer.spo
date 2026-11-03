@@ -39,8 +39,10 @@ domain/overall table remains product output on stdout; the independent full-prec
 report is `report.json` under `profiles/perplexity/` unless `--output` supplies an empty directory.
 
 For KV-format comparisons, the recommended long-context profile is the full corpus with
-`--context 65536 --stride 32768` and without `--quick`. The default KV format is FP8; Gemma 4
-artifacts store bf16 KV only and need `--kv-dtype bf16`.
+`--context 65536 --stride 32768` and without `--quick`. The default evaluator
+KV format is FP8. Gemma 4 accepts BF16 and experimental global-only FP8;
+its sliding rings remain BF16. Use `--kv-dtype bf16` for a BF16 baseline.
+Context plus prefix length must fit the artifact's native position limit.
 
 `--prefix-ids 2,105,...` prepends the same token ids to every window. They are context only: the
 scored targets and token counts do not change. Use it for models that are far from their training
@@ -82,12 +84,13 @@ aggregate.
 The schema-v2 report identifies the artifact's architecture, public name, actual weight formats
 and prefill signature alongside the workload and numerical results.
 
-## Top-k dump for KL comparison
+## Top-k dump for truncated-distribution comparison
 
-`--dump-topk FILE` also writes, for every scored position, the 64 most likely next-token ids and
-their log-softmax log-probabilities. Two dumps from the same corpus, context and stride line up
-position by position, so a quantized artifact can be compared with its BF16 reference by
-KL divergence and top-1 agreement without storing full logits. Only Gemma 4 artifacts support it
+`--dump-topk FILE` writes, for every scored position, the 64 most likely
+next-token ids and their full-softmax log-probabilities. Matched dumps can
+support top-1 agreement and explicitly defined truncated-distribution
+diagnostics; they cannot establish full-vocabulary KL divergence because
+the omitted tail is unavailable. Only Gemma 4 artifacts support this dump
 today; other families reject the option.
 
 The file is little-endian: the 8 bytes `NTOPK001`, a `u32` k (64), a `u32` 0, then per scored

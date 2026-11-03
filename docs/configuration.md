@@ -97,7 +97,7 @@ The engine does not read these. The scripts, tests, and probes that do are named
 | `--response-store-max-records` | 1024 | Stored responses. |
 | `--response-store-max-mib` | 256 | Stored response bytes. |
 | `--device` | 0 | CUDA device. |
-| `--kv-dtype` | bf16 | KV storage: `bf16`, `int8`, `fp8`, `nvfp4`, or `k8v4`. Flash-Next accepts `bf16`, `fp8`, and `int8`. |
+| `--kv-dtype` | bf16 | KV storage: `bf16`, `int8`, `fp8`, `nvfp4`, or `k8v4`. Flash-Next accepts `bf16`, `fp8`, and `int8`. Gemma 4 accepts `bf16` and experimental global-only `fp8`; its sliding rings remain BF16. |
 | `--spec` | | Speculative backend: `mtp`, `dflash`, or `dflash2`. Flash-Next accepts only `mtp`, which `scripts/serve.cmd` uses. |
 | `--draft-tokens` | | Draft length: `auto` or digits. Flash-Next MTP takes `auto` or 1..7. Gemma 4 MTP takes the same; its `auto` is a fixed 6 drafts per round. |
 | `--default-max-tokens` | 8192 | Used when the client omits `max_tokens`. |
@@ -125,6 +125,34 @@ The engine does not read these. The scripts, tests, and probes that do are named
 | `--host-ram-budget-gib` | 200 | `0` skips the host RAM check. |
 
 `ninfer-spo`, `ninfer-spo-perplexity`, and `ninfer_bench` resolve the NUMA node the same way and tune the process before loading. `ninfer-spo` and `ninfer_bench` also take the four host flags above.
+
+### Experimental Gemma 4 FP8 KV
+
+`--kv-dtype fp8` changes runtime cache storage, not artifact weights. Only
+global D512 layers use E4M3 codes with two FP16 scales per K/V vector (one
+per 256 elements); sliding D256 rings and their snapshots remain BF16.
+Target and MTP attention expand cache values by an FP32 code/scale product
+rounded to BF16. Q and the attention products remain BF16; this is not FP8 QK
+tensor-core computation. BF16 is still the default. INT8/NVFP4/K8V4 remain
+unsupported for Gemma.
+
+The finite-row domain is supported. Any NaN or infinity in a final normalized
+BF16 K/V row-half poisons that complete 256-element half with NaN codes and
+unit scale; nonfinite inputs do not promise useful attention outputs.
+
+For the 31B geometry (10 global layers, four KV heads), global payload is
+41,280 B/token including scales, versus 81,920 B/token for BF16. At 131,072,
+that is 5.04 GiB instead of 10 GiB. These figures exclude spare pool pages,
+sliding rings, snapshots, workspace, MTP and CUDA graphs. Sliding storage is
+unchanged: chunk 128 uses a 900 MiB ring and up to 900 MiB per device snapshot.
+Host checkpoint storage is not active-context offload.
+
+Startup reports requested/global/sliding formats and actual payload bytes.
+Use resolved capacity, not the requested ceiling, as fit evidence. Explicit
+capacities round up to 64-token pages before fit validation. Requests above
+the artifact's native position limit fail before weight loading. Auto-sizing
+headroom also covers lazy CUDA graph allocations; measure memory after graph
+capture. Functional fit does not establish model quality or vision support.
 
 ## CLI
 

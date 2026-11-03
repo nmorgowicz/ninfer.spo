@@ -942,17 +942,24 @@ Keep a changing memory block in its own message after the first system message: 
 resumes from the system-plus-tools checkpoint. A breakpoint on the memory message keeps that frontier
 as well.
 
-The global layers' KV is a pool of 64-token pages that checkpoints share with the live sequence, so
-a capture copies nothing there. The sliding layers' ring is overwritten by later tokens, so each
-checkpoint snapshots at least the last 1,279 positions (21 pages, about 1.05 GiB for the 31B). That
-snapshot also limits the resume point. A prompt that diverges from a displaced state more than about
-256 tokens before that state's end cannot use it; it resumes from an earlier frontier.
+The global layers' KV is a pool of 64-token pages shared with the live sequence,
+so capture copies nothing there. BF16 global payload is 80 KiB/token for the
+31B geometry; experimental `--kv-dtype fp8` uses 40.3125 KiB/token including
+FP16 row scales. Sliding rings remain BF16. Their snapshot extent depends on
+prefill chunk: chunk 128 needs 18 pages (900 MiB), while chunk 256 needs 21
+pages (1.05 GiB). A displaced state's retained window limits its resume point;
+earlier divergence resumes from an older frontier.
 
 | Budget | Size for the 31B |
 |---|---|
-| `--device-state-slots H` | H snapshots on the device, 1.05 GiB each |
-| spare KV pages | `min(max_context x H, 65,536)` tokens at 80 KiB per token (5 GiB for 16k x 4) |
-| `--host-context-mib` (default 8192) | pinned host memory; a demoted checkpoint takes its snapshot plus 80 KiB per token |
+| `--device-state-slots H` | H BF16 ring snapshots; chunk-dependent, not halved by FP8 |
+| spare KV pages | `min(resolved capacity x H, 65,536)` tokens at 80 KiB BF16 or 40.3125 KiB FP8 per token |
+| `--host-context-mib` (default 8192) | pinned checkpoint storage; demotion holds its BF16 ring snapshot plus global code/scale payload |
+
+FP8 changes cache storage, not artifact quantization, Q precision or the
+BF16 attention products. MTP reads the same global code/scale planes.
+BF16 remains the serving default; vision and model quality require separate
+qualification. See [FP8 format and memory details](configuration.md#experimental-gemma-4-fp8-kv).
 
 The least recently used checkpoint moves to the host when the slots or the page pool run out, and is
 dropped when the host arena is full too. A checkpoint counts as used whenever a prompt extends it,
@@ -1086,6 +1093,12 @@ For `server_start.memory`, `workspace.capacity_bytes` is the only physical works
 When Vision is enabled, `vision_workspace` reports the aggregate prompt and maximum-item token
 bounds plus encode peak and handoff layout/usage within that same allocation; these bytes must not
 be added to `workspace.capacity_bytes`. The field is `null` when Vision is disabled.
+
+For Gemma, `server_start.memory.gemma4_kv` identifies `requested`, `global`
+and `sliding` formats plus `global_payload_bytes` and `sliding_payload_bytes`.
+Their sum is `kv_payload_bytes`; it includes the allocated global pool and
+sliding rings, but not checkpoint ring snapshots. Do not interpret the global
+FP8 selection as quantizing the sliding ring.
 
 `request_done.engine_timing` separates FIFO `queue_wait_seconds`, blocking
 `device_wait_exposed_seconds`, and five mutually exclusive Host-active exposure phases under
