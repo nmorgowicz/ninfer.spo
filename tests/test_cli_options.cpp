@@ -1,5 +1,6 @@
 #include "options.h"
 
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -183,10 +184,16 @@ int main() {
                                        "--log-level", "verbose"});
                       }),
                       "CLI accepted an unknown log level");
+    for (const char* accepted : {"21", "64"}) {
+        failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k",
+                                 accepted})
+                                  .sampling.top_k == std::atoi(accepted),
+                          "CLI rejected top_k inside the 64-candidate range");
+    }
     failures +=
         check(rejects([] {
-                  (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
+                  (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "65"});
               }),
-              "CLI accepted top_k beyond the executable candidate domain");
+              "CLI accepted top_k beyond the 64-candidate ceiling");
     return failures == 0 ? 0 : 1;
 }

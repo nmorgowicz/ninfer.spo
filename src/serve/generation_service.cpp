@@ -192,6 +192,17 @@ using Clock = std::chrono::steady_clock;
     throw ApiException(std::move(error));
 }
 
+// The wire parsers admit the largest ceiling of any registered model; the loaded model's own
+// ceiling (ModelSamplingDefaults::max_top_k) decides here, so the client sees a 400 on top_k.
+void require_top_k_within_model(const ninfer::SamplingOverrides& sampling,
+                                std::int32_t max_top_k) {
+    if (!sampling.top_k || *sampling.top_k <= max_top_k) { return; }
+    ApiError error;
+    error.param   = "top_k";
+    error.message = "top_k must be in [0," + std::to_string(max_top_k) + "] for this model";
+    throw ApiException(std::move(error));
+}
+
 ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point deadline,
                                  const std::function<bool()>& is_cancelled,
                                  std::size_t& remaining_bytes) {
@@ -328,7 +339,13 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.startup_observer         = std::move(startup_observer);
-    engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    engine_ = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    const std::int32_t top_k_ceiling = engine_->sampling_defaults().max_top_k;
+    if (options_.sampling_overrides.top_k && *options_.sampling_overrides.top_k > top_k_ceiling) {
+        throw std::invalid_argument("--top-k " + std::to_string(*options_.sampling_overrides.top_k) +
+                                    " exceeds this model's top_k ceiling of " +
+                                    std::to_string(top_k_ceiling));
+    }
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
 }
@@ -382,6 +399,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     ninfer::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
+    require_top_k_within_model(request_options.execution.sampling,
+                               engine_->sampling_defaults().max_top_k);
     prepared.thinking_budget     = request_options.execution.thinking.budget;
     prepared.gemma4_qk           = engine_->options().gemma4_qk;
     prepared.reasoning_effort    = semantics.reasoning_effort;

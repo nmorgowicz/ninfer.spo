@@ -128,8 +128,14 @@ int test_envelope_and_field_policy() {
     body["temperature"] = 1.01;
     failures += check(api_param([&] { (void)parse(body); }) == "temperature",
                       "Anthropic temperature range was not enforced");
+    for (const int accepted : {21, 64}) {
+        body          = base_request();
+        body["top_k"] = accepted;
+        failures += check(parse(body).generation.sampling.top_k == accepted,
+                          "Anthropic top_k within the 64-candidate range was rejected");
+    }
     body          = base_request();
-    body["top_k"] = 21;
+    body["top_k"] = 65;
     failures += check(api_param([&] { (void)parse(body); }) == "top_k",
                       "Engine top_k range was not enforced");
     body                  = base_request();

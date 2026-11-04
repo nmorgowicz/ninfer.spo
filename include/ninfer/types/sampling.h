@@ -23,6 +23,14 @@ enum class SamplingMode : std::uint8_t {
     NonThinking,
 };
 
+// Largest top_k any registered model accepts. A model's own ceiling, ModelSamplingDefaults::
+// max_top_k, never exceeds it; protocol and CLI parsers validate against this value and the
+// Engine validates against the loaded model's ceiling.
+inline constexpr std::int32_t kMaxSamplingTopK = 64;
+// The 20-candidate sampling pipeline's ceiling: Qwen3.5 and Flash-Next, whose Engines run only
+// that pipeline, and the default for a model that does not declare another.
+inline constexpr std::int32_t kDefaultMaxSamplingTopK = 20;
+
 // Immutable model-owned values used when a request does not override a sampling field. Seed is
 // deliberately excluded: it is an execution choice rather than a model recommendation.
 struct SamplingPreset {
@@ -37,6 +45,9 @@ struct SamplingPreset {
 struct ModelSamplingDefaults {
     SamplingPreset thinking;
     SamplingPreset non_thinking;
+    // Largest top_k this model's sampling pipeline serves. A request's top_k of 0 resolves to the
+    // preset's top_k (the model default), and an explicit top_k above this is rejected.
+    std::int32_t max_top_k = kDefaultMaxSamplingTopK;
 
     [[nodiscard]] constexpr const SamplingPreset& for_mode(SamplingMode mode) const noexcept {
         return mode == SamplingMode::Thinking ? thinking : non_thinking;

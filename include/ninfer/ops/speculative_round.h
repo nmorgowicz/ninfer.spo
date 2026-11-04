@@ -17,10 +17,13 @@ struct SpeculativeAcceptExecutionEnvelope {
 };
 
 // Caller-owned transient capacity for every draft-count and batch-size pair in the inclusive
-// domains. token_domain is the fixed sampling profile; invalid domains throw.
+// domains. token_domain is the fixed sampling profile; invalid domains throw. top_k_capacity
+// (kSamplingFastTopK or kSamplingMaxTopK) selects the sampling pipeline exactly as in sampling.h
+// and must match the value later passed to speculative_accept_greedy_drafts().
 [[nodiscard]] std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(
     std::int32_t token_domain, std::int32_t min_drafts, std::int32_t max_drafts,
-    std::int32_t min_batch, std::int32_t max_batch);
+    std::int32_t min_batch, std::int32_t max_batch,
+    std::int32_t top_k_capacity = kSamplingFastTopK);
 
 /**
  * Op: speculative_prepare_verify_inputs
@@ -79,7 +82,9 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   configs[b].token_counts do not overlap except for the explicitly mutated objects.
  *
  * Numeric:
- *   Sampling filtering, penalties, normalization, and RNG semantics are those of sampling.h.
+ *   Sampling filtering, penalties, normalization, and RNG semantics are those of sampling.h,
+ *   including top_k up to top_k_capacity (20 or 64): every column's truncation is the exact
+ *   first-top_k prefix of the adjusted-logit order, for the accept test and for the residual.
  *
  * Effects:
  *   For each row, let A be the accepted draft count and L=A+1. licensed_tokens[0:A,b] receives
@@ -99,7 +104,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
-                                      WorkspaceArena& workspace, cudaStream_t stream);
+                                      WorkspaceArena& workspace, cudaStream_t stream,
+                                      std::int32_t top_k_capacity = kSamplingFastTopK);
 
 // Caller-owned transient capacity over the inclusive draft-count and batch intervals.
 // The raw-greedy execution envelope requires no workspace.
@@ -131,6 +137,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *   over the valid token domain, with lower ids breaking ties.
  *
  * Numeric:
+ *   The sparse route always uses the 20-wide sampling pipeline: its warp accept holds at most
+ *   32 target candidates, so configs[b].top_k above 20 is clamped to 20.
  *   proposal_q is consumed directly; it is not reconstructed from selector scores or expanded to
  *   a dense vocabulary distribution. Target logits are interpreted through sampling.h. Column i's
  *   penalty overlay is drafts[0..i-1], because the column is consumed only after that prefix was

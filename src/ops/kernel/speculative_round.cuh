@@ -151,12 +151,12 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
     if (lane < extent) {
         const int d = drafts[row * k + lane];
         if (greedy)
-            reject = workspace.dist_idx[sampling_dist_offset(lane, 0)] != d;
+            reject = workspace.dist_idx[sampling_dist_offset<kSamplerFastCandidates>(lane, 0)] != d;
         else {
             const int support = workspace.dist_support[lane];
             float pd          = 0.0f;
             for (int j = 0; j < support; ++j) {
-                const int at = sampling_dist_offset(lane, j);
+                const int at = sampling_dist_offset<kSamplerFastCandidates>(lane, j);
                 if (workspace.dist_idx[at] == d) {
                     pd = workspace.dist_prob[at];
                     break;
@@ -173,13 +173,13 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
     const int a             = failures ? __ffs(failures) - 1 : extent;
     int terminal;
     if (greedy)
-        terminal = workspace.dist_idx[sampling_dist_offset(a, 0)];
+        terminal = workspace.dist_idx[sampling_dist_offset<kSamplerFastCandidates>(a, 0)];
     else {
         const int n  = workspace.dist_support[a];
         int token    = 0;
         float weight = 0.0f;
         if (lane < n) {
-            const int at = sampling_dist_offset(a, lane);
+            const int at = sampling_dist_offset<kSamplerFastCandidates>(a, lane);
             token        = workspace.dist_idx[at];
             weight       = workspace.dist_prob[at];
             if (a < extent) {
@@ -226,6 +226,7 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
 // collapses to `u < p_i(drafts[i])`. Launch with a single block of kSamplerBlock
 // threads; only thread 0 performs the sequential accept/commit while the whole
 // block cooperates on the per-column truncated-distribution build.
+template <int Cap>
 __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_drafts_kernel(
     const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
@@ -258,11 +259,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
 
     __shared__ float red_val[kSamplerBlock];
     __shared__ int red_idx[kSamplerBlock];
-    __shared__ float cand_val[kSamplerCandidateCap];
-    __shared__ int cand_idx[kSamplerCandidateCap];
-    __shared__ float prob[kSamplerCandidateCap];
-    __shared__ float merge_val[kSamplerBlock * kSamplerFastCandidates];
-    __shared__ int merge_idx[kSamplerBlock * kSamplerFastCandidates];
+    __shared__ float cand_val[Cap];
+    __shared__ int cand_idx[Cap];
+    __shared__ float prob[Cap];
+    __shared__ SamplingFallbackScratch<Cap> scratch;
     __shared__ int n_support;
     __shared__ int a_sh;
     __shared__ int done_sh;
@@ -270,9 +270,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     __shared__ int L_sh;
 
     const int partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
-    const int group_count    = sampler_group_count(partial_blocks);
+    const int group_count    = sampler_group_count<Cap>(partial_blocks);
     // No-op when the scratch/group path owns this shape.
-    if (sampler_multiblock_ok(token_domain, cols, partial_blocks, group_count)) { return; }
+    if (sampler_multiblock_ok<Cap>(token_domain, cols, partial_blocks, group_count)) { return; }
 
     if (tid == 0) {
         a_sh     = 0;
@@ -334,12 +334,13 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         // round-local penalty overlay for this column is exactly those i drafts.
         const std::int64_t base = static_cast<std::int64_t>(i) * physical_rows;
         if (token_domain <= kSamplerTileItems) {
-            sampling_build_truncated_small(row_logits, base, token_domain, cfg, red_val, red_idx,
-                                           cand_val, cand_idx, prob, &n_support, row_drafts, i);
-        } else {
-            sampling_build_truncated_block_fast(row_logits, base, token_domain, cfg, merge_val,
-                                                merge_idx, cand_val, cand_idx, prob, &n_support,
+            sampling_build_truncated_small<Cap>(row_logits, base, token_domain, cfg, red_val,
+                                                red_idx, cand_val, cand_idx, prob, &n_support,
                                                 row_drafts, i);
+        } else {
+            sampling_build_truncated_large<Cap>(row_logits, base, token_domain, cfg, scratch,
+                                                cand_val, cand_idx, prob, &n_support, row_drafts,
+                                                i);
         }
         if (tid == 0 && done_sh == 0) {
             const int L = L_sh;
@@ -382,6 +383,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     }
 }
 
+template <int Cap>
 __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_topk_kernel(
     const __nv_bfloat16* logits, const std::int32_t* drafts, const std::int32_t* current_extents,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
@@ -405,10 +407,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
         if (col == 0) { *workspace.speculative_finalize_count = 0; }
     }
 
-    __shared__ SamplingPartialTopKStorage topk_storage;
+    __shared__ SamplingPartialTopKStorage<Cap> topk_storage;
     __shared__ unsigned long long greedy_warp_keys[kSamplerBlock / 32];
 
-    const int cap                  = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
+    const int cap                  = greedy ? 1 : sampling_candidate_cap<Cap>(cfg, token_domain);
     const std::int64_t base        = (static_cast<std::int64_t>(row) * cols + col) * physical_rows;
     const std::int32_t* row_drafts = drafts + row * k;
     const int tile_start           = partial * kSamplerPartialTileItems;
@@ -424,8 +426,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
                                        ? sampling_bf16_tile_sort_key(logits[base + v], tile_index)
                                        : 0u;
         }
-        sampling_store_bf16_tile_topk(keys, cap, tile_start, workspace, col, partial,
-                                      topk_storage.bf16);
+        sampling_store_bf16_tile_topk<Cap>(keys, cap, tile_start, workspace, col, partial,
+                                           topk_storage.bf16);
         return;
     }
 
@@ -452,15 +454,15 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
         }
         best = sampling_block_max_key(best, greedy_warp_keys);
         if (threadIdx.x == 0) {
-            const int off               = sampling_partial_offset(workspace, col, partial, 0);
+            const int off = sampling_partial_offset<Cap>(workspace, col, partial, 0);
             workspace.partial_keys[off] = best;
         }
         return;
     }
-    sampling_store_tile_topk(keys, cap, workspace, col, partial, topk_storage.fp32);
+    sampling_store_tile_topk<Cap>(keys, cap, workspace, col, partial, topk_storage.fp32);
 }
 
-template <bool SparseProposal>
+template <int Cap, bool SparseProposal>
 __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group_finalize_kernel(
     const std::int32_t* target_tokens, const std::int32_t* drafts,
     const std::int32_t* candidate_ids, const float* proposal_q, const std::int32_t* current_extents,
@@ -507,36 +509,40 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
 
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
 
-    __shared__ SamplingTileTopKStorage topk_storage;
-    __shared__ float cand_val[kSamplerCandidateCap];
-    __shared__ int cand_idx[kSamplerCandidateCap];
-    __shared__ float prob[kSamplerCandidateCap];
+    static_assert(!SparseProposal || Cap == kSamplerFastCandidates,
+                  "the sparse-proposal warp accept handles at most 32 candidates");
+    constexpr int kGroupItems       = sampler_group_items_per_thread(Cap);
+    constexpr int kPartialsPerGroup = sampler_partials_per_group(Cap);
+    __shared__ SamplingTileTopKStorage<kGroupItems, Cap> topk_storage;
+    __shared__ float cand_val[Cap];
+    __shared__ int cand_idx[Cap];
+    __shared__ float prob[Cap];
     __shared__ int n_support;
     __shared__ int is_last_group;
-    unsigned long long keys[kSamplerGroupItemsPerThread];
+    unsigned long long keys[kGroupItems];
 
-    const int cap = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
+    const int cap = greedy ? 1 : sampling_candidate_cap<Cap>(cfg, token_domain);
     // The preceding partial launch initializes all caller-owned counters. CUDA
     // stream ordering makes those writes visible before this launch begins.
 
-    const int group_begin = group * kSamplerPartialsPerGroup;
+    const int group_begin = group * kPartialsPerGroup;
     int group_partials    = partial_blocks - group_begin;
     if (group_partials < 0) { group_partials = 0; }
-    if (group_partials > kSamplerPartialsPerGroup) { group_partials = kSamplerPartialsPerGroup; }
+    if (group_partials > kPartialsPerGroup) { group_partials = kPartialsPerGroup; }
     const int group_n = group_partials * cap;
 #pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
+    for (int item = 0; item < kGroupItems; ++item) {
         const int p = item * blockDim.x + tid;
         if (p < group_n) {
             const int partial = group_begin + p / cap;
             const int j       = p - (p / cap) * cap;
-            const int off     = sampling_partial_offset(workspace, col, partial, j);
+            const int off     = sampling_partial_offset<Cap>(workspace, col, partial, j);
             keys[item]        = workspace.partial_keys[off];
         } else {
             keys[item] = 0ull;
         }
     }
-    sampling_store_tile_topk(keys, cap, workspace, col, partial_blocks + group, topk_storage);
+    sampling_store_tile_topk<Cap>(keys, cap, workspace, col, partial_blocks + group, topk_storage);
     __syncthreads();
 
     if (tid == 0) {
@@ -549,22 +555,22 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
 
     const int final_n = group_count * cap;
 #pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
+    for (int item = 0; item < kGroupItems; ++item) {
         const int p = item * blockDim.x + tid;
         if (p < final_n) {
             const int partial = partial_blocks + p / cap;
             const int j       = p - (p / cap) * cap;
-            const int off     = sampling_partial_offset(workspace, col, partial, j);
+            const int off     = sampling_partial_offset<Cap>(workspace, col, partial, j);
             keys[item]        = workspace.partial_keys[off];
         } else {
             keys[item] = 0ull;
         }
     }
-    sampling_store_tile_topk(keys, cap, workspace, col, partial_blocks + group, topk_storage);
+    sampling_store_tile_topk<Cap>(keys, cap, workspace, col, partial_blocks + group, topk_storage);
     __syncthreads();
 
     if (tid < cap) {
-        const int off = sampling_partial_offset(workspace, col, partial_blocks + group, tid);
+        const int off = sampling_partial_offset<Cap>(workspace, col, partial_blocks + group, tid);
         const unsigned long long key = workspace.partial_keys[off];
         cand_val[tid]                = sampling_key_float(key);
         cand_idx[tid]                = sampling_key_index(key);
@@ -577,7 +583,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
         __shared__ int last_column;
         if (greedy) {
             if (tid == 0) {
-                workspace.dist_idx[sampling_dist_offset(col, 0)] = cand_idx[0];
+                workspace.dist_idx[sampling_dist_offset<Cap>(col, 0)] = cand_idx[0];
                 workspace.group_done[col]                        = 0;
                 __threadfence();
                 last_column = atomicAdd(workspace.speculative_finalize_count, 1) + 1 == extent + 1;
@@ -594,7 +600,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
         if (tid == 0) {
             workspace.dist_support[col] = n_support;
             for (int j = 0; j < n_support; ++j) {
-                const int at            = sampling_dist_offset(col, j);
+                const int at            = sampling_dist_offset<Cap>(col, j);
                 workspace.dist_idx[at]  = cand_idx[j];
                 workspace.dist_prob[at] = prob[j];
             }
@@ -613,7 +619,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
 
         if (greedy) {
             if (tid == 0) {
-                workspace.dist_idx[sampling_dist_offset(col, 0)] = cand_idx[0];
+                workspace.dist_idx[sampling_dist_offset<Cap>(col, 0)] = cand_idx[0];
                 workspace.group_done[col]                        = 0;
                 __threadfence();
                 const int done_cols = atomicAdd(workspace.speculative_finalize_count, 1) + 1;
@@ -621,7 +627,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                     int a     = 0;
                     int tstar = 0;
                     for (int i = 0; i <= extent; ++i) {
-                        const int selected = workspace.dist_idx[sampling_dist_offset(i, 0)];
+                        const int selected = workspace.dist_idx[sampling_dist_offset<Cap>(i, 0)];
                         if (i < extent && selected == row_drafts[i]) {
                             a = i + 1;
                             continue;
@@ -643,7 +649,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
         if (tid == 0) {
             workspace.dist_support[col] = n_support;
             for (int j = 0; j < n_support; ++j) {
-                const int off            = sampling_dist_offset(col, j);
+                const int off            = sampling_dist_offset<Cap>(col, j);
                 workspace.dist_idx[off]  = cand_idx[j];
                 workspace.dist_prob[off] = prob[j];
             }
@@ -656,8 +662,8 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                 int tstar   = 0;
                 for (int i = 0; i <= extent; ++i) {
                     const int n            = workspace.dist_support[i];
-                    const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(i, 0);
-                    const float* dist_prob = workspace.dist_prob + sampling_dist_offset(i, 0);
+                    const int* dist_idx    = workspace.dist_idx + sampling_dist_offset<Cap>(i, 0);
+                    const float* dist_prob = workspace.dist_prob + sampling_dist_offset<Cap>(i, 0);
                     if (i < extent) {
                         const int d = row_drafts[i];
                         float pd    = 0.0f;

@@ -1,6 +1,7 @@
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -381,12 +382,17 @@ int main() {
                           sampling.sampling_overrides.frequency_penalty == -0.5F &&
                           sampling.sampling_overrides.seed == 0,
                       "server sampling flags did not preserve explicit values and zeros");
+    for (const char* accepted : {"21", "64"}) {
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--top-k", accepted})
+                                  .sampling_overrides.top_k == std::atoi(accepted),
+                          "server rejected top_k inside the 64-candidate range");
+    }
     bool oversized_top_k_rejected = false;
     try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--top-k", "21"});
+        (void)parse({"ninfer-serve", "model.ninfer", "--top-k", "65"});
     } catch (const std::invalid_argument&) { oversized_top_k_rejected = true; }
     failures += check(oversized_top_k_rejected,
-                      "server accepted top_k beyond the executable candidate domain");
+                      "server accepted top_k beyond the 64-candidate ceiling");
 
     GenerationRequest request;
     request.max_tokens   = 1;

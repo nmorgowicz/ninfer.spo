@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `top_k` runs up to 64. Gemma 4's built-in default is now temperature 1.0, top_k 64, top_p 0.95 (it was top_k 20), and `docs/serving.md` no longer says the suggested 64 cannot be sent. HTTP (OpenAI chat, Responses, Anthropic), `--top-k` of the server and the CLI, and the `ops::sample` and `ops::speculative_accept_greedy_drafts` sampling kernels all accept 1..64; top_k 0 means the model's default top_k (20 for Qwen3.5 and Flash-Next, 64 for Gemma 4). Sampled MTP rounds truncate to the exact top-k at every verify column, for the accept test and for the residual.
+  - Qwen3.5 and Flash-Next keep their ceiling of 20 (`ModelSamplingDefaults::max_top_k`): their programs run only the original 20-wide sampling kernels, and the DFlash2 sparse accept reads at most 32 candidates per warp. A larger request is a 400 on `top_k` (and `--top-k` above the loaded model's ceiling stops the server at startup).
+  - The sampling ops take `top_k_capacity` (`kSamplingFastTopK` 20, the default, or `kSamplingMaxTopK` 64) on both the workspace query and the launch. The 20-wide instantiation is the original pipeline: same registers and shared memory (`cuobjdump --dump-resource-usage`: 29/60/60 registers for partial, group and single-block kernels) and no timing change beyond noise on a shared GPU. The 64-wide pipeline sorts 8 keys per thread in its group stage (2048-key tiles, 32 partials per group) so one final merge still covers vocabularies up to 524,288 tokens, and falls back to a streamed tile merge beyond that or above 16 columns. Gemma 4 picks the width per request (top_k above 20 selects the 64-wide kernels and recaptures its sampling graphs when the width changes).
+  - `ninfer_sampling_select_bench --top-k 1..64 [--wide]` times both pipelines. On the 248,077-token domain (shared GPU, median of three interleaved runs): B=1 stochastic 33 µs at top_k 20 and 38 µs at top_k 64; MTP K=5 44 µs and 77 µs.
 - Opt-in, quality-unqualified Gemma 4 global-layer `--kv-dtype int8`: INT8 codes
   with one FP16 scale per 64 elements (eight per D512 K/V vector, 42,240
   B/token for the 31B geometry). Sliding rings, snapshots and vision stay BF16;

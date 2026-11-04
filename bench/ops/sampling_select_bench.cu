@@ -55,11 +55,13 @@ struct Options {
     int repeat         = 60;
     int graph_calls    = 1;
     int top_k          = 20;
+    bool wide          = false; // force the 64-wide pipeline even when top_k <= 20
 };
 
 void usage(const char* argv0) {
     std::printf("usage: %s [--sample|--mtp|--dflash2|--matrix] [--mode greedy|stochastic] "
-                "[--batch 1..8] [--mtp-k 1..5] [--drafts 1..15] [--extent 0..K] [--top-k 1..20] "
+                "[--batch 1..8] [--mtp-k 1..5] [--drafts 1..15] [--extent 0..K] [--top-k 1..64] "
+                "[--wide] "
                 "[--no-counts] [--general] [--mixed] [--reject-at J] [--warmup N] [--repeat N] "
                 "[--graph-calls N]\n",
                 argv0);
@@ -126,6 +128,8 @@ Options parse_args(int argc, char** argv) {
             options.graph_calls = parse_int(need_value("--graph-calls"), "--graph-calls");
         } else if (arg == "--top-k") {
             options.top_k = parse_int(need_value("--top-k"), "--top-k");
+        } else if (arg == "--wide") {
+            options.wide = true;
         } else if (arg == "--no-counts") {
             options.counts_active = false;
         } else if (arg == "-h" || arg == "--help") {
@@ -161,8 +165,11 @@ Options parse_args(int argc, char** argv) {
     if (options.warmup < 0 || options.repeat < 1 || options.graph_calls < 1 ||
         options.graph_calls > 64)
         throw std::invalid_argument("invalid timing counts");
-    if (options.top_k < 1 || options.top_k > 20) {
-        throw std::invalid_argument("--top-k must be in [1,20]");
+    if (options.top_k < 1 || options.top_k > ops::kSamplingMaxTopK) {
+        throw std::invalid_argument("--top-k must be in [1,64]");
+    }
+    if (options.dflash2 && (options.top_k > ops::kSamplingFastTopK || options.wide)) {
+        throw std::invalid_argument("--dflash2 uses the 20-wide pipeline only");
     }
     return options;
 }
@@ -238,8 +245,13 @@ double stochastic_payload_bytes(int cols, bool counts_active) {
     return per_col * static_cast<double>(cols);
 }
 
+int capacity_for(int top_k, bool wide) {
+    return wide || top_k > ops::kSamplingFastTopK ? ops::kSamplingMaxTopK
+                                                   : ops::kSamplingFastTopK;
+}
+
 void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, int batch, Mode mode,
-                bool counts_active, int top_k) {
+                bool counts_active, int top_k, int capacity) {
     CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
     DeviceBuffer configs = make_batch_configs(counts, batch, mode, counts_active, top_k);
     DeviceBuffer out(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
@@ -249,7 +261,8 @@ void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, int batch, Mode mode
     Tensor tlogits(logits.p, DType::BF16, {kPhysicalRows, batch});
     Tensor tout(out.p, DType::I32, {batch});
     Tensor tpositions(device_positions.p, DType::I32, {batch});
-    WorkspaceArena workspace(ops::sampling_workspace_capacity_bytes(kTokenDomain, batch, batch));
+    WorkspaceArena workspace(
+        ops::sampling_workspace_capacity_bytes(kTokenDomain, batch, batch, capacity));
     const auto* config_ptr = static_cast<const ops::SamplingConfig*>(configs.p);
 
     const double bytes  = mode == Mode::Greedy ? static_cast<double>(kTokenDomain) * 2.0 * batch
@@ -257,18 +270,18 @@ void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, int batch, Mode mode
     const Result result = bench_loop(
         [&](cudaStream_t stream) {
             ops::sample(tlogits, tout, kTokenDomain, config_ptr, tpositions,
-                        ops::kSamplePurposeDecode, workspace, stream);
+                        ops::kSamplePurposeDecode, workspace, stream, capacity);
         },
         bytes);
     const std::string label = std::string("G2 B=") + std::to_string(batch) + " " +
                               (mode == Mode::Greedy ? "greedy" : "stochastic") +
                               (counts_active && mode == Mode::Stochastic ? " counts" : "") +
-                              " top_k=" + std::to_string(top_k);
+                              " top_k=" + std::to_string(top_k) + " cap=" + std::to_string(capacity);
     print_result(label.c_str(), result);
 }
 
 void run_mtp(DeviceBuffer& logits, DeviceBuffer& counts, int k, Mode mode, bool counts_active,
-             int top_k) {
+             int top_k, int capacity) {
     CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
     DeviceBuffer config = make_config(counts, mode, counts_active, top_k);
     std::vector<std::int32_t> target_host(static_cast<std::size_t>(k + 1));
@@ -297,8 +310,8 @@ void run_mtp(DeviceBuffer& logits, DeviceBuffer& counts, int k, Mode mode, bool 
     Tensor tsampled(sampled.p, DType::I32, {k + 1});
     Tensor tnum(num.p, DType::I32, {1});
     Tensor taccepted(accepted.p, DType::I32, {1});
-    WorkspaceArena workspace(
-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(kTokenDomain, k, k, 1, 1));
+    WorkspaceArena workspace(ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+        kTokenDomain, k, k, 1, 1, capacity));
     const auto* config_ptr = static_cast<const ops::SamplingConfig*>(config.p);
 
     const double bytes  = mode == Mode::Greedy ? static_cast<double>((k + 1) * 4 + k * 4)
@@ -307,13 +320,13 @@ void run_mtp(DeviceBuffer& logits, DeviceBuffer& counts, int k, Mode mode, bool 
         [&](cudaStream_t stream) {
             ops::speculative_accept_greedy_drafts(ttargets, tlogits, tdrafts, textent, tlength,
                                                   ttoken, tsampled, tnum, taccepted, kTokenDomain,
-                                                  config_ptr, workspace, stream);
+                                                  config_ptr, workspace, stream, capacity);
         },
         bytes);
     const std::string label = std::string("G3 K=") + std::to_string(k) + " " +
                               (mode == Mode::Greedy ? "greedy" : "stochastic") +
                               (counts_active && mode == Mode::Stochastic ? " counts" : "") +
-                              " top_k=" + std::to_string(top_k);
+                              " top_k=" + std::to_string(top_k) + " cap=" + std::to_string(capacity);
     print_result(label.c_str(), result);
 }
 
@@ -460,29 +473,45 @@ int main(int argc, char** argv) {
                     kPhysicalRows, kTokenDomain, static_cast<double>(kTokenDomain * 2) / 1048576.0,
                     static_cast<double>(kTokenDomain * 4) / 1048576.0);
         std::printf(
-            "workspace: lanes=1 %.1f KiB, lanes=8 %.1f KiB\n",
+            "workspace: lanes=1 %.1f KiB, lanes=8 %.1f KiB (20-wide); %.1f KiB, %.1f KiB "
+            "(64-wide)\n",
             static_cast<double>(ops::sampling_workspace_capacity_bytes(kTokenDomain, 1, 1)) /
                 1024.0,
             static_cast<double>(ops::sampling_workspace_capacity_bytes(kTokenDomain, 8, 8)) /
+                1024.0,
+            static_cast<double>(ops::sampling_workspace_capacity_bytes(
+                kTokenDomain, 1, 1, ops::kSamplingMaxTopK)) /
+                1024.0,
+            static_cast<double>(ops::sampling_workspace_capacity_bytes(
+                kTokenDomain, 8, 8, ops::kSamplingMaxTopK)) /
                 1024.0);
         if (options.matrix) {
             for (const int batch : {1, 2, 4, 8}) {
-                run_sample(logits, counts, batch, Mode::Greedy, false, 1);
-                run_sample(logits, counts, batch, Mode::Stochastic, true, 20);
+                run_sample(logits, counts, batch, Mode::Greedy, false, 1, ops::kSamplingFastTopK);
+                run_sample(logits, counts, batch, Mode::Stochastic, true, 20,
+                           ops::kSamplingFastTopK);
+                run_sample(logits, counts, batch, Mode::Stochastic, true, 20,
+                           ops::kSamplingMaxTopK);
+                run_sample(logits, counts, batch, Mode::Stochastic, true, 64,
+                           ops::kSamplingMaxTopK);
             }
-            run_sample(logits, counts, 1, Mode::Stochastic, false, 20);
+            run_sample(logits, counts, 1, Mode::Stochastic, false, 20, ops::kSamplingFastTopK);
+            run_sample(logits, counts, 1, Mode::Stochastic, false, 64, ops::kSamplingMaxTopK);
             for (int k = 1; k <= 5; ++k) {
-                run_mtp(logits, counts, k, Mode::Greedy, false, 1);
-                run_mtp(logits, counts, k, Mode::Stochastic, true, 20);
+                run_mtp(logits, counts, k, Mode::Greedy, false, 1, ops::kSamplingFastTopK);
+                run_mtp(logits, counts, k, Mode::Stochastic, true, 20, ops::kSamplingFastTopK);
+                run_mtp(logits, counts, k, Mode::Stochastic, true, 20, ops::kSamplingMaxTopK);
+                run_mtp(logits, counts, k, Mode::Stochastic, true, 64, ops::kSamplingMaxTopK);
             }
         } else {
+            const int capacity = capacity_for(options.top_k, options.wide);
             if (options.sample) {
                 run_sample(logits, counts, options.batch, options.mode, options.counts_active,
-                           options.top_k);
+                           options.top_k, capacity);
             }
             if (options.mtp) {
                 run_mtp(logits, counts, options.mtp_k, options.mode, options.counts_active,
-                        options.top_k);
+                        options.top_k, capacity);
             }
             if (options.dflash2) { run_dflash2(logits, counts, options); }
         }

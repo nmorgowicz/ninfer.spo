@@ -375,10 +375,13 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
 }
 
 ModelSamplingDefaults Frontend::sampling_defaults() const noexcept {
+    // Gemma 4's recommended sampling: temperature 1.0, top_p 0.95, top_k 64. The program runs the
+    // 64-wide sampling pipeline for top_k above 20, so 64 is also this model's ceiling.
     ModelSamplingDefaults defaults;
-    const SamplingPreset preset{.temperature = 1.0F, .top_k = 20, .top_p = 0.95F};
+    const SamplingPreset preset{.temperature = 1.0F, .top_k = 64, .top_p = 0.95F};
     defaults.thinking     = preset;
     defaults.non_thinking = preset;
+    defaults.max_top_k    = kMaxSamplingTopK;
     return defaults;
 }
 

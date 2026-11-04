@@ -32,6 +32,8 @@ namespace ninfer::models::gemma4 {
 namespace {
 
 constexpr std::int32_t kScoreTile = 128;
+static_assert(kMaxSamplingTopK == ops::kSamplingMaxTopK,
+              "the public top_k ceiling is the wide sampling pipeline's capacity");
 
 runtime::ExecutionTiming timed(std::chrono::steady_clock::time_point start) {
     runtime::ExecutionTiming timing;
@@ -188,6 +190,10 @@ struct Program::Impl {
     DecodeGraphExecutable round_graph;
     DecodeGraphDefinition sampled_round_definition;
     DecodeGraphExecutable sampled_round_graph;
+    // Sampling pipeline width: the 20-wide fast path serves requests with top_k <= 20, the
+    // 64-wide path the rest. Workspace is sized for the wide path; a change recaptures the
+    // graphs that embed a sampling op.
+    std::int32_t sampler_capacity = ops::kSamplingFastTopK;
     std::vector<TokenId> round_ids;
     SpeculativeStats spec_stats;
 
@@ -195,7 +201,8 @@ struct Program::Impl {
         const std::size_t layers = layer_bytes(loaded, chunk);
         const std::size_t logits = static_cast<std::size_t>(loaded.vocab) * kScoreTile * 2U +
                                    gemma4_logits_workspace_bytes(loaded.output_head, kScoreTile);
-        const std::size_t sampling = ops::sampling_workspace_capacity_bytes(loaded.vocab, 1, 1);
+        const std::size_t sampling =
+            ops::sampling_workspace_capacity_bytes(loaded.vocab, 1, 1, ops::kSamplingMaxTopK);
         std::size_t draft = 0;
         if (loaded.draft != nullptr) {
             const auto columns = static_cast<std::size_t>(kMinChunk);
@@ -203,7 +210,8 @@ struct Program::Impl {
                 static_cast<std::size_t>(loaded.vocab) * columns * 2U +
                 gemma4_logits_workspace_bytes(loaded.output_head, static_cast<int>(columns)) +
                 ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                    loaded.vocab, 1, static_cast<std::int32_t>(kMaxDraftTokens), 1, 1);
+                    loaded.vocab, 1, static_cast<std::int32_t>(kMaxDraftTokens), 1, 1,
+                    ops::kSamplingMaxTopK);
             draft = std::max(gemma4_draft_workspace_bytes(*loaded.draft),
                              layer_bytes(loaded, kMinChunk) + round_logits);
         }
@@ -509,6 +517,15 @@ struct Program::Impl {
             config.token_counts = static_cast<std::int32_t*>(counts_buf.p);
         }
         config_buf.copy_from_host(&config, sizeof(config));
+        const std::int32_t needed =
+            sampling.top_k > ops::kSamplingFastTopK ? ops::kSamplingMaxTopK : ops::kSamplingFastTopK;
+        if (needed != sampler_capacity) {
+            sampler_capacity = needed;
+            decode_graph.reset();
+            decode_definition.reset();
+            sampled_round_graph.reset();
+            sampled_round_definition.reset();
+        }
     }
 
     // Samples the next token from hidden column `column`, which predicts logical position
@@ -525,7 +542,7 @@ struct Program::Impl {
         check(cudaMemcpyAsync(logical.data, &logical_position, 4, cudaMemcpyHostToDevice, stream),
               "position upload");
         ops::sample(logits, out, vocab, static_cast<const ops::SamplingConfig*>(config_buf.p),
-                    logical, purpose, workspace, stream);
+                    logical, purpose, workspace, stream, sampler_capacity);
         std::int32_t token = 0;
         check(cudaMemcpyAsync(&token, out.data, 4, cudaMemcpyDeviceToHost, stream), "token copy");
         check(cudaStreamSynchronize(stream), "sample sync");
@@ -548,7 +565,7 @@ struct Program::Impl {
         gemma4_logits(column, logits, model->final_norm, model->output_head, model->softcap,
                       model->rms_eps, gemm, workspace, stream);
         ops::sample(logits, out, vocab, static_cast<const ops::SamplingConfig*>(config_buf.p),
-                    logical, ops::kSamplePurposeDecode, workspace, stream);
+                    logical, ops::kSamplePurposeDecode, workspace, stream, sampler_capacity);
         auto* host = static_cast<std::int32_t*>(step_host.data());
         check(cudaMemcpyAsync(host + 3, out.data, 4, cudaMemcpyDeviceToHost, stream), "token copy");
     }
@@ -649,7 +666,7 @@ struct Program::Impl {
             Tensor licensed(slots + kRoundLicensed, DType::I32, {1});
             const Tensor logical(slots + kRoundLogical, DType::I32, {1});
             ops::sample(logits, licensed, vocab, config, logical, ops::kSamplePurposeDecode,
-                        workspace, stream);
+                        workspace, stream, sampler_capacity);
             return;
         }
         const auto k = static_cast<std::int32_t>(drafts);
@@ -664,7 +681,7 @@ struct Program::Impl {
         Tensor accepted(slots + kRoundAccepted, DType::I32, {1});
         ops::speculative_accept_greedy_drafts(targets, verify_logits, draft_ids, extents, lengths,
                                               anchors, licensed, counts, accepted, vocab, config,
-                                              workspace, stream);
+                                              workspace, stream, sampler_capacity);
     }
 
     PendingBatch speculative_round(std::uint32_t remaining,

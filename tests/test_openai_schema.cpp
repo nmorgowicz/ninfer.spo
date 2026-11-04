@@ -756,8 +756,15 @@ int test_stops_and_ranges() {
     failures +=
         check(api_error([&] { (void)parse(body); }).param == "stop", "empty stop string rejected");
 
-    body                                  = base_request();
-    body["top_k"]                         = 21;
+    // top_k reaches 64 (Gemma 4's recommendation); 65 is outside every model's range.
+    body          = base_request();
+    body["top_k"] = 64;
+    failures += check(options(parse(body).generation).execution.sampling.top_k == 64,
+                      "top_k 64 was not accepted and lowered to Engine request options");
+    body["top_k"] = 21;
+    failures += check(options(parse(body).generation).execution.sampling.top_k == 21,
+                      "top_k 21 was not accepted");
+    body["top_k"]                         = 65;
     const GenerationRequest invalid_top_k = parse(body).generation;
     failures += check(api_error([&] { (void)options(invalid_top_k); }).param == "top_k",
                       "Engine translator owns sampler value range");

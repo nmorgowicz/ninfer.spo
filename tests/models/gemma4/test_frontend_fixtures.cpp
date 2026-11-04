@@ -307,8 +307,21 @@ int main() {
         }
         std::cout << "context length: " << (length_ok ? "rejected" : "FAIL not rejected") << '\n';
 
-        const bool ok =
-            token_failures == 0 && chat_failures == 0 && output_failures == 0 && length_ok;
+        // Gemma 4's recommended sampling is temperature 1.0, top_p 0.95, top_k 64, and the
+        // model serves the whole 64-candidate range.
+        const ninfer::ModelSamplingDefaults defaults = frontend.sampling_defaults();
+        const auto same_preset = [](const ninfer::SamplingPreset& preset) {
+            return preset.temperature == 1.0F && preset.top_k == 64 && preset.top_p == 0.95F &&
+                   preset.min_p == 0.0F && preset.presence_penalty == 0.0F &&
+                   preset.frequency_penalty == 0.0F;
+        };
+        const bool defaults_ok = same_preset(defaults.thinking) &&
+                                 same_preset(defaults.non_thinking) &&
+                                 defaults.max_top_k == ninfer::kMaxSamplingTopK;
+        std::cout << "sampling defaults: " << (defaults_ok ? "top_k 64" : "FAIL") << '\n';
+
+        const bool ok = token_failures == 0 && chat_failures == 0 && output_failures == 0 &&
+                        length_ok && defaults_ok;
         std::cout << (ok ? "OK" : "FAIL") << " gemma4 frontend fixtures\n";
         return ok ? 0 : 1;
     } catch (const std::exception& error) {

@@ -1072,10 +1072,19 @@ the conservative general envelope even for greedy inputs. `--reject-at J` change
 exercise rejection; `--extent 0` checks the bonus-only case. These DFlash2 measurements do not
 measure Engine inference.
 
+`--top-k` takes 1..64. Up to 20 it runs the 20-wide sampling pipeline (what Qwen3.5 and Flash-Next
+use); 21..64 runs the 64-wide pipeline that Gemma 4 uses, and `--wide` forces the 64-wide
+pipeline at any `--top-k` to compare the two at equal work. Each G2/G3 line prints `cap=20` or
+`cap=64`. `--matrix` adds 64-wide rows at `top_k=20` and `top_k=64`. G4 (the DFlash2 sparse
+accept) always uses the 20-wide pipeline and rejects `--top-k` above 20 and `--wide`.
+
 ```bash
 ./build/bench/ninfer_sampling_select_bench --matrix
 ./build/bench/ninfer_sampling_select_bench --sample --batch 8 --mode stochastic --top-k 20
+./build/bench/ninfer_sampling_select_bench --sample --batch 1 --mode stochastic --top-k 64
+./build/bench/ninfer_sampling_select_bench --sample --batch 1 --mode stochastic --top-k 20 --wide
 ./build/bench/ninfer_sampling_select_bench --mtp --mode stochastic --mtp-k 5 --top-k 20
+./build/bench/ninfer_sampling_select_bench --mtp --mode stochastic --mtp-k 5 --top-k 64
 ./build/bench/ninfer_sampling_select_bench \
   --dflash2 --drafts 15 --batch 8 --mode greedy --graph-calls 32 --warmup 8 --repeat 60
 ./build/bench/ninfer_sampling_select_bench \

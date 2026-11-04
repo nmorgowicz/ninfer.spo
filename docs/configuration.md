@@ -113,7 +113,7 @@ The engine does not read these. The scripts, tests, and probes that do are named
 | `--cors` | off | Permissive CORS. |
 | `--temperature` | | 0..2. |
 | `--top-p` | | 0..1. |
-| `--top-k` | | 0..20. |
+| `--top-k` | | 0..64; 0 is the model's default. The loaded model's ceiling applies: 20 for Qwen3.5 and Flash-Next, 64 for Gemma 4. |
 | `--min-p` | | 0..1. |
 | `--presence-penalty` | | -2..2. |
 | `--frequency-penalty` | | -2..2. |

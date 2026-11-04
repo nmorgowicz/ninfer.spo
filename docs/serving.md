@@ -94,7 +94,9 @@ The endpoint supports:
 - nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
   processing without generation;
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
-- the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
+- the compatible `top_k` (`0..64`; the loaded model's own ceiling applies, 20 for Qwen3.5 and
+  Flash-Next and 64 for Gemma 4, and a larger value is a 400 on `top_k`) and `min_p` (`0..1`)
+  sampler extensions; `top_k` 0 means the model's default `top_k`;
 - up to four non-empty stop strings, applied to both reasoning and answer output;
 - `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
 - non-streaming responses and server-sent event streams;
@@ -866,7 +868,7 @@ Flags and defaults are in `docs/configuration.md`.
 
 Context-cost coefficients resolve once at startup from generic defaults, matching compiled values, and optional transfer or prefill entries from `--context-cost-presets`. Prefill entries match the hardware and a signature derived from the text and vision configuration, bindings, and uses. A representation without a matching measurement uses the generic prefill coefficients. A malformed file aborts startup. The operational context-cost record and the JSONL `server_start` name the source that was selected.
 
-Sampling defaults come from the loaded architecture and the request's resolved thinking mode. Flash-Next and Qwen3.5 use temperature 1.0, top-p 0.95, and top-k 20 while thinking, and temperature 0.7, top-p 0.80, top-k 20, and presence penalty 1.5 when thinking is off. Qwen3.5 MoE also uses presence penalty 1.5 while thinking. Gemma 4 uses temperature 1.0, top-k 20, and top-p 0.95. Frequency penalty is 0. Process flags override the preset, request fields override process flags, and `--greedy` forces temperature 0.
+Sampling defaults come from the loaded architecture and the request's resolved thinking mode. Flash-Next and Qwen3.5 use temperature 1.0, top-p 0.95, and top-k 20 while thinking, and temperature 0.7, top-p 0.80, top-k 20, and presence penalty 1.5 when thinking is off. Qwen3.5 MoE also uses presence penalty 1.5 while thinking. Gemma 4 uses temperature 1.0, top-k 64, and top-p 0.95. Frequency penalty is 0. Process flags override the preset, request fields override process flags, and `--greedy` forces temperature 0. `top_k` runs from 1 to the model's candidate ceiling, which is 20 for Flash-Next and Qwen3.5 and 64 for Gemma 4; 0 selects the preset's `top_k`. `--top-k` above the loaded model's ceiling stops the server at startup, and a request above it is a 400 naming `top_k`.
 
 For `C=--max-concurrency` and `H=--device-state-slots`, total device state images are `C+H`. Host state and KV share one byte budget fixed at startup. That budget is context storage, not a cap on process RAM. `--host-context-mib 0` disables the host context backing.
 
@@ -920,8 +922,9 @@ prompt and tools first: it prefills them and leaves a checkpoint at the end of t
   once replies reach a few hundred tokens. Greedy rounds keep the argmax; sampled rounds
   (temperature above 0 or a penalty) accept each draft with its target probability and draw the
   correction from the residual, so output follows the same distribution as plain decode. `top_k`
-  above 20 is rejected (400), so Gemma's suggested 64 cannot be sent; the model default is
-  `temperature` 1.0, `top_k` 20, `top_p` 0.95.
+  runs up to 64 (the model default is `temperature` 1.0, `top_k` 64, `top_p` 0.95), including in
+  sampled MTP rounds; requests with `top_k` of 20 or less use the 20-wide sampling kernels, wider
+  ones the 64-wide kernels.
 - `tool_choice` `required` and a named function force the tool-call opener into the prompt.
   Arguments are not grammar-constrained, and `response_format` and other output constraints are
   rejected for Gemma.

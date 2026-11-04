@@ -1,7 +1,9 @@
 // Implements: include/ninfer/ops/sampling.h
 // Match: validated contiguous BF16/I32 tensors and a shared-layout workspace.
 // Algorithm assumptions: launcher and kernels use sampler_multiblock_ok() from
-// the same layout authority, so exactly one finite route owns each shape.
+// the same layout authority, so exactly one finite route owns each shape. The candidate
+// capacity (20 or 64) is a launch-time template choice; the 20-wide instantiation is the
+// original pipeline.
 #include "ops/launcher/sampling.h"
 
 #include "ops/common/math.h"
@@ -16,38 +18,57 @@ __global__ void increment_token_counts_kernel(const std::int32_t* token_ids, std
     if (index < count) { atomicAdd(&token_counts[token_ids[index]], 1); }
 }
 
-std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain, std::int32_t columns) {
-    return make_sampling_workspace_layout(token_domain, columns).bytes;
+std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain, std::int32_t columns,
+                                           std::int32_t top_k_capacity) {
+    return make_sampling_workspace_layout(token_domain, columns, top_k_capacity).bytes;
 }
 
-void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
-                         const SamplingConfig* configs, const Tensor& logical_positions,
-                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream) {
+namespace {
+
+template <int Cap>
+void sample_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
+                   const SamplingConfig* configs, const std::int32_t* positions,
+                   std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream) {
     const std::int32_t physical_rows     = logits.ne[0];
     const std::int32_t batch             = logits.ne[1];
-    const auto* positions                = static_cast<const std::int32_t*>(logical_positions.data);
-    const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, batch);
+    const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, batch, Cap);
     if (!layout.multiblock) {
-        sample_row_kernel<<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(
+        sample_row_kernel<Cap><<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(logits.data), static_cast<std::int32_t*>(out.data),
             configs, positions, purpose, token_domain, physical_rows);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
     const std::int32_t partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
-    const std::int32_t groups         = sampler_group_count(partial_blocks);
+    const std::int32_t groups         = sampler_group_count<Cap>(partial_blocks);
     const SamplingWorkspace scratch   = layout.bind(workspace);
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(batch));
-    sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(
+    sampling_partial_topk_kernel<Cap><<<partial_grid, kSamplerBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits.data), configs, token_domain, physical_rows,
         scratch);
     CUDA_CHECK(cudaGetLastError());
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(batch));
-    sampling_group_finalize_sample_kernel<<<group_grid, kSamplerGroupBlock, 0, stream>>>(
+    sampling_group_finalize_sample_kernel<Cap><<<group_grid, kSamplerGroupBlock, 0, stream>>>(
         static_cast<std::int32_t*>(out.data), configs, positions, purpose, token_domain,
         partial_blocks, groups, scratch);
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
+                         const SamplingConfig* configs, const Tensor& logical_positions,
+                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream,
+                         std::int32_t top_k_capacity) {
+    const auto* positions = static_cast<const std::int32_t*>(logical_positions.data);
+    if (top_k_capacity == kSamplerWideCandidates) {
+        sample_launch<kSamplerWideCandidates>(logits, out, token_domain, configs, positions,
+                                              purpose, workspace, stream);
+    } else {
+        sample_launch<kSamplerFastCandidates>(logits, out, token_domain, configs, positions,
+                                              purpose, workspace, stream);
+    }
 }
 
 void increment_token_counts_launch(const Tensor& token_ids, Tensor& token_counts,

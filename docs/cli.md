@@ -232,7 +232,7 @@ Only one speculative backend can be enabled per engine. DFlash accepts one to fi
 
 Flags and defaults are in `docs/configuration.md`. The CLI context and KV defaults are 2048, and its prefill chunk default is 1024. `ninfer-spo --help` prints the same contract.
 
-When a sampling flag is omitted, the engine uses the loaded architecture and the rendered thinking mode. Flash-Next and Qwen3.5 use temperature 1.0, top-p 0.95, and top-k 20 while thinking, and temperature 0.7, top-p 0.80, top-k 20, and presence penalty 1.5 when thinking is off. Qwen3.5 MoE also uses presence penalty 1.5 while thinking. Gemma 4 uses temperature 1.0, top-k 20, and top-p 0.95. Frequency penalty is 0.
+When a sampling flag is omitted, the engine uses the loaded architecture and the rendered thinking mode. Flash-Next and Qwen3.5 use temperature 1.0, top-p 0.95, and top-k 20 while thinking, and temperature 0.7, top-p 0.80, top-k 20, and presence penalty 1.5 when thinking is off. Qwen3.5 MoE also uses presence penalty 1.5 while thinking. Gemma 4 uses temperature 1.0, top-k 64, and top-p 0.95. Frequency penalty is 0. `--top-k` takes 0 to 64 and the loaded model enforces its own ceiling: 20 for Flash-Next and Qwen3.5, 64 for Gemma 4. `--top-k 0` selects the model's default top-k.
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include generated token IDs in diagnostics.
 

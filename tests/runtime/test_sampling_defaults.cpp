@@ -5,6 +5,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace {
@@ -88,15 +89,52 @@ int main() {
     failures += check(overridden.temperature == 0.0F && overridden.top_k == 20 &&
                           overridden.top_p == 0.0F && overridden.presence_penalty == 0.0F &&
                           overridden.frequency_penalty == -1.0F && overridden.seed == 123,
-                      "explicit zero sampling overrides were not normalized to the target cap");
+                      "explicit zero sampling overrides were not normalized to the model default");
 
-    overrides.top_k = 21;
-    failures += check(throws_invalid([&] {
-                          (void)ninfer::runtime::resolve_sampling(
-                              dense, ninfer::SamplingMode::Thinking, overrides);
-                      }),
-                      "top_k beyond the executable candidate domain was accepted");
+    // Qwen3.5 and Flash-Next keep the 20-candidate ceiling: nothing above 20 resolves.
+    failures += check(dense.max_top_k == 20 && moe.max_top_k == 20,
+                      "Qwen presets lost the 20-candidate ceiling");
+    for (const std::int32_t rejected : {21, 64, 65}) {
+        overrides.top_k = rejected;
+        failures += check(throws_invalid([&] {
+                              (void)ninfer::runtime::resolve_sampling(
+                                  dense, ninfer::SamplingMode::Thinking, overrides);
+                          }),
+                          "top_k beyond the model's candidate ceiling was accepted");
+    }
+    overrides.top_k = 20;
+    failures += check(ninfer::runtime::resolve_sampling(dense, ninfer::SamplingMode::Thinking,
+                                                        overrides)
+                              .top_k == 20,
+                      "top_k at the Qwen ceiling was rejected");
     overrides.top_k = 0;
+
+    // A model that serves 64 candidates (Gemma 4): its preset default is 64, an explicit value
+    // up to 64 resolves as given, top_k 0 means the model default, and 65 is rejected.
+    ninfer::ModelSamplingDefaults wide;
+    wide.thinking     = {.temperature = 1.0F, .top_k = 64, .top_p = 0.95F};
+    wide.non_thinking = wide.thinking;
+    wide.max_top_k    = ninfer::kMaxSamplingTopK;
+    const auto resolve_wide = [&](std::optional<std::int32_t> top_k) {
+        ninfer::SamplingOverrides request;
+        request.top_k = top_k;
+        return ninfer::runtime::resolve_sampling(wide, ninfer::SamplingMode::Thinking, request);
+    };
+    failures += check(resolve_wide(std::nullopt).top_k == 64 && resolve_wide(0).top_k == 64 &&
+                          resolve_wide(21).top_k == 21 && resolve_wide(64).top_k == 64 &&
+                          resolve_wide(1).top_k == 1,
+                      "64-candidate model resolved top_k incorrectly");
+    failures += check(throws_invalid([&] { (void)resolve_wide(65); }) &&
+                          throws_invalid([&] { (void)resolve_wide(-1); }),
+                      "64-candidate model accepted an out-of-range top_k");
+    // A preset that carries no top_k still resolves top_k 0 to the 20-wide pipeline.
+    ninfer::ModelSamplingDefaults bare;
+    bare.thinking     = {.temperature = 1.0F};
+    bare.non_thinking = bare.thinking;
+    failures += check(ninfer::runtime::resolve_sampling(bare, ninfer::SamplingMode::Thinking,
+                                                        ninfer::SamplingOverrides{.top_k = 0})
+                              .top_k == 20,
+                      "top_k 0 without a preset top_k did not select the 20-wide default");
 
     overrides.temperature = std::numeric_limits<float>::quiet_NaN();
     failures += check(throws_invalid([&] {

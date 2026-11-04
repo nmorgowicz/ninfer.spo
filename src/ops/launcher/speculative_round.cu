@@ -47,19 +47,22 @@ void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& 
     CUDA_CHECK(cudaGetLastError());
 }
 
-void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
-                                             const Tensor& drafts, const Tensor& current_extents,
-                                             Tensor& lengths, Tensor& anchors,
-                                             Tensor& licensed_tokens, Tensor& licensed_counts,
-                                             Tensor& accepted, std::int32_t token_domain,
-                                             const SamplingConfig* configs, DeviceSpan workspace,
-                                             cudaStream_t stream) {
-    const std::int32_t physical_rows     = logits.ne[0];
-    const std::int32_t cols              = drafts.ne[0] + 1;
-    const std::int32_t batch             = drafts.ne[1];
-    const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, cols);
+namespace {
+
+template <int Cap>
+void accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
+                                 const Tensor& drafts, const Tensor& current_extents,
+                                 Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
+                                 Tensor& licensed_counts, Tensor& accepted,
+                                 std::int32_t token_domain, const SamplingConfig* configs,
+                                 DeviceSpan workspace, cudaStream_t stream) {
+    const std::int32_t physical_rows = logits.ne[0];
+    const std::int32_t cols          = drafts.ne[0] + 1;
+    const std::int32_t batch         = drafts.ne[1];
+    const SamplingWorkspaceLayout layout =
+        make_sampling_workspace_layout(token_domain, cols, Cap);
     if (!layout.multiblock) {
-        speculative_accept_greedy_drafts_kernel<<<batch, kSamplerBlock, 0, stream>>>(
+        speculative_accept_greedy_drafts_kernel<Cap><<<batch, kSamplerBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(target_tokens.data),
             static_cast<const __nv_bfloat16*>(logits.data),
             static_cast<const std::int32_t*>(drafts.data),
@@ -73,11 +76,11 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
         return;
     }
     const std::int32_t partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
-    const std::int32_t groups         = sampler_group_count(partial_blocks);
+    const std::int32_t groups         = sampler_group_count<Cap>(partial_blocks);
     const SamplingWorkspace scratch   = layout.bind(workspace);
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(cols), static_cast<unsigned int>(batch));
-    speculative_sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(
+    speculative_sampling_partial_topk_kernel<Cap><<<partial_grid, kSamplerBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits.data),
         static_cast<const std::int32_t*>(drafts.data),
         static_cast<const std::int32_t*>(current_extents.data), configs, token_domain,
@@ -86,7 +89,7 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
     const dim3 batched_group_grid(static_cast<unsigned int>(groups),
                                   static_cast<unsigned int>(cols),
                                   static_cast<unsigned int>(batch));
-    speculative_sampling_group_finalize_kernel<false>
+    speculative_sampling_group_finalize_kernel<Cap, false>
         <<<batched_group_grid, kSamplerGroupBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(target_tokens.data),
             static_cast<const std::int32_t*>(drafts.data), nullptr, nullptr,
@@ -97,6 +100,26 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
             static_cast<std::int32_t*>(accepted.data), configs, token_domain, cols, partial_blocks,
             groups, scratch, layout.bytes);
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
+                                             const Tensor& drafts, const Tensor& current_extents,
+                                             Tensor& lengths, Tensor& anchors,
+                                             Tensor& licensed_tokens, Tensor& licensed_counts,
+                                             Tensor& accepted, std::int32_t token_domain,
+                                             const SamplingConfig* configs, DeviceSpan workspace,
+                                             cudaStream_t stream, std::int32_t top_k_capacity) {
+    if (top_k_capacity == kSamplerWideCandidates) {
+        accept_greedy_drafts_launch<kSamplerWideCandidates>(
+            target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
+            licensed_counts, accepted, token_domain, configs, workspace, stream);
+    } else {
+        accept_greedy_drafts_launch<kSamplerFastCandidates>(
+            target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
+            licensed_counts, accepted, token_domain, configs, workspace, stream);
+    }
 }
 
 void speculative_accept_sparse_drafts_launch(
@@ -120,11 +143,12 @@ void speculative_accept_sparse_drafts_launch(
 
     const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, cols);
     const std::int32_t partial_blocks    = div_up(token_domain, kSamplerPartialTileItems);
-    const std::int32_t groups            = sampler_group_count(partial_blocks);
+    const std::int32_t groups = sampler_group_count<kSamplerFastCandidates>(partial_blocks);
     const SamplingWorkspace scratch      = layout.bind(workspace);
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(cols), static_cast<unsigned int>(batch));
-    speculative_sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(
+    speculative_sampling_partial_topk_kernel<kSamplerFastCandidates>
+        <<<partial_grid, kSamplerBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits.data),
         static_cast<const std::int32_t*>(drafts.data),
         static_cast<const std::int32_t*>(current_extents.data), configs, token_domain, logits.ne[0],
@@ -134,7 +158,8 @@ void speculative_accept_sparse_drafts_launch(
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(cols),
                           static_cast<unsigned int>(batch));
 
-    speculative_sampling_group_finalize_kernel<true><<<group_grid, kSamplerGroupBlock, 0, stream>>>(
+    speculative_sampling_group_finalize_kernel<kSamplerFastCandidates, true>
+        <<<group_grid, kSamplerGroupBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(target_tokens.data),
         static_cast<const std::int32_t*>(drafts.data),
         static_cast<const std::int32_t*>(candidate_ids.data),

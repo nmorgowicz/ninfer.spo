@@ -118,7 +118,7 @@ ninfer-spo-serve <artifact> --port 8080 --model-id local --max-context 16384 --k
     --device-state-slots 4 --host-context-mib 8192
 ```
 
-One request at a time. A client that omits sampling gets temperature 1.0, top_k 20, top_p 0.95; top_k above 20 is rejected. Four drafts is fastest for replies of 20 to 100 tokens; `--draft-tokens auto` (6) is faster once replies reach a few hundred tokens. The server uses 44.4 GiB at 16k context and 45.7 GiB at 32k. The checkpoint behaviour, the prewarm request, and the sizing are in `docs/serving.md` under "Gemma 4 for voice chat".
+One request at a time. A client that omits sampling gets temperature 1.0, top_k 64, top_p 0.95; top_k above 64 is rejected. Four drafts is fastest for replies of 20 to 100 tokens; `--draft-tokens auto` (6) is faster once replies reach a few hundred tokens. The server uses 44.4 GiB at 16k context and 45.7 GiB at 32k. The checkpoint behaviour, the prewarm request, and the sizing are in `docs/serving.md` under "Gemma 4 for voice chat".
 
 ### Speed
 
