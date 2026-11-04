@@ -172,7 +172,11 @@ Per global layer a page holds 131,072 B of codes plus 4,096 B of scales per
 K/V plane, so the 31B geometry (10 global layers, four KV heads) stores
 42,240 B/token including 1,280 B/token of scales, versus 41,280 B/token for
 FP8 and 81,920 B/token for BF16 (5.16 GiB at 131,072 tokens). INT8 is a
-quality fallback hypothesis, not a capacity lever over FP8. Any NaN, infinity
+quality fallback hypothesis, not a capacity lever over FP8. Measured on one
+artifact and corpus (teacher-forced, 4096 and 65536/32768 contexts, plus a
+120-case needle grid), INT8 was indistinguishable from FP8 in fidelity and
+retrieval and slower in long-context decode (MTP at 100k: 18.3 vs 26.5 tok/s), so
+it showed no advantage; it remains unqualified. Any NaN, infinity
 or FP16-overflowing scale in a 64-element group poisons that group (NaN scale,
 zero codes). Checkpoints, copy-on-write and host restore cover all four
 global code/scale planes.
