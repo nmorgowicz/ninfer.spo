@@ -45,7 +45,8 @@ int main() {
     catch (const std::invalid_argument&) { missing_qk_rejected = true; }
     failures += check(missing_qk_rejected, "missing QK value accepted");
     for (bool gemma : {false, true}) {
-        for (auto storage : {ninfer::KvCacheStorage::BFloat16, ninfer::KvCacheStorage::Fp8E4M3Row256}) {
+        for (auto storage : {ninfer::KvCacheStorage::BFloat16, ninfer::KvCacheStorage::Fp8E4M3Row256,
+                             ninfer::KvCacheStorage::Int8Group64}) {
             bool rejected = false;
             try { ninfer::validate_gemma4_qk(Qk::Fp8, storage, gemma); }
             catch (const std::invalid_argument&) { rejected = true; }
@@ -54,6 +55,19 @@ int main() {
             ninfer::validate_gemma4_qk(Qk::BFloat16, storage, gemma);
         }
     }
+    const ServeOptions int8 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "int8"});
+    failures += check(int8.kv_cache == ninfer::KvCacheStorage::Int8Group64 &&
+                          int8.gemma4_qk == Qk::BFloat16,
+                      "--kv-dtype int8 did not select INT8-G64 KV with the default BF16 QK");
+    bool int8_qk_rejected = false;
+    try {
+        const ServeOptions combined = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "int8",
+                                             "--gemma4-qk", "fp8"});
+        ninfer::validate_gemma4_qk(combined.gemma4_qk, combined.kv_cache, true);
+    } catch (const std::invalid_argument& error) {
+        int8_qk_rejected = std::string_view(error.what()).find("int8") != std::string_view::npos;
+    }
+    failures += check(int8_qk_rejected, "INT8 KV with FP8 QK was not rejected with a clear error");
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");

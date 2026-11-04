@@ -16,17 +16,21 @@ inline void validate_gemma4_cache(const Gemma4CacheView& cache, int head_dim, bo
         fail("cache requires k/v pages and block_table");
     }
     const bool fp8 = cache.format == Gemma4KvFormat::Fp8E4m3Row256;
-    if (!fp8 && cache.format != Gemma4KvFormat::BFloat16) { fail("unknown cache format"); }
-    if (fp8 && (head_dim != 512 || !global)) { fail("FP8 requires D512 global attention"); }
+    const bool int8 = cache.format == Gemma4KvFormat::Int8Group64;
+    const bool quantized = fp8 || int8;
+    if (!quantized && cache.format != Gemma4KvFormat::BFloat16) { fail("unknown cache format"); }
+    if (quantized && (head_dim != 512 || !global)) {
+        fail(int8 ? "INT8 requires D512 global attention" : "FP8 requires D512 global attention");
+    }
     if (cache.qk_mode != Gemma4QkMode::BFloat16 && cache.qk_mode != Gemma4QkMode::Fp8) {
         fail("unknown QK mode");
     }
     if (cache.qk_mode == Gemma4QkMode::Fp8 && (!fp8 || head_dim != 512 || !global)) {
-        fail("FP8 QK requires D512 global FP8 cache");
+        fail("FP8 QK requires D512 global FP8 cache (not supported with INT8 KV)");
     }
     const Tensor& k = *cache.k_pages;
     const Tensor& v = *cache.v_pages;
-    const DType dtype = fp8 ? DType::U8 : DType::BF16;
+    const DType dtype = fp8 ? DType::U8 : int8 ? DType::I8 : DType::BF16;
     if (k.dtype != dtype || v.dtype != dtype || !k.is_contiguous() || !v.is_contiguous() ||
         !k.data || !v.data) { fail("cache pages must have matching contiguous non-null storage"); }
     if (k.ne[0] != head_dim || k.ne[1] != kGemma4KvPageTokens || k.ne[2] <= 0 ||
@@ -39,17 +43,21 @@ inline void validate_gemma4_cache(const Gemma4CacheView& cache, int head_dim, bo
         table.ne[1] != 1 || table.ne[2] != 1 || table.ne[3] != 1) {
         fail("block_table must be contiguous non-null nonempty I32 [logical_pages]");
     }
-    if (!fp8) {
+    if (!quantized) {
         if (cache.k_scales || cache.v_scales) { fail("BF16 cache must not have scale planes"); }
         return;
     }
-    if (!cache.k_scales || !cache.v_scales) { fail("FP8 cache requires both scale planes"); }
+    if (!cache.k_scales || !cache.v_scales) {
+        fail(int8 ? "INT8 cache requires both scale planes" : "FP8 cache requires both scale planes");
+    }
+    const int group = int8 ? kGemma4KvInt8Group : kGemma4KvFp8Group;
     for (const Tensor* scales : {cache.k_scales, cache.v_scales}) {
         if (scales->dtype != DType::FP16 || !scales->is_contiguous() || !scales->data ||
-            scales->ne[0] != head_dim / kGemma4KvFp8Group ||
+            scales->ne[0] != head_dim / group ||
             scales->ne[1] != kGemma4KvPageTokens || scales->ne[2] != k.ne[2] ||
             scales->ne[3] != k.ne[3]) {
-            fail("FP8 scales must be contiguous non-null FP16 [2,64,Hkv,pages]");
+            fail(int8 ? "INT8 scales must be contiguous non-null FP16 [8,64,Hkv,pages]"
+                      : "FP8 scales must be contiguous non-null FP16 [2,64,Hkv,pages]");
         }
     }
 }

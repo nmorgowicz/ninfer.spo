@@ -77,12 +77,12 @@ struct Cache {
     DeviceBuffer table_store{3 * sizeof(std::int32_t)};
     Tensor table;
     std::vector<g4::Gemma4CacheLayer> views;
-    Cache(const g4::LoadedText& model, ops::Gemma4QkMode qk_mode) {
+    Cache(const g4::LoadedText& model, ops::Gemma4QkMode qk_mode, KvCacheStorage storage) {
         const std::int32_t ids[] = {0, 1, 2};
         table_store.copy_from_host(ids, sizeof(ids));
         table = Tensor(table_store.p, DType::I32, {3});
         for (const auto& layer : model.layers) {
-            const auto layout = g4::kv_layer_layout(KvCacheStorage::Fp8E4M3Row256,
+            const auto layout = g4::kv_layer_layout(storage,
                                                      layer.global_layer, layer.head_dim, 1);
             for (int plane = 0; plane != 2; ++plane) {
                 codes.emplace_back(layout.code_page_bytes * 3); codes.back().fill(0);
@@ -98,7 +98,7 @@ struct Cache {
         }
         for (std::size_t i = 0; i < model.layers.size(); ++i) {
             const bool global = model.layers[i].global_layer;
-            views.push_back({.format = global ? ops::Gemma4KvFormat::Fp8E4m3Row256
+            views.push_back({.format = global ? g4::gemma4_kv_format(storage)
                                                : ops::Gemma4KvFormat::BFloat16,
                 // Sliding descriptors retain BF16 QK.
                 .k_pages = &code_tensors[2*i], .v_pages = &code_tensors[2*i+1],
@@ -109,8 +109,9 @@ struct Cache {
     }
 };
 
-void target_and_draft(Fixture& fixture, cudaStream_t stream, ops::Gemma4QkMode qk_mode) {
-    Cache cache(fixture.model, qk_mode);
+void target_and_draft(Fixture& fixture, cudaStream_t stream, ops::Gemma4QkMode qk_mode,
+                      KvCacheStorage storage) {
+    Cache cache(fixture.model, qk_mode, storage);
     require(cache.views[0].qk_mode == qk_mode &&
                 cache.views[1].qk_mode == ops::Gemma4QkMode::BFloat16,
             "QK selector applies only to global cache");
@@ -161,8 +162,8 @@ void target_and_draft(Fixture& fixture, cudaStream_t stream, ops::Gemma4QkMode q
     }
 }
 
-void four_plane_checkpoint(cudaStream_t stream) {
-    const auto layout = g4::kv_layer_layout(KvCacheStorage::Fp8E4M3Row256, true, 512, 1);
+void four_plane_checkpoint(cudaStream_t stream, KvCacheStorage storage) {
+    const auto layout = g4::kv_layer_layout(storage, true, 512, 1);
     const std::size_t strides[] = {layout.code_page_bytes, layout.code_page_bytes,
                                    layout.scale_page_bytes, layout.scale_page_bytes};
     std::vector<DeviceBuffer> buffers;
@@ -211,8 +212,18 @@ void four_plane_checkpoint(cudaStream_t stream) {
 
 void program_summary(Fixture& fixture, cudaStream_t stream) {
     for (auto qk : {ops::Gemma4QkMode::BFloat16, ops::Gemma4QkMode::Fp8})
-    for (auto format : {KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4M3Row256}) {
-        if (qk == ops::Gemma4QkMode::Fp8 && format != KvCacheStorage::Fp8E4M3Row256) continue;
+    for (auto format : {KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4M3Row256,
+                        KvCacheStorage::Int8Group64}) {
+        if (qk == ops::Gemma4QkMode::Fp8 && format != KvCacheStorage::Fp8E4M3Row256) {
+            // FP8 QK is only defined for FP8 codes; INT8 and BF16 caches must be refused.
+            bool rejected = false;
+            try {
+                g4::Program program(fixture.model,128,16,2,stream,
+                                    {.history=false,.extra_tokens=64},format,qk);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            require(rejected, "FP8 QK refused for non-FP8 KV cache");
+            continue;
+        }
         g4::Program program(fixture.model,128,16,2,stream,
                             {.history=false,.extra_tokens=64},format,qk);
         const auto memory = program.memory_summary();
@@ -237,9 +248,11 @@ int main() {
         cuda(cudaStreamCreate(&stream));
         {
             Fixture fixture;
-            target_and_draft(fixture,stream,ops::Gemma4QkMode::BFloat16);
-            target_and_draft(fixture,stream,ops::Gemma4QkMode::Fp8);
-            four_plane_checkpoint(stream);
+            for (auto storage : {KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Int8Group64}) {
+                target_and_draft(fixture, stream, ops::Gemma4QkMode::BFloat16, storage);
+                four_plane_checkpoint(stream, storage);
+            }
+            target_and_draft(fixture, stream, ops::Gemma4QkMode::Fp8, KvCacheStorage::Fp8E4M3Row256);
             program_summary(fixture,stream);
         }
         cuda(cudaStreamDestroy(stream));
@@ -247,6 +260,6 @@ int main() {
         if (stream) { cudaStreamDestroy(stream); }
         std::cerr << "EXC " << error.what() << '\n'; return 1;
     }
-    std::cout << (failures ? "FAIL" : "OK") << " Gemma4 FP8 runtime\n";
+    std::cout << (failures ? "FAIL" : "OK") << " Gemma4 quantized KV runtime\n";
     return failures ? 1 : 0;
 }

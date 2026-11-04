@@ -4,6 +4,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kernel/gemma4_fp8_kv.cuh"
+#include "ops/kernel/gemma4_int8_kv.cuh"
 #include "ops/kernel/rmsnorm.cuh"
 
 #include <cuda_bf16.h>
@@ -89,7 +90,7 @@ __device__ __forceinline__ void rotate(__nv_bfloat162 (&v)[D / 64], int position
     }
 }
 
-template <int D, int Rot, bool Fp8>
+template <int D, int Rot, Gemma4KvFormat Fmt>
 __global__ __launch_bounds__(kWarpsPerBlock * 32) void gemma4_qkv_prep_kernel(
     const __nv_bfloat162* qkv, std::int64_t column_pairs, const __nv_bfloat162* q_norm,
     const __nv_bfloat162* k_norm, const std::int32_t* positions, __nv_bfloat162* q_out,
@@ -134,8 +135,10 @@ __global__ __launch_bounds__(kWarpsPerBlock * 32) void gemma4_qkv_prep_kernel(
     const float k_inv = head_inv<D>(x, d, eps, lane);
     normalize<D>(x, k_norm, k_inv, lane, out);
     rotate<D, Rot>(out, position, rotary_dim, theta, lane);
-    if constexpr (Fp8) {
+    if constexpr (Fmt == Gemma4KvFormat::Fp8E4m3Row256) {
         gemma4_fp8_store(out, static_cast<std::uint8_t*>(k_pages), k_scales, slot * 2 / D, lane);
+    } else if constexpr (Fmt == Gemma4KvFormat::Int8Group64) {
+        gemma4_int8_store(out, static_cast<std::int8_t*>(k_pages), k_scales, slot * 2 / D, lane);
     } else {
 #pragma unroll
         for (int s = 0; s < D / 64; ++s) {
@@ -148,8 +151,10 @@ __global__ __launch_bounds__(kWarpsPerBlock * 32) void gemma4_qkv_prep_kernel(
         load_head<D>(column + v_rows + static_cast<std::int64_t>(kv_head) * kHeadPairs, lane, x);
     }
     normalize<D>(x, nullptr, v_from_k ? k_inv : head_inv<D>(x, d, eps, lane), lane, out);
-    if constexpr (Fp8) {
+    if constexpr (Fmt == Gemma4KvFormat::Fp8E4m3Row256) {
         gemma4_fp8_store(out, static_cast<std::uint8_t*>(v_pages), v_scales, slot * 2 / D, lane);
+    } else if constexpr (Fmt == Gemma4KvFormat::Int8Group64) {
+        gemma4_int8_store(out, static_cast<std::int8_t*>(v_pages), v_scales, slot * 2 / D, lane);
     } else {
 #pragma unroll
         for (int s = 0; s < D / 64; ++s) {
@@ -158,10 +163,11 @@ __global__ __launch_bounds__(kWarpsPerBlock * 32) void gemma4_qkv_prep_kernel(
     }
 }
 
-template <int D, int Rot, bool Fp8>
+template <int D, int Rot, Gemma4KvFormat Fmt>
 void launch(const Tensor& qkv, const Tensor& q_norm, const Tensor& k_norm, const Tensor& positions,
             int rotary_dim, float theta, float eps, bool v_from_k, Tensor& q_out,
             const Gemma4CacheView& cache, cudaStream_t stream) {
+    constexpr bool Quantized = Fmt != Gemma4KvFormat::BFloat16;
     const Tensor& k_pages = *cache.k_pages;
     const Tensor& block_table = *cache.block_table;
     const int q_heads  = q_out.ne[1];
@@ -170,14 +176,14 @@ void launch(const Tensor& qkv, const Tensor& q_norm, const Tensor& k_norm, const
     const dim3 grid(
         static_cast<unsigned>((q_heads + kv_heads + kWarpsPerBlock - 1) / kWarpsPerBlock),
         static_cast<unsigned>(tokens));
-    gemma4_qkv_prep_kernel<D, Rot, Fp8><<<grid, kWarpsPerBlock * 32, 0, stream>>>(
+    gemma4_qkv_prep_kernel<D, Rot, Fmt><<<grid, kWarpsPerBlock * 32, 0, stream>>>(
         static_cast<const __nv_bfloat162*>(qkv.data), qkv.ne[0] / 2,
         static_cast<const __nv_bfloat162*>(q_norm.data),
         static_cast<const __nv_bfloat162*>(k_norm.data),
         static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat162*>(q_out.data),
         k_pages.data, cache.v_pages->data,
-        Fp8 ? static_cast<__half*>(cache.k_scales->data) : nullptr,
-        Fp8 ? static_cast<__half*>(cache.v_scales->data) : nullptr,
+        Quantized ? static_cast<__half*>(cache.k_scales->data) : nullptr,
+        Quantized ? static_cast<__half*>(cache.v_scales->data) : nullptr,
         static_cast<const std::int32_t*>(block_table.data), q_heads, kv_heads, rotary_dim, D, theta,
         eps, v_from_k, block_table.ne[0], k_pages.ne[3]);
 }
@@ -190,15 +196,20 @@ void gemma4_qkv_prep_launch(const Tensor& qkv, const Tensor& q_norm, const Tenso
                             cudaStream_t stream) {
     const int head_dim = q_out.ne[0];
     if (head_dim == 256 && rotary_dim == 256) {
-        launch<256, 2, false>(qkv, q_norm, k_norm, positions, rotary_dim, theta, eps, v_from_k,
-                              q_out, cache, stream);
+        launch<256, 2, Gemma4KvFormat::BFloat16>(qkv, q_norm, k_norm, positions, rotary_dim, theta,
+                                                 eps, v_from_k, q_out, cache, stream);
     } else if (head_dim == 512 && rotary_dim == 128) {
         if (cache.format == Gemma4KvFormat::Fp8E4m3Row256) {
-            launch<512, 1, true>(qkv, q_norm, k_norm, positions, rotary_dim, theta, eps, v_from_k,
-                                 q_out, cache, stream);
+            launch<512, 1, Gemma4KvFormat::Fp8E4m3Row256>(qkv, q_norm, k_norm, positions,
+                                                          rotary_dim, theta, eps, v_from_k, q_out,
+                                                          cache, stream);
+        } else if (cache.format == Gemma4KvFormat::Int8Group64) {
+            launch<512, 1, Gemma4KvFormat::Int8Group64>(qkv, q_norm, k_norm, positions,
+                                                        rotary_dim, theta, eps, v_from_k, q_out,
+                                                        cache, stream);
         } else {
-            launch<512, 1, false>(qkv, q_norm, k_norm, positions, rotary_dim, theta, eps, v_from_k,
-                                  q_out, cache, stream);
+            launch<512, 1, Gemma4KvFormat::BFloat16>(qkv, q_norm, k_norm, positions, rotary_dim,
+                                                     theta, eps, v_from_k, q_out, cache, stream);
         }
     } else {
         throw std::invalid_argument("gemma4_qkv_prep: D/rotary_dim must be 256/256 or 512/128");

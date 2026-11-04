@@ -40,8 +40,8 @@ report is `report.json` under `profiles/perplexity/` unless `--output` supplies 
 
 For KV-format comparisons, the recommended long-context profile is the full corpus with
 `--context 65536 --stride 32768` and without `--quick`. The default evaluator
-KV format is FP8. Gemma 4 accepts BF16 and experimental global-only FP8;
-its sliding rings remain BF16. Use `--kv-dtype bf16` for a BF16 baseline.
+KV format is FP8. Gemma 4 accepts BF16, experimental global-only FP8 and opt-in
+unqualified global-only INT8; its sliding rings remain BF16. Use `--kv-dtype bf16` for a BF16 baseline.
 Context plus prefix length must fit the artifact's native position limit.
 
 For Gemma 4, `--gemma4-qk bf16` (default) retains Phase 1 BF16 QK over

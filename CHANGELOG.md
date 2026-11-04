@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Opt-in, quality-unqualified Gemma 4 global-layer `--kv-dtype int8`: INT8 codes
+  with one FP16 scale per 64 elements (eight per D512 K/V vector, 42,240
+  B/token for the 31B geometry). Sliding rings, snapshots and vision stay BF16;
+  BF16 remains the default and FP8 behavior is unchanged. Target and MTP
+  attention dequantize to BF16 on read (SIMT and tensor-core staging); there
+  is no INT8 tensor-core path and no rotation. `--gemma4-qk fp8` with
+  `--kv-dtype int8` is rejected. All four global code/scale planes are
+  registered with checkpoints, copy-on-write and host capture/restore;
+  capacity sizing, startup/request-log fields and perplexity treat INT8 like
+  FP8.
+
 - Opt-in Gemma 4 `--gemma4-qk fp8` enables global D512 FP8 tensor-core QK
   for query widths ≥64 with FP8 KV storage. Two transient FP16-rounded Q
   scales match K's 256-element grouping; each FP32 partial is corrected

@@ -27,7 +27,9 @@ namespace ninfer::ops {
  * Global FP8 (D512, v_from_k) quantizes these final BF16-valued K/V per row-half,
  * using FP16-rounded bounded scales before reciprocal/encoding. A row-half containing
  * any nonfinite value stores canonical NaN codes with unit scale (including infinities);
- * finite rows are the supported domain. q_out stays BF16 [D,Hq,T]. No workspace.
+ * finite rows are the supported domain. Global INT8-G64 (D512, v_from_k) quantizes the same
+ * final K/V values per 64-element group with symmetric absmax/127 FP16-rounded scales; a group
+ * with any nonfinite value gets a NaN scale and zero codes. q_out stays BF16 [D,Hq,T]. No workspace.
  */
 void gemma4_qkv_prep(const Tensor& qkv, const Tensor& q_norm, const Tensor& k_norm,
                      const Tensor& positions, int rotary_dim, float theta, float eps, bool v_from_k,

@@ -953,13 +953,18 @@ earlier divergence resumes from an older frontier.
 | Budget | Size for the 31B |
 |---|---|
 | `--device-state-slots H` | H BF16 ring snapshots; chunk-dependent, not halved by FP8 |
-| spare KV pages | `min(resolved capacity x H, 65,536)` tokens at 80 KiB BF16 or 40.3125 KiB FP8 per token |
+| spare KV pages | `min(resolved capacity x H, 65,536)` tokens at 80 KiB BF16, 40.3125 KiB FP8 or 41.25 KiB INT8 per token |
 | `--host-context-mib` (default 8192) | pinned checkpoint storage; demotion holds its BF16 ring snapshot plus global code/scale payload |
 
 FP8 changes cache storage, not artifact quantization, Q precision or the
 BF16 attention products. MTP reads the same global code/scale planes.
 BF16 remains the serving default; vision and model quality require separate
 qualification. See [FP8 format and memory details](configuration.md#experimental-gemma-4-fp8-kv).
+
+Opt-in `--kv-dtype int8` (global layers only, unqualified for quality) stores
+42,240 B/token (41.25 KiB) including FP16 group-64 scales; ring snapshots stay
+BF16 and unchanged, and checkpoints carry all four code/scale planes. See
+[INT8 details](configuration.md#opt-in-gemma-4-int8-kv-unqualified).
 
 The least recently used checkpoint moves to the host when the slots or the page pool run out, and is
 dropped when the host arena is full too. A checkpoint counts as used whenever a prompt extends it,

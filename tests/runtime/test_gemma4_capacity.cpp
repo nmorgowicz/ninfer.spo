@@ -29,7 +29,18 @@ int main() {
     check(sliding.format == ops::Gemma4KvFormat::BFloat16 &&
               sliding.page_bytes() == 1048576 && sliding.scale_page_bytes == 0,
           "FP8 request leaves the sliding ring BF16");
-    for (const auto unsupported : {KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16,
+    const auto int8 = g4::kv_layer_layout(KvCacheStorage::Int8Group64, true, 512, 4);
+    const auto int8_sliding = g4::kv_layer_layout(KvCacheStorage::Int8Group64, false, 256, 16);
+    check(int8.format == ops::Gemma4KvFormat::Int8Group64 && int8.code_dtype == DType::I8 &&
+              int8.scale_groups == 8 && int8.code_page_bytes == 131072 &&
+              int8.scale_page_bytes == 4096 && int8.page_bytes() == 270336,
+          "INT8 codes and all eight FP16 group scales are counted");
+    check(int8_sliding.format == ops::Gemma4KvFormat::BFloat16 &&
+              int8_sliding.page_bytes() == 1048576 && int8_sliding.scale_page_bytes == 0,
+          "INT8 request leaves the sliding ring BF16");
+    rejects([&] { (void)g4::kv_layer_layout(KvCacheStorage::Int8Group64, true, 256, 4); },
+            "INT8 global D256 rejection");
+    for (const auto unsupported : {KvCacheStorage::Nvfp4Group16,
                                    KvCacheStorage::Fp8KeyNvfp4Value,
                                    KvCacheStorage::BFloat16KeyValue}) {
         rejects([&] { (void)g4::gemma4_kv_format(unsupported); }, "unsupported Gemma KV format");
@@ -57,6 +68,8 @@ int main() {
     check(g4::Program::kv_bytes_per_token(model) == 81920, "qualified BF16 global bytes/token");
     check(g4::Program::kv_bytes_per_token(model, KvCacheStorage::Fp8E4M3Row256) == 41280,
           "qualified FP8 global bytes/token includes 320 scale bytes");
+    check(g4::Program::kv_bytes_per_token(model, KvCacheStorage::Int8Group64) == 42240,
+          "qualified INT8 global bytes/token includes 1280 scale bytes");
     // fixed_bytes is intentionally format independent and conservative even at tiny capacity.
     const auto fixed = g4::Program::fixed_bytes(model, 128, 0);
     const auto snapshots = g4::Program::fixed_bytes(model, 128, 1) - fixed;

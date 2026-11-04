@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kernel/gemma4_fp8_kv.cuh"
+#include "ops/kernel/gemma4_int8_kv.cuh"
 
 #include <cuda_bf16.h>
 
@@ -42,10 +43,10 @@ __device__ __forceinline__ void load_row(const __nv_bfloat16* row, float (&out)[
     }
 }
 
-template <int E, bool Fp8>
+template <int E, Gemma4KvFormat Fmt>
 __device__ __forceinline__ void load_cache(const void* pages, const __half* scales,
                                           std::int64_t base, float (&out)[E]) {
-    if constexpr (Fp8) {
+    if constexpr (Fmt == Gemma4KvFormat::Fp8E4m3Row256) {
         const auto* codes = static_cast<const std::uint8_t*>(pages) + base;
         const __half scale = scales[(base / 512) * 2 + (base % 512) / kGemma4KvFp8Group];
 #pragma unroll
@@ -55,6 +56,21 @@ __device__ __forceinline__ void load_cache(const void* pages, const __half* scal
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 out[chunk * 8 + i] = __bfloat162float(gemma4_fp8_expand(bytes[i], scale));
+            }
+        }
+    } else if constexpr (Fmt == Gemma4KvFormat::Int8Group64) {
+        // E (16) divides the 64-element group, so one scale covers a lane's whole slice.
+        static_assert(64 % E == 0);
+        const auto* codes = static_cast<const std::int8_t*>(pages) + base;
+        const __half scale = scales[(base / 512) * kGemma4Int8Groups +
+                                    (base % 512) / kGemma4KvInt8Group];
+#pragma unroll
+        for (int chunk = 0; chunk < E / 8; ++chunk) {
+            const uint2 packed = reinterpret_cast<const uint2*>(codes)[chunk];
+            const auto* bytes = reinterpret_cast<const std::int8_t*>(&packed);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                out[chunk * 8 + i] = __bfloat162float(gemma4_int8_expand(bytes[i], scale));
             }
         }
     } else {
@@ -76,7 +92,7 @@ __device__ __forceinline__ float warp_sum(float value) {
 // softmax, holding D / 32 contiguous dimensions per lane. The splits of one head are merged in
 // shared memory. With one chunk the block writes the BF16 output; otherwise it writes its
 // normalized FP32 result and (max, sum) for gemma4_attention_combine_kernel.
-template <int D, bool Fp8>
+template <int D, Gemma4KvFormat Fmt>
 __global__ void gemma4_attention_kernel(
     const __nv_bfloat16* __restrict__ q, const void* __restrict__ k_pages,
     const void* __restrict__ v_pages, const __half* __restrict__ k_scales,
@@ -127,7 +143,7 @@ __global__ void gemma4_attention_kernel(
                 (static_cast<std::int64_t>(kvh) + static_cast<std::int64_t>(kv_heads) * physical) +
             static_cast<std::int64_t>(D) * (key & kPagedKVPageMask) + lane * E;
         float kv[E];
-        load_cache<E, Fp8>(k_pages, k_scales, base, kv);
+        load_cache<E, Fmt>(k_pages, k_scales, base, kv);
         float dot = 0.0f;
 #pragma unroll
         for (int dim = 0; dim < E; ++dim) { dot = fmaf(qv[dim], kv[dim], dot); }
@@ -137,7 +153,7 @@ __global__ void gemma4_attention_kernel(
         const float weight   = expf(score - next_max);
         running_sum          = running_sum * rescale + weight;
         running_max          = next_max;
-        load_cache<E, Fp8>(v_pages, v_scales, base, kv);
+        load_cache<E, Fmt>(v_pages, v_scales, base, kv);
 #pragma unroll
         for (int dim = 0; dim < E; ++dim) { acc[dim] = fmaf(acc[dim], rescale, weight * kv[dim]); }
     }
@@ -222,7 +238,7 @@ __global__ void gemma4_attention_combine_kernel(const float* __restrict__ partia
     }
 }
 
-template <int D, bool Fp8>
+template <int D, Gemma4KvFormat Fmt>
 void launch(const Tensor& q, const Gemma4CacheView& cache,
             const Tensor& positions, int window, float scale, Tensor& out,
             float* partial, float* partial_stats, cudaStream_t stream) {
@@ -252,10 +268,11 @@ void launch(const Tensor& q, const Gemma4CacheView& cache,
     if (chunks > 1 && (partial == nullptr || partial_stats == nullptr)) {
         throw std::invalid_argument("gemma4_attention: split keys need workspace");
     }
-    gemma4_attention_kernel<D, Fp8><<<grid, threads, shared, stream>>>(
+    constexpr bool Quantized = Fmt != Gemma4KvFormat::BFloat16;
+    gemma4_attention_kernel<D, Fmt><<<grid, threads, shared, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), k_pages.data, cache.v_pages->data,
-        Fp8 ? static_cast<const __half*>(cache.k_scales->data) : nullptr,
-        Fp8 ? static_cast<const __half*>(cache.v_scales->data) : nullptr,
+        Quantized ? static_cast<const __half*>(cache.k_scales->data) : nullptr,
+        Quantized ? static_cast<const __half*>(cache.v_scales->data) : nullptr,
         static_cast<const std::int32_t*>(block_table.data),
         static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(out.data),
         partial, partial_stats, q_heads, kv_heads, group, splits, chunks, window, scale,
@@ -287,11 +304,17 @@ void gemma4_attention_launch(const Tensor& q, const Gemma4CacheView& cache,
         return;
     }
     if (q.ne[0] == 256) {
-        launch<256, false>(q, cache, positions, window, scale, out, partial, stats, stream);
+        launch<256, Gemma4KvFormat::BFloat16>(q, cache, positions, window, scale, out, partial,
+                                              stats, stream);
     } else if (cache.format == Gemma4KvFormat::Fp8E4m3Row256) {
-        launch<512, true>(q, cache, positions, window, scale, out, partial, stats, stream);
+        launch<512, Gemma4KvFormat::Fp8E4m3Row256>(q, cache, positions, window, scale, out,
+                                                   partial, stats, stream);
+    } else if (cache.format == Gemma4KvFormat::Int8Group64) {
+        launch<512, Gemma4KvFormat::Int8Group64>(q, cache, positions, window, scale, out, partial,
+                                                 stats, stream);
     } else {
-        launch<512, false>(q, cache, positions, window, scale, out, partial, stats, stream);
+        launch<512, Gemma4KvFormat::BFloat16>(q, cache, positions, window, scale, out, partial,
+                                              stats, stream);
     }
 }
 

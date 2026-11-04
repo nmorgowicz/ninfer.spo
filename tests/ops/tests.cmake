@@ -48,6 +48,10 @@ ninfer_add_op_test(ninfer_gemma4_fp8_kv_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gemma4_fp8_kv.cu"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_gemma4_int8_kv_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gemma4_int8_kv.cu"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_gemma4_fp8_kv_runtime_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../models/gemma4/test_fp8_kv_runtime.cpp"
   LIBRARIES ninfer_model_runtime ninfer_ops)

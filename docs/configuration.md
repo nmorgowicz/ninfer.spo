@@ -97,7 +97,7 @@ The engine does not read these. The scripts, tests, and probes that do are named
 | `--response-store-max-records` | 1024 | Stored responses. |
 | `--response-store-max-mib` | 256 | Stored response bytes. |
 | `--device` | 0 | CUDA device. |
-| `--kv-dtype` | bf16 | KV storage: `bf16`, `int8`, `fp8`, `nvfp4`, or `k8v4`. Flash-Next accepts `bf16`, `fp8`, and `int8`. Gemma 4 accepts `bf16` and experimental global-only `fp8`; its sliding rings remain BF16. |
+| `--kv-dtype` | bf16 | KV storage: `bf16`, `int8`, `fp8`, `nvfp4`, or `k8v4`. Flash-Next accepts `bf16`, `fp8`, and `int8`. Gemma 4 accepts `bf16`, experimental global-only `fp8`, and opt-in unqualified global-only `int8`; its sliding rings remain BF16. |
 | `--gemma4-qk` | bf16 | Gemma 4 global attention QK: `bf16` keeps Phase 1 cache expansion; experimental `fp8` uses FP8 tensor cores for D512 MMA widths ≥64 and requires `--kv-dtype fp8`. Small-width SIMT and sliding D256 remain unchanged. Also accepted by CLI and perplexity. |
 | `--spec` | | Speculative backend: `mtp`, `dflash`, or `dflash2`. Flash-Next accepts only `mtp`, which `scripts/serve.cmd` uses. |
 | `--draft-tokens` | | Draft length: `auto` or digits. Flash-Next MTP takes `auto` or 1..7. Gemma 4 MTP takes the same; its `auto` is a fixed 6 drafts per round. |
@@ -142,7 +142,7 @@ K codes come directly from the cache. V still expands to BF16, and PV retains
 the hi/lo BF16 probability products. Short decode/MTP widths below 64 keep
 the existing SIMT arithmetic; sliding D256 is unchanged. No artifact
 reconversion is needed. FP8 QK is rejected for non-Gemma models or non-FP8 KV.
-BF16 KV and BF16 QK remain defaults. INT8/NVFP4/K8V4 remain unsupported for Gemma.
+BF16 KV and BF16 QK remain defaults. NVFP4/K8V4 remain unsupported for Gemma.
 
 The finite-row domain is supported. Any NaN or infinity in a final normalized
 BF16 K/V row-half poisons that complete 256-element half with NaN codes and
@@ -154,6 +154,28 @@ that is 5.04 GiB instead of 10 GiB. These figures exclude spare pool pages,
 sliding rings, snapshots, workspace, MTP and CUDA graphs. Sliding storage is
 unchanged: chunk 128 uses a 900 MiB ring and up to 900 MiB per device snapshot.
 Host checkpoint storage is not active-context offload.
+
+### Opt-in Gemma 4 INT8 KV (unqualified)
+
+`--kv-dtype int8` is an opt-in, global-layer-only runtime cache format. It is
+**not quality-qualified**; BF16 remains the default and FP8 remains the
+separate experimental format. Only global D512 layers change: signed INT8
+codes with one FP16 scale per 64 elements (eight scales per K/V vector),
+symmetric `absmax/127` scale rounded to FP16, round-to-nearest codes clamped to
+±127, no rotation. Sliding D256 rings, their snapshots and vision profiles
+remain BF16. Target and MTP attention expand cache values by an FP32
+code/scale product rounded to BF16 and then use the existing BF16 attention
+products (SIMT and tensor-core staging alike); there is no INT8 tensor-core
+path. `--gemma4-qk fp8` combined with `--kv-dtype int8` is rejected.
+
+Per global layer a page holds 131,072 B of codes plus 4,096 B of scales per
+K/V plane, so the 31B geometry (10 global layers, four KV heads) stores
+42,240 B/token including 1,280 B/token of scales, versus 41,280 B/token for
+FP8 and 81,920 B/token for BF16 (5.16 GiB at 131,072 tokens). INT8 is a
+quality fallback hypothesis, not a capacity lever over FP8. Any NaN, infinity
+or FP16-overflowing scale in a 64-element group poisons that group (NaN scale,
+zero codes). Checkpoints, copy-on-write and host restore cover all four
+global code/scale planes.
 
 Startup reports requested/global/sliding formats, QK mode/scope and actual payload bytes.
 Use resolved capacity, not the requested ceiling, as fit evidence. Explicit

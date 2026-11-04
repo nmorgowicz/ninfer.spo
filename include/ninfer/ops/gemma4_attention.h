@@ -32,7 +32,9 @@ namespace ninfer::ops {
  * q and out are contiguous BF16 [D,Hq,T]. positions is contiguous I32 [T].
  * cache follows Gemma4CacheView's plane layout. FP8 is accepted only for D512/global
  * (window zero); each code is expanded with an FP32 code-times-stored-FP16-scale
- * product rounded to BF16, identically for SIMT and tensor-core staging.
+ * product rounded to BF16, identically for SIMT and tensor-core staging. INT8-G64 is also
+ * accepted only for D512/global: the same expansion applies with one FP16 scale per 64
+ * elements ([8,64,Hkv,pages] scale planes); FP8 QK never combines with INT8.
  * block_table maps absolute position p to physical page block_table[p/64], slot p%64.
  * The Op writes all of out. Small grids split each query's visible keys into chunks
  * whose partial results are merged in a fixed order.

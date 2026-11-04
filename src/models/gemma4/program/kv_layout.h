@@ -16,7 +16,8 @@ namespace ninfer::models::gemma4 {
     switch (requested) {
     case KvCacheStorage::BFloat16: return ops::Gemma4KvFormat::BFloat16;
     case KvCacheStorage::Fp8E4M3Row256: return ops::Gemma4KvFormat::Fp8E4m3Row256;
-    default: throw std::invalid_argument("gemma4 KV cache supports only bf16 and fp8");
+    case KvCacheStorage::Int8Group64: return ops::Gemma4KvFormat::Int8Group64;
+    default: throw std::invalid_argument("gemma4 KV cache supports only bf16, fp8 and int8");
     }
 }
 
@@ -48,6 +49,14 @@ struct KvLayerLayout {
         }
         layout.code_dtype = DType::U8;
         layout.scale_groups = head_dim / ops::kGemma4KvFp8Group;
+        layout.code_page_bytes = rows * head_dim;
+        layout.scale_page_bytes = rows * layout.scale_groups * sizeof(std::uint16_t);
+    } else if (layout.format == ops::Gemma4KvFormat::Int8Group64) {
+        if (head_dim != 512) {
+            throw std::invalid_argument("gemma4 int8 global KV requires head dimension 512");
+        }
+        layout.code_dtype = DType::I8;
+        layout.scale_groups = head_dim / ops::kGemma4KvInt8Group;
         layout.code_page_bytes = rows * head_dim;
         layout.scale_page_bytes = rows * layout.scale_groups * sizeof(std::uint16_t);
     } else {

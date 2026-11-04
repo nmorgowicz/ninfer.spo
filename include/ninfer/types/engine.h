@@ -57,7 +57,7 @@ inline void validate_gemma4_qk(ops::Gemma4QkMode mode, KvCacheStorage storage,
     if (mode != ops::Gemma4QkMode::BFloat16 && mode != ops::Gemma4QkMode::Fp8)
         throw std::invalid_argument("invalid Gemma4 QK mode");
     if (mode == ops::Gemma4QkMode::Fp8 && (!gemma4 || storage != KvCacheStorage::Fp8E4M3Row256))
-        throw std::invalid_argument("fp8 Gemma4 QK requires Gemma4 global FP8 KV cache");
+        throw std::invalid_argument("fp8 Gemma4 QK requires Gemma4 global FP8 KV cache (--kv-dtype fp8); it is not supported with --kv-dtype int8 or bf16");
 }
 
 enum class EnginePurpose : std::uint8_t {
