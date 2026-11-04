@@ -160,9 +160,10 @@ Json template_context(const PromptInput& input, std::vector<Gemma4PreparedImage>
 }
 
 // Token counts (before image expansion) of the prompt prefixes worth a checkpoint: the end of a
-// leading system or developer turn, which holds the instructions and tools, and each explicit
-// prompt_cache_breakpoint marker. A marker's prefix is the messages before it rendered on their
-// own; its frontier is where those tokens stop matching the prompt.
+// leading system or developer turn, which holds the instructions and tools, and each explicit or
+// automatic prompt cache marker (including the boundary after the last message). A marker's prefix
+// is the messages before it rendered on their own; its frontier is where those tokens stop matching
+// the prompt.
 std::vector<std::size_t> frontier_tokens(const text::JinjaTemplate& chat, const Tokenizer& tokenizer,
                                          int turn_close, const PromptInput& input,
                                          const std::vector<TokenId>& tokens) {
@@ -179,10 +180,15 @@ std::vector<std::size_t> frontier_tokens(const text::JinjaTemplate& chat, const 
     for (std::size_t index = 0;
          index < markers.size() && index < kMaximumExplicitPromptCacheMarkers; ++index) {
         const PromptCacheMarker marker = markers[index];
-        // The serve layer's automatic boundary after the last message is what the live state
-        // continues anyway; capturing it every turn would only evict the useful checkpoints.
+        // The live state alone does not survive: the next turn re-renders the assistant reply
+        // normalized, so it diverges from the live tokens right after this boundary. Capture the
+        // normalized prefix (the render below, cut where it stops matching) so it can be restored.
+        // Tool boundaries stay engine-structural and are handled by the engine, not here.
+        constexpr SharedCandidateEvidence kCheckpointEvidence =
+            SharedCandidateEvidence::ExplicitBoundary | SharedCandidateEvidence::RequestedAutomatic |
+            SharedCandidateEvidence::DefaultAutomatic;
         if (marker.location == PromptCacheMarkerLocation::ToolBoundary ||
-            !has_shared_candidate_evidence(marker.evidence, SharedCandidateEvidence::ExplicitBoundary)) {
+            !has_shared_candidate_evidence(marker.evidence, kCheckpointEvidence)) {
             continue;
         }
         const bool leading = marker.location == PromptCacheMarkerLocation::LeadingInstructionBoundary;
