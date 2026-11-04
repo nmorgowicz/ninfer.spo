@@ -44,6 +44,15 @@ KV format is FP8. Gemma 4 accepts BF16 and experimental global-only FP8;
 its sliding rings remain BF16. Use `--kv-dtype bf16` for a BF16 baseline.
 Context plus prefix length must fit the artifact's native position limit.
 
+For Gemma 4, `--gemma4-qk bf16` (default) retains Phase 1 BF16 QK over
+expanded FP8 cache values. `--kv-dtype fp8 --gemma4-qk fp8` selects experimental
+FP8 tensor-core QK for global D512 query widths ≥64; sliding attention and
+short-width SIMT are unchanged. V expands to BF16 and PV keeps its hi/lo BF16
+products. The report records requested/resolved QK mode and scope under
+`execution`. Compare Phase 2 against Phase 1 with the same FP8 cache and
+identical histories to isolate query quantization, and against BF16 KV
+separately. Top-k dumps do not establish full-distribution KL or model quality.
+
 `--prefix-ids 2,105,...` prepends the same token ids to every window. They are context only: the
 scored targets and token counts do not change. Use it for models that are far from their training
 distribution on bare text. Gemma 4 instruction-tuned models score raw prose near perplexity 1,000

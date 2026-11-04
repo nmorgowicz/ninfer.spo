@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Opt-in Gemma 4 `--gemma4-qk fp8` enables global D512 FP8 tensor-core QK
+  for query widths ≥64 with FP8 KV storage. Two transient FP16-rounded Q
+  scales match K's 256-element grouping; each FP32 partial is corrected
+  separately before summation. BF16-expanded V and hi/lo BF16 PV, sliding
+  D256 and short SIMT remain unchanged. `--gemma4-qk bf16` remains the
+  default and the Phase 1 comparison path. CLI, serve and perplexity report
+  selection/scope; incompatible architecture/cache combinations fail closed.
+  This changes runtime computation, not artifact conversion or model-quality
+  qualification.
+
 - Experimental Gemma 4 global-layer `--kv-dtype fp8` stores E4M3 codes with
   FP16 scales per 256 elements; sliding rings stay BF16. Target and MTP reads
   expand to BF16, preserving the existing attention products. Checkpoints
