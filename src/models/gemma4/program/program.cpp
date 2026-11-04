@@ -302,12 +302,13 @@ struct Program::Impl {
             const auto layout = kv_layer_layout(kv_storage, global, layer.head_dim, layer.kv_heads);
             const Tensor* table_of = global ? &block : &ring_block;
             caches.push_back({.format = layout.format,
-                              .qk_mode = global ? qk_mode : ops::Gemma4QkMode::BFloat16,
+                              // Sliding descriptors retain BF16 QK.
                               .k_pages = &k_pages[index],
                               .v_pages = &v_pages[index],
                               .k_scales = layout.scale_groups ? &k_scales[index] : nullptr,
                               .v_scales = layout.scale_groups ? &v_scales[index] : nullptr,
-                              .block_table = table_of});
+                              .block_table = table_of,
+                              .qk_mode = global ? qk_mode : ops::Gemma4QkMode::BFloat16});
             auto& regions = global ? setup.store.global : setup.store.ring;
             for (const DeviceBuffer* store : {&k_store[index], &v_store[index]}) {
                 regions.push_back({static_cast<std::uint8_t*>(store->p), layout.code_page_bytes});

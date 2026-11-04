@@ -482,6 +482,10 @@ int validation_test() {
     bad = valid; bad.block_table = nullptr; rejects(bad);
     bad = valid; bad.format = static_cast<ops::Gemma4KvFormat>(99); rejects(bad);
     rejects(valid, 256); rejects(valid, D, false);
+    bad = valid; bad.qk_mode = static_cast<ops::Gemma4QkMode>(99); rejects(bad);
+    bad = valid; bad.qk_mode = ops::Gemma4QkMode::Fp8;
+    ops::detail::validate_gemma4_cache(bad, D, true, "test");
+    rejects(bad, 256); rejects(bad, D, false);
     for (Tensor* plane : {&ks, &vs}) {
         const Tensor saved = *plane;
         plane->dtype = DType::BF16; rejects(valid); *plane = saved;
@@ -503,6 +507,13 @@ int validation_test() {
     rejects(bad); // stale FP8 scale planes are not admitted on BF16 descriptors.
     bad.k_scales = bad.v_scales = nullptr;
     ops::detail::validate_gemma4_cache(bad, D, true, "test");
+    bad.qk_mode = ops::Gemma4QkMode::Fp8; rejects(bad);
+    bad.qk_mode = static_cast<ops::Gemma4QkMode>(99); rejects(bad);
+    Tensor sliding(&storage, DType::BF16, {256, 64, Heads, Pages});
+    bad.qk_mode = ops::Gemma4QkMode::BFloat16;
+    bad.k_pages = bad.v_pages = &sliding;
+    ops::detail::validate_gemma4_cache(bad, 256, false, "test");
+    bad.qk_mode = ops::Gemma4QkMode::Fp8; rejects(bad, 256, false);
     return failures;
 }
 

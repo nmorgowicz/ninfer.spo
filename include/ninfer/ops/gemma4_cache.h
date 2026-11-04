@@ -15,12 +15,12 @@ enum class Gemma4QkMode { BFloat16, Fp8 };
 // FP16 scales [2,64,Hkv,pages]. All planes use the same physical page IDs.
 struct Gemma4CacheView {
     Gemma4KvFormat format = Gemma4KvFormat::BFloat16;
-    Gemma4QkMode qk_mode = Gemma4QkMode::BFloat16;
     Tensor* k_pages = nullptr;
     Tensor* v_pages = nullptr;
     Tensor* k_scales = nullptr;
     Tensor* v_scales = nullptr;
     const Tensor* block_table = nullptr;
+    Gemma4QkMode qk_mode = Gemma4QkMode::BFloat16;
 };
 
 } // namespace ninfer::ops

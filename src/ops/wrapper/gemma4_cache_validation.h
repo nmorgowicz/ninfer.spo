@@ -18,6 +18,12 @@ inline void validate_gemma4_cache(const Gemma4CacheView& cache, int head_dim, bo
     const bool fp8 = cache.format == Gemma4KvFormat::Fp8E4m3Row256;
     if (!fp8 && cache.format != Gemma4KvFormat::BFloat16) { fail("unknown cache format"); }
     if (fp8 && (head_dim != 512 || !global)) { fail("FP8 requires D512 global attention"); }
+    if (cache.qk_mode != Gemma4QkMode::BFloat16 && cache.qk_mode != Gemma4QkMode::Fp8) {
+        fail("unknown QK mode");
+    }
+    if (cache.qk_mode == Gemma4QkMode::Fp8 && (!fp8 || head_dim != 512 || !global)) {
+        fail("FP8 QK requires D512 global FP8 cache");
+    }
     const Tensor& k = *cache.k_pages;
     const Tensor& v = *cache.v_pages;
     const DType dtype = fp8 ? DType::U8 : DType::BF16;

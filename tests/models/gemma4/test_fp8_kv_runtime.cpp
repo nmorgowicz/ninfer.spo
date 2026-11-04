@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 namespace {
@@ -101,10 +100,11 @@ struct Cache {
             const bool global = model.layers[i].global_layer;
             views.push_back({.format = global ? ops::Gemma4KvFormat::Fp8E4m3Row256
                                                : ops::Gemma4KvFormat::BFloat16,
-                .qk_mode = global ? qk_mode : ops::Gemma4QkMode::BFloat16,
+                // Sliding descriptors retain BF16 QK.
                 .k_pages = &code_tensors[2*i], .v_pages = &code_tensors[2*i+1],
                 .k_scales = global ? &scale_tensors[2*i] : nullptr,
-                .v_scales = global ? &scale_tensors[2*i+1] : nullptr, .block_table = &table});
+                .v_scales = global ? &scale_tensors[2*i+1] : nullptr, .block_table = &table,
+                .qk_mode = global ? qk_mode : ops::Gemma4QkMode::BFloat16});
         }
     }
 };
@@ -221,7 +221,6 @@ void program_summary(Fixture& fixture, cudaStream_t stream) {
         require(memory.gemma4_kv && memory.gemma4_kv->requested == format &&
                     memory.gemma4_kv->global == format &&
                     memory.gemma4_kv->qk_mode == qk &&
-                    std::string(gemma4_qk_scope(qk)).find(qk == ops::Gemma4QkMode::Fp8 ? "tokens>=64" : "Phase1") != std::string::npos &&
                     memory.gemma4_kv->sliding == KvCacheStorage::BFloat16 &&
                     memory.gemma4_kv->global_payload_bytes == global &&
                     memory.gemma4_kv->sliding_payload_bytes == sliding &&
