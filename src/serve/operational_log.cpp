@@ -462,6 +462,8 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_bytes(memory.available_after_startup_bytes));
     if (memory.gemma4_kv) {
         const auto& kv = *memory.gemma4_kv;
+        logger_->info("Gemma QK | requested/resolved {} | {}",
+                      gemma4_qk_name(kv.qk_mode), gemma4_qk_scope(kv.qk_mode));
         logger_->info("Gemma KV | requested {} | global {} ({}) | sliding {} ({})",
                       kv_cache_name(kv.requested), kv_cache_name(kv.global),
                       product::format_pretty_bytes(kv.global_payload_bytes),

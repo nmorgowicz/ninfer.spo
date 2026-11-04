@@ -78,6 +78,7 @@ struct Gemma4KvMemorySummary {
     KvCacheStorage requested = KvCacheStorage::BFloat16;
     KvCacheStorage global    = KvCacheStorage::BFloat16;
     KvCacheStorage sliding   = KvCacheStorage::BFloat16;
+    ops::Gemma4QkMode qk_mode = ops::Gemma4QkMode::BFloat16;
     std::size_t global_payload_bytes = 0;
     std::size_t sliding_payload_bytes = 0;
 };

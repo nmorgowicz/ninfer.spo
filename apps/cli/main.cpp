@@ -196,6 +196,8 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
     if (memory.gemma4_kv) {
         const auto& kv = *memory.gemma4_kv;
+        print_metric("requested/resolved QK", ninfer::gemma4_qk_name(kv.qk_mode));
+        print_metric("Gemma QK scope", ninfer::gemma4_qk_scope(kv.qk_mode));
         print_metric("requested KV dtype", format_kv_cache(kv.requested));
         print_metric("global KV dtype", format_kv_cache(kv.global));
         print_metric("sliding KV dtype", format_kv_cache(kv.sliding));
@@ -305,6 +307,7 @@ int main(int argc, char** argv) {
         engine_options.kv_capacity        = cli.kv_capacity;
         engine_options.prefill_chunk      = cli.prefill_chunk;
         engine_options.kv_cache           = cli.kv_cache;
+        engine_options.gemma4_qk          = cli.gemma4_qk;
         engine_options.speculative        = cli.speculative;
         engine_options.enable_vision      = cli.enable_vision;
         engine_options.use_cuda_graph     = cli.use_cuda_graph;
@@ -318,6 +321,11 @@ int main(int argc, char** argv) {
 
         ninfer::Engine engine(std::move(engine_options));
         startup_log.engine_ready(engine.load_summary());
+        if (engine.memory_summary().gemma4_kv) {
+            print_metric("requested QK", ninfer::gemma4_qk_name(cli.gemma4_qk));
+            print_metric("resolved QK", ninfer::gemma4_qk_name(engine.options().gemma4_qk));
+            print_metric("Gemma QK scope", ninfer::gemma4_qk_scope(engine.options().gemma4_qk));
+        }
         engine.reset_memory_peaks();
 
         ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));

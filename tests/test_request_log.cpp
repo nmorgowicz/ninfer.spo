@@ -300,6 +300,16 @@ int main() {
                   default_thinking_start.find("unresolved") == std::string::npos,
               "default thinking state leaks an internal resolution detail");
     const Json started = Json::parse(format_request_start_json("serve-test", 2000, context));
+    failures += check(started.at("request").at("gemma4_qk_requested") == "bf16" &&
+                          started.at("request").at("gemma4_qk_resolved") == "bf16",
+                      "default QK request evidence missing");
+    RequestLogContext fp8_qk_context = context;
+    fp8_qk_context.gemma4_qk = ninfer::ops::Gemma4QkMode::Fp8;
+    const Json fp8_qk_record = Json::parse(format_request_start_json("serve-test", 2000, fp8_qk_context));
+    failures += check(fp8_qk_record.at("request").at("gemma4_qk_resolved") == "fp8" &&
+                          fp8_qk_record.at("request").at("gemma4_qk_scope").get<std::string>().find("tokens>=64") != std::string::npos &&
+                          fp8_qk_record.at("request").at("gemma4_qk_scope").get<std::string>().find("SIMT") != std::string::npos,
+                      "Phase2 QK scope evidence missing");
     failures +=
         check(started.at("request").at("request_id") == 7, "request id missing from start record");
     failures += check(started.at("request").at("http_request_id") == "req_wire_923" &&

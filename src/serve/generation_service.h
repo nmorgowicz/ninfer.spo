@@ -108,6 +108,7 @@ struct PreparedRequest {
     PromptPreparationStats preparation;
     int prompt_tokens    = 0;
     bool enable_thinking = true;
+    ops::Gemma4QkMode gemma4_qk = ops::Gemma4QkMode::BFloat16;
     std::optional<std::uint32_t> thinking_budget;
     std::optional<ninfer::ReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;

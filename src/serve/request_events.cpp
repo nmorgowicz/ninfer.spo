@@ -23,6 +23,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.tool_choice                        = request.tool_choice;
     context.has_tool_history                   = request.has_tool_history();
     context.enable_thinking                    = prepared.enable_thinking;
+    context.gemma4_qk                          = prepared.gemma4_qk;
     context.thinking_budget                    = prepared.thinking_budget;
     context.requested_reasoning_effort =
         prepared.reasoning_effort ? parse_requested_reasoning_effort(

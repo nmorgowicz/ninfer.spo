@@ -265,6 +265,9 @@ Json request_json(const RequestLogContext& context) {
                 {"tool_choice", tool_choice_name(context.tool_choice)},
                 {"has_tool_history", context.has_tool_history},
                 {"enable_thinking", context.enable_thinking},
+                {"gemma4_qk_requested", gemma4_qk_name(context.gemma4_qk)},
+                {"gemma4_qk_resolved", gemma4_qk_name(context.gemma4_qk)},
+                {"gemma4_qk_scope", gemma4_qk_scope(context.gemma4_qk)},
                 {"thinking_budget", std::move(thinking_budget)},
                 {"requested_reasoning_effort",
                  requested_reasoning_effort_json(context.requested_reasoning_effort)},
@@ -565,6 +568,9 @@ std::string format_server_start_json(
              {"prefill_chunk", engine_options.prefill_chunk},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
+             {"gemma4_qk_requested", gemma4_qk_name(options.gemma4_qk)},
+             {"gemma4_qk_resolved", gemma4_qk_name(engine_options.gemma4_qk)},
+             {"gemma4_qk_scope", gemma4_qk_scope(engine_options.gemma4_qk)},
              {"vision", engine_options.enable_vision},
              {"cuda_graph", engine_options.use_cuda_graph},
              {"prefix_reuse", options.allow_prefix_reuse},
@@ -617,6 +623,8 @@ std::string format_server_start_json(
             Json{{"requested", kv_cache_name(kv.requested)},
                  {"global", kv_cache_name(kv.global)},
                  {"sliding", kv_cache_name(kv.sliding)},
+                 {"qk_mode", gemma4_qk_name(kv.qk_mode)},
+                 {"qk_scope", gemma4_qk_scope(kv.qk_mode)},
                  {"global_payload_bytes", kv.global_payload_bytes},
                  {"sliding_payload_bytes", kv.sliding_payload_bytes}};
     }

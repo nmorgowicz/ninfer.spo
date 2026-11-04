@@ -52,6 +52,7 @@ struct Options {
     std::uint32_t stride                = 2048;
     int device                          = 0;
     ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    ninfer::ops::Gemma4QkMode gemma4_qk = ninfer::ops::Gemma4QkMode::BFloat16;
     bool quick                          = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
 };
@@ -59,7 +60,7 @@ struct Options {
 std::string usage_text() {
     return "usage: ninfer-spo-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
-           "       [--context N] [--stride N] [--device N]\n"
+           "       [--context N] [--stride N] [--device N] [--gemma4-qk bf16|fp8] (default bf16)\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
            "       [--dump-topk <file>] [--prefix-ids <id,id,...>]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
@@ -106,6 +107,8 @@ Options parse_options(int argc, char** argv) {
             out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
         } else if (option == "--device") {
             out.device = parse_integer<int>(value("--device"), "device");
+        } else if (option == "--gemma4-qk") {
+            out.gemma4_qk = ninfer::parse_gemma4_qk(value("--gemma4-qk"));
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
@@ -263,10 +266,15 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.device           = options.device;
     engine_options.max_context = options.context + static_cast<std::uint32_t>(options.prefix.size());
     engine_options.kv_cache         = options.kv;
+    engine_options.gemma4_qk        = options.gemma4_qk;
     engine_options.startup_observer = startup_log.observer();
     ninfer::Engine engine(std::move(engine_options));
     const ninfer::LoadSummary load = engine.load_summary();
     startup_log.engine_ready(load);
+    logger->info("Gemma QK requested {} | resolved {} | {}",
+                 ninfer::gemma4_qk_name(options.gemma4_qk),
+                 ninfer::gemma4_qk_name(engine.options().gemma4_qk),
+                 ninfer::gemma4_qk_scope(engine.options().gemma4_qk));
 
     const Clock::time_point preflight_started = Clock::now();
     logger->info("preparing corpus");
@@ -444,6 +452,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"prefix_ids", options.prefix},
           {"prefill_chunk_tokens", 1024},
           {"score_tile_tokens", 1024},
+          {"gemma4_qk_requested", ninfer::gemma4_qk_name(options.gemma4_qk)},
+          {"gemma4_qk_resolved", ninfer::gemma4_qk_name(engine.options().gemma4_qk)},
+          {"gemma4_qk_scope", ninfer::gemma4_qk_scope(engine.options().gemma4_qk)},
           {"kv_dtype", kv_name(options.kv)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},

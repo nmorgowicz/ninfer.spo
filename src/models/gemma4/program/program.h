@@ -33,7 +33,8 @@ public:
     // round with the MTP assistant.
     Program(LoadedText& model, std::uint32_t capacity, std::uint32_t prefill_chunk,
             std::uint32_t draft_tokens, cudaStream_t stream, const CacheBudget& cache = {},
-            KvCacheStorage kv_cache = KvCacheStorage::BFloat16);
+            KvCacheStorage kv_cache = KvCacheStorage::BFloat16,
+            ops::Gemma4QkMode qk_mode = ops::Gemma4QkMode::BFloat16);
     ~Program();
 
     // KV bytes per position of the global layers; the sliding layers' ring is in fixed_bytes.

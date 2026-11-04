@@ -373,7 +373,7 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
         models::gemma4::CacheBudget{.history      = history.enabled,
                                     .device_slots = slots,
                                     .host_bytes   = host_bytes,
-                                    .extra_tokens = extra_tokens}, options.kv_cache);
+                                    .extra_tokens = extra_tokens}, options.kv_cache, options.gemma4_qk);
     device.synchronize();
     auto instance                         = std::make_unique<Gemma4Instance>(std::move(loaded),
                                                                              models::gemma4::Frontend(tokenizer, chat, options.max_context),
@@ -423,6 +423,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
     const auto architecture = peek_architecture(reader);
+    validate_gemma4_qk(options.gemma4_qk, options.kv_cache,
+                      architecture == models::Architecture::Gemma4);
     if (architecture == models::Architecture::Qwen3_8FlashNext) {
         return construct_flash_next(options, device, reader, start);
     }

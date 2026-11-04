@@ -6,6 +6,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/launcher/gemma4_attention_fp8_qk.cuh"
 #include "ops/launcher/gemma4_attention_tile.cuh"
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
@@ -34,12 +35,17 @@ constexpr std::size_t kSharedBytes = sizeof(__nv_bfloat16) * (kRows + 2 * kBc) *
 static_assert(kSharedBytes <= 99 * 1024);
 static_assert(kPagedKVPageSize % kBc == 0);
 
+template <bool Fp8Qk>
+constexpr std::size_t shared_bytes() {
+    return Fp8Qk ? (kRows + kBc) * kD + sizeof(__nv_bfloat16) * kBc * kD : kSharedBytes;
+}
+
 // grid (query tiles, Hq); CTA (tile, h) covers query rows [64 tile, 64 tile + 64) of head h.
 // Warps w and w ^ 4 own the same 16 rows and each computes their full QK scores, so both hold
 // the same softmax state; warp w writes output columns [256 (w / 4), 256 (w / 4) + 256). One
 // staged K and V tile serves both halves. The arithmetic per row and column is the same as a
 // 4-warp CTA per output half, so the result does not depend on the split.
-template <bool Fp8>
+template <bool Fp8, bool Fp8Qk = false>
 __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
     const __nv_bfloat16* __restrict__ q, const void* __restrict__ k_pages,
     const void* __restrict__ v_pages, const __half* __restrict__ k_scales,
@@ -50,10 +56,15 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
     constexpr unsigned FullMask = 0xffffffffu;
 
     extern __shared__ __align__(16) __nv_bfloat16 gemma4_d512_smem[];
-    __nv_bfloat16* q_s = gemma4_d512_smem; // [kRows, D] swizzled
-    __nv_bfloat16* k_s = q_s + kRows * kD; // [Bc, D] swizzled
-    __nv_bfloat16* v_s = k_s + kBc * kD;   // [Bc, D] swizzled
-    __shared__ int range[3];               // first visible key, highest position, lowest position
+    static_assert(!Fp8Qk || Fp8);
+    __nv_bfloat16* q_s = gemma4_d512_smem;
+    auto* q_fp8 = reinterpret_cast<std::uint8_t*>(q_s);
+    auto* k_fp8 = q_fp8 + kRows * kD;
+    __nv_bfloat16* k_s = Fp8Qk ? reinterpret_cast<__nv_bfloat16*>(k_fp8) : q_s + kRows * kD;
+    __nv_bfloat16* v_s = Fp8Qk ? reinterpret_cast<__nv_bfloat16*>(k_fp8 + kBc * kD) : k_s + kBc * kD;
+    __shared__ __align__(4) __half q_scale_s[Fp8Qk ? kRows * 2 : 1];
+    __shared__ __align__(4) __half k_scale_s[Fp8Qk ? kBc * 2 : 1];
+    __shared__ int range[3]; // first visible key, highest position, lowest position
 
     // Later tiles see more keys; start them first.
     const int q0       = (static_cast<int>(gridDim.x) - 1 - static_cast<int>(blockIdx.x)) * kRows;
@@ -105,7 +116,12 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
     const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
     const unsigned v_r  = static_cast<unsigned>(b_rin << 4);
 
-    {
+    if constexpr (Fp8Qk) {
+        const auto* q_block = q + (static_cast<std::int64_t>(q0) * q_heads + q_head) * kD;
+        gemma4_fp8_qk_queries<kRows, kWarps>(
+            q_block, static_cast<std::int64_t>(q_heads) * kD, rows,
+            q_fp8, q_scale_s, warp, lane);
+    } else {
         constexpr int VecPerRow       = kD / 8;
         const std::int64_t row_stride = static_cast<std::int64_t>(q_heads) * kD;
         const __nv_bfloat16* q_block  = q + (static_cast<std::int64_t>(q0) * q_heads + q_head) * kD;
@@ -160,11 +176,20 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
                 kv_heads, kvh, mapped, k0, last_key, 0, tid);
         }
     };
+    const auto stage_key = [&](int mapped, int k0) {
+        if constexpr (Fp8Qk) {
+            gemma4_fp8_qk_keys<kBc, kThreads>(
+                k_fp8, k_scale_s, static_cast<const std::uint8_t*>(k_pages), k_scales,
+                kv_heads, kvh, mapped, k0, last_key, tid);
+        } else {
+            stage(k_s, k_pages, k_scales, mapped, k0);
+        }
+    };
 
     int physical = block_begin < block_end ? physical_of(block_begin) : -1;
     cp_commit();
     if (block_begin < block_end) {
-        stage(k_s, k_pages, k_scales, physical, block_begin * kBc);
+        stage_key(physical, block_begin * kBc);
     }
     cp_commit();
 
@@ -179,32 +204,36 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
         cp_commit();
 
         float score[kQkNt][4];
-#pragma unroll
-        for (int nt = 0; nt < kQkNt; ++nt) {
-            score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
-        }
-        unsigned af[2][4];
-        unsigned bf[2][kQkNt][2];
-        const auto load = [&](unsigned(&a)[4], unsigned(&b)[kQkNt][2], int k) {
-            const unsigned ck = static_cast<unsigned>(k << 5);
-            ldmatrix_x4(a[0], a[1], a[2], a[3], causal_swizzle_address(q_lane_base, ck, q_as, q_r));
-#pragma unroll
-            for (int nt2 = 0; nt2 < kQkNt; nt2 += 2) {
-                ldmatrix_x4(
-                    b[nt2][0], b[nt2][1], b[nt2 + 1][0], b[nt2 + 1][1],
-                    causal_swizzle_address(k_lane_base + static_cast<unsigned>(nt2 * (8 * kD * 2)),
-                                           ck, k_as, k_r));
-            }
-        };
-        load(af[0], bf[0], 0);
-#pragma unroll
-        for (int k = 0; k < kQkKs; ++k) {
-            const int cur = k & 1;
-            if (k + 1 < kQkKs) { load(af[cur ^ 1], bf[cur ^ 1], k + 1); }
+        if constexpr (Fp8Qk) {
+            gemma4_fp8_qk_scores<kBc>(score, q_fp8, k_fp8, q_scale_s, k_scale_s, row_base, lane);
+        } else {
 #pragma unroll
             for (int nt = 0; nt < kQkNt; ++nt) {
-                mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[cur][0],
-                         af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0], bf[cur][nt][1]);
+                score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
+            }
+            unsigned af[2][4];
+            unsigned bf[2][kQkNt][2];
+            const auto load = [&](unsigned(&a)[4], unsigned(&b)[kQkNt][2], int k) {
+                const unsigned ck = static_cast<unsigned>(k << 5);
+                ldmatrix_x4(a[0], a[1], a[2], a[3], causal_swizzle_address(q_lane_base, ck, q_as, q_r));
+#pragma unroll
+                for (int nt2 = 0; nt2 < kQkNt; nt2 += 2) {
+                    ldmatrix_x4(
+                        b[nt2][0], b[nt2][1], b[nt2 + 1][0], b[nt2 + 1][1],
+                        causal_swizzle_address(k_lane_base + static_cast<unsigned>(nt2 * (8 * kD * 2)),
+                                               ck, k_as, k_r));
+                }
+            };
+            load(af[0], bf[0], 0);
+#pragma unroll
+            for (int k = 0; k < kQkKs; ++k) {
+                const int cur = k & 1;
+                if (k + 1 < kQkKs) { load(af[cur ^ 1], bf[cur ^ 1], k + 1); }
+#pragma unroll
+                for (int nt = 0; nt < kQkNt; ++nt) {
+                    mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[cur][0],
+                             af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0], bf[cur][nt][1]);
+                }
             }
         }
 
@@ -212,7 +241,7 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
         __syncthreads();
         if (block + 1 < block_end) {
             physical = next_physical;
-            stage(k_s, k_pages, k_scales, physical, (block + 1) * kBc);
+            stage_key(physical, (block + 1) * kBc);
             cp_commit();
         }
 
@@ -347,22 +376,22 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
     }
 }
 
-template <bool Fp8>
+template <bool Fp8, bool Fp8Qk = false>
 void launch_d512(const Tensor& q, const Gemma4CacheView& cache, const Tensor& positions,
                   int window, float scale, Tensor& out, cudaStream_t stream) {
     const Tensor& k_pages = *cache.k_pages;
     const Tensor& block_table = *cache.block_table;
     static bool configured = false;
     if (!configured) {
-        CUDA_CHECK(cudaFuncSetAttribute(gemma4_attention_d512_kernel<Fp8>,
+        CUDA_CHECK(cudaFuncSetAttribute(gemma4_attention_d512_kernel<Fp8, Fp8Qk>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(kSharedBytes)));
+                                        static_cast<int>(shared_bytes<Fp8Qk>())));
         configured = true;
     }
     const int tokens = q.ne[2];
     const dim3 grid(static_cast<unsigned>((tokens + kRows - 1) / kRows),
                     static_cast<unsigned>(q.ne[1]));
-    gemma4_attention_d512_kernel<Fp8><<<grid, kThreads, kSharedBytes, stream>>>(
+    gemma4_attention_d512_kernel<Fp8, Fp8Qk><<<grid, kThreads, shared_bytes<Fp8Qk>(), stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), k_pages.data, cache.v_pages->data,
         Fp8 ? static_cast<const __half*>(cache.k_scales->data) : nullptr,
         Fp8 ? static_cast<const __half*>(cache.v_scales->data) : nullptr,
@@ -378,7 +407,11 @@ void gemma4_attention_mma_d512_launch(const Tensor& q, const Gemma4CacheView& ca
                                       const Tensor& positions, int window, float scale,
                                       Tensor& out, cudaStream_t stream) {
     if (cache.format == Gemma4KvFormat::Fp8E4m3Row256) {
-        launch_d512<true>(q, cache, positions, window, scale, out, stream);
+        if (cache.qk_mode == Gemma4QkMode::Fp8) {
+            launch_d512<true, true>(q, cache, positions, window, scale, out, stream);
+        } else {
+            launch_d512<true>(q, cache, positions, window, scale, out, stream);
+        }
     } else {
         launch_d512<false>(q, cache, positions, window, scale, out, stream);
     }

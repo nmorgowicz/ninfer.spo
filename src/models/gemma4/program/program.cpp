@@ -106,6 +106,7 @@ struct Program::Impl {
     int hidden             = 0;
     std::uint32_t capacity = 0;
     KvCacheStorage kv_storage = KvCacheStorage::BFloat16;
+    ops::Gemma4QkMode qk_mode = ops::Gemma4QkMode::BFloat16;
     std::size_t global_payload_bytes = 0;
     std::size_t sliding_payload_bytes = 0;
     std::uint32_t chunk    = 0;
@@ -218,15 +219,16 @@ struct Program::Impl {
 
     Impl(LoadedText& loaded, std::uint32_t token_capacity, std::uint32_t prefill_chunk,
          std::uint32_t drafts, cudaStream_t device_stream, const CacheBudget& budget,
-         KvCacheStorage format)
+         KvCacheStorage format, ops::Gemma4QkMode qk)
         : model(&loaded), stream(device_stream), gemm(device_stream), vocab(loaded.vocab),
-          hidden(loaded.hidden), capacity(token_capacity), kv_storage(format),
+          hidden(loaded.hidden), capacity(token_capacity), kv_storage(format), qk_mode(qk),
           chunk(std::clamp<std::uint32_t>(prefill_chunk, kMinChunk, kMaxChunk)),
           workspace(workspace_bytes(loaded, chunk)), draft_tokens(drafts) {
         if (vocab <= 0 || hidden <= 0 || loaded.layers.empty() || capacity == 0) {
             throw std::invalid_argument("gemma4 program: model is empty");
         }
         (void)gemma4_kv_format(kv_storage);
+        validate_gemma4_qk(qk_mode, kv_storage, true);
         if (draft_tokens > kMaxDraftTokens || (draft_tokens > 0 && loaded.draft == nullptr)) {
             throw std::invalid_argument("gemma4 program: MTP needs the assistant and 1..15 drafts");
         }
@@ -300,6 +302,7 @@ struct Program::Impl {
             const auto layout = kv_layer_layout(kv_storage, global, layer.head_dim, layer.kv_heads);
             const Tensor* table_of = global ? &block : &ring_block;
             caches.push_back({.format = layout.format,
+                              .qk_mode = global ? qk_mode : ops::Gemma4QkMode::BFloat16,
                               .k_pages = &k_pages[index],
                               .v_pages = &v_pages[index],
                               .k_scales = layout.scale_groups ? &k_scales[index] : nullptr,
@@ -764,9 +767,9 @@ struct Program::Impl {
 
 Program::Program(LoadedText& model, std::uint32_t capacity, std::uint32_t prefill_chunk,
                  std::uint32_t draft_tokens, cudaStream_t stream, const CacheBudget& cache,
-                 KvCacheStorage kv_cache)
+                 KvCacheStorage kv_cache, ops::Gemma4QkMode qk_mode)
     : impl_(std::make_unique<Impl>(model, capacity, prefill_chunk, draft_tokens, stream, cache,
-                                  kv_cache)) {}
+                                  kv_cache, qk_mode)) {}
 
 Program::~Program() = default;
 
@@ -1182,6 +1185,7 @@ MemorySummary Program::memory_summary() const noexcept {
         .requested = impl_->kv_storage,
         .global = impl_->kv_storage,
         .sliding = KvCacheStorage::BFloat16,
+        .qk_mode = impl_->qk_mode,
         .global_payload_bytes = impl_->global_payload_bytes,
         .sliding_payload_bytes = impl_->sliding_payload_bytes};
     summary.kv_payload_bytes = impl_->global_payload_bytes + impl_->sliding_payload_bytes;

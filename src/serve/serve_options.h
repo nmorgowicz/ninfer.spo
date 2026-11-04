@@ -48,6 +48,7 @@ struct ServeOptions {
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    ops::Gemma4QkMode gemma4_qk = ops::Gemma4QkMode::BFloat16;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
     HostResidencyOptions host_residency;

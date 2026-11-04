@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ninfer/ops/gemma4_cache.h"
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -34,6 +35,30 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8KeyNvfp4Value,
     BFloat16KeyValue,
 };
+
+[[nodiscard]] inline ops::Gemma4QkMode parse_gemma4_qk(std::string_view value) {
+    if (value == "bf16") return ops::Gemma4QkMode::BFloat16;
+    if (value == "fp8") return ops::Gemma4QkMode::Fp8;
+    throw std::invalid_argument("--gemma4-qk must be bf16 or fp8");
+}
+
+[[nodiscard]] inline const char* gemma4_qk_name(ops::Gemma4QkMode mode) {
+    return mode == ops::Gemma4QkMode::Fp8 ? "fp8" : "bf16";
+}
+
+[[nodiscard]] inline const char* gemma4_qk_scope(ops::Gemma4QkMode mode) {
+    return mode == ops::Gemma4QkMode::Fp8
+        ? "global D512 MMA tokens>=64: fp8 QK; tokens<64: unchanged BF16 SIMT; sliding D256 unchanged; V BF16-expanded, P hi+lo"
+        : "BF16 QK including FP8-cache expansion (Phase1); small SIMT and sliding D256 unchanged";
+}
+
+inline void validate_gemma4_qk(ops::Gemma4QkMode mode, KvCacheStorage storage,
+                              bool gemma4) {
+    if (mode != ops::Gemma4QkMode::BFloat16 && mode != ops::Gemma4QkMode::Fp8)
+        throw std::invalid_argument("invalid Gemma4 QK mode");
+    if (mode == ops::Gemma4QkMode::Fp8 && (!gemma4 || storage != KvCacheStorage::Fp8E4M3Row256))
+        throw std::invalid_argument("fp8 Gemma4 QK requires Gemma4 global FP8 KV cache");
+}
 
 enum class EnginePurpose : std::uint8_t {
     Generation,
@@ -196,6 +221,7 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    ops::Gemma4QkMode gemma4_qk = ops::Gemma4QkMode::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

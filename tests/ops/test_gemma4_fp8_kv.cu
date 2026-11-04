@@ -2,6 +2,7 @@
 #include "ninfer/ops/gemma4_kv_append.h"
 #include "ninfer/ops/gemma4_qkv_prep.h"
 #include "ops/kernel/gemma4_fp8_kv.cuh"
+#include "ops/launcher/gemma4_attention_fp8_qk.cuh"
 #include "ops/op_tester.h"
 #include "ops/wrapper/gemma4_cache_validation.h"
 
@@ -153,6 +154,132 @@ int expansion_boundary_test() {
         expanded.verify_guards("expansion boundary");
 }
 
+// Exercise the exact private primitives used by the attention kernel, including
+// both copies of the QK state retained by paired output-half warps.
+__global__ void qk_probe_kernel(const __nv_bfloat16* q, const std::uint8_t* k,
+                                const __half* ks, int physical, int last,
+                                std::uint8_t* qc, __half* qs, float* result) {
+    __shared__ __align__(16) std::uint8_t query[64 * D];
+    __shared__ __align__(16) std::uint8_t keys[16 * D];
+    __shared__ __align__(4) __half query_scales[64 * 2];
+    __shared__ __align__(4) __half key_scales[16 * 2];
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    ops::detail::gemma4_fp8_qk_queries<64, 8>(q, D, 63, query, query_scales, warp, lane);
+    ops::detail::gemma4_fp8_qk_keys<16, 256>(keys, key_scales, k, ks, Heads, 1,
+                                          physical, 48, last, tid);
+    ops::cp_commit();
+    ops::cp_wait<0>();
+    __syncthreads();
+    for (int i = tid; i < 64 * D; i += 256) {
+        qc[i] = query[ops::detail::gemma4_fp8_qk_offset(i / D, i % D)];
+    }
+    if (tid < 128) { qs[tid] = query_scales[tid]; }
+    float score[2][4];
+    const int base = (warp & 3) * 16;
+    ops::detail::gemma4_fp8_qk_scores<16>(score, query, keys, query_scales, key_scales, base, lane);
+    const int row = base + (lane >> 2);
+    const int column = 2 * (lane & 3);
+    const int copy = warp >> 2;
+    for (int nt = 0; nt < 2; ++nt) {
+        result[(copy * 64 + row) * 16 + nt * 8 + column] = score[nt][0];
+        result[(copy * 64 + row) * 16 + nt * 8 + column + 1] = score[nt][1];
+        result[(copy * 64 + row + 8) * 16 + nt * 8 + column] = score[nt][2];
+        result[(copy * 64 + row + 8) * 16 + nt * 8 + column + 1] = score[nt][3];
+    }
+}
+
+int qk_probe_test(int physical, int last, bool nonfinite_keys = false) {
+    std::vector<float> query(64 * D);
+    fill_uniform(query, 721, -0.5f, 0.5f);
+    for (int row = 0; row < 64; ++row) {
+        for (int d = 0; d < D; ++d) {
+            query[row * D + d] *= d < 256 ? 0.31f + row * 0.01f : 7.3f + row * 0.1f;
+        }
+    }
+    std::fill(query.begin(), query.begin() + D, 0.0f);
+    for (int d = 0; d < D; ++d) { query[D + d] *= 0x1p-100f; }
+    query[2 * D + 255] = 0x1p30f; // upper scale clamp and saturated outlier
+    query[3 * D + 256] = 0.252f;  // lower/upper half boundary
+    query[4 * D + 17] = std::numeric_limits<float>::quiet_NaN();
+    query[5 * D + 301] = std::numeric_limits<float>::infinity();
+    query[6 * D + 31] = -std::numeric_limits<float>::infinity();
+    std::fill(query.begin() + 63 * D, query.end(), std::numeric_limits<float>::quiet_NaN());
+    auto dq = to_device_bf16(query);
+    auto qb = from_device<std::uint16_t>(dq, query.size());
+    // The final query row is out of bounds, despite poisoned backing input.
+    std::fill(qb.begin() + 63 * D, qb.end(), std::uint16_t{0});
+    std::vector<std::uint8_t> expected_codes(query.size());
+    std::vector<std::uint16_t> expected_scales(128);
+    for (int row = 0; row < 64; ++row) {
+        quantize(qb.data() + row * D, expected_codes.data() + row * D, expected_scales.data() + row * 2);
+    }
+    std::vector<std::uint8_t> keys(Rows * D);
+    std::vector<std::uint16_t> scales(Rows * 2);
+    for (int row = 0; row < Rows; ++row) {
+        scales[row * 2] = half_bits(0.00314159f + (row % 11) * 0.001f);
+        scales[row * 2 + 1] = half_bits(0.07123f + (row % 7) * 0.01f);
+        for (int d = 0; d < D; ++d) {
+            keys[row * D + d] = static_cast<std::uint8_t>((8 + (d * 17 + row * 13) % 110) |
+                                                          ((d + row) & 1 ? 128 : 0));
+        }
+    }
+    if (nonfinite_keys && physical >= 0) {
+        for (int group = 0; group < 2; ++group) {
+            const auto row = ops::detail::gemma4_kv_row(physical, Heads, 1, 50 + group);
+            std::fill(keys.begin() + row * D + group * 256,
+                      keys.begin() + row * D + (group + 1) * 256, std::uint8_t{0x7f});
+            scales[row * 2 + group] = half_bits(1.0f);
+        }
+    }
+    // Poison the unwritten tail: staging must not read its codes or scales.
+    if (physical >= 0) {
+        for (int slot = last + 1; slot < 64; ++slot) {
+            const auto row = ops::detail::gemma4_kv_row(physical, Heads, 1, slot);
+            std::fill(keys.begin() + row * D, keys.begin() + (row + 1) * D, std::uint8_t{0x7f});
+            scales[row * 2] = scales[row * 2 + 1] = 0x7e00;
+        }
+    }
+    auto dk = to_device(keys), ds = to_device(scales);
+    GuardedDeviceBuffer qc(query.size()), qs(256), score(2 * 64 * 16 * sizeof(float));
+    qk_probe_kernel<<<1, 256>>>(static_cast<const __nv_bfloat16*>(dq.p),
+        static_cast<const std::uint8_t*>(dk.p), static_cast<const __half*>(ds.p), physical, last,
+        static_cast<std::uint8_t*>(qc.data()), static_cast<__half*>(qs.data()), static_cast<float*>(score.data()));
+    cuda_check_last_launch("qk_probe_kernel");
+    cuda_synchronize();
+    int failures = verify_exact("transient Q codes", from_device<std::uint8_t>(qc.data(), query.size()), expected_codes);
+    failures += verify_exact("transient Q represented scales", from_device<std::uint16_t>(qs.data(), 128), expected_scales);
+    const auto got = from_device<float>(score.data(), 2 * 64 * 16);
+    for (int row = 0; row < 64; ++row) {
+        for (int key = 0; key < 16; ++key) {
+            float expected = 0.0f;
+            for (int group = 0; group < 2; ++group) {
+                float partial = 0.0f;
+                const bool mapped = physical >= 0 && 48 + key <= last;
+                const auto kr = mapped ? ops::detail::gemma4_kv_row(physical, Heads, 1, 48 + key) : 0;
+                for (int d = group * 256; d < (group + 1) * 256; ++d) {
+                    const float kval = mapped ? code_value(keys[kr * D + d]) : 0.0f;
+                    partial += code_value(expected_codes[row * D + d]) * kval;
+                }
+                const float product = half_value(expected_scales[row * 2 + group]) *
+                                      (mapped ? half_value(scales[kr * 2 + group]) : 0.0f);
+                expected += partial * product;
+            }
+            for (int copy = 0; copy < 2; ++copy) {
+                const float actual = got[(copy * 64 + row) * 16 + key];
+                if (std::isnan(expected) ? !std::isnan(actual) :
+                    !std::isfinite(actual) || std::fabs(actual - expected) > 1e-4f + 3e-6f * std::fabs(expected)) {
+                    std::cerr << "FP8 QK represented score mismatch row=" << row << " key=" << key
+                              << " copy=" << copy << " got=" << actual << " ref=" << expected << '\n';
+                    return failures + 1;
+                }
+            }
+        }
+    }
+    return failures + qc.verify_guards("Q codes") + qs.verify_guards("Q scales") + score.verify_guards("QK scores");
+}
+
 int qkv_test() {
     const std::vector<int> positions{-1, 0, 1, 63, 64, 65, 127, 128, 129, 191, 192, 193, 255, 256};
     const std::vector<int> table{2, 0, -1, Pages};
@@ -205,13 +332,69 @@ int qkv_test() {
     return failures;
 }
 
-int attention_test(int tokens, bool invalid_high_page = true) {
+// Independent CPU softmax/PV reference: Q and K use FP8 code*FP16-scale
+// without an intermediate BF16 rounding; V retains Phase1 BF16 expansion.
+std::vector<double> fp8_attention_reference(
+    const std::vector<std::uint16_t>& query, const std::vector<std::uint8_t>& codes,
+    const std::vector<std::uint16_t>& scales, const std::vector<std::uint16_t>& values,
+    const std::vector<int>& positions, const std::vector<int>& table) {
+    std::vector<std::uint8_t> qc(query.size());
+    std::vector<std::uint16_t> qs(query.size() / 256);
+    for (std::size_t row = 0; row < query.size() / D; ++row) {
+        quantize(query.data() + row * D, qc.data() + row * D, qs.data() + row * 2);
+    }
+    std::vector<double> expected(query.size(), 0.0);
+    for (std::size_t token = 0; token < positions.size(); ++token) {
+        for (int head = 0; head < 4; ++head) {
+            const auto qr = token * 4 + head;
+            std::vector<double> logits(positions[token] + 1, -std::numeric_limits<double>::infinity());
+            double maximum = -std::numeric_limits<double>::infinity();
+            for (int key = 0; key <= positions[token]; ++key) {
+                if (key / 64 >= static_cast<int>(table.size())) { continue; }
+                const int physical = table[key / 64];
+                if (physical < 0 || physical >= Pages) { continue; }
+                const auto kr = ops::detail::gemma4_kv_row(physical, Heads, head / 2, key % 64);
+                double score = 0.0;
+                for (int group = 0; group < 2; ++group) {
+                    double partial = 0.0;
+                    for (int d = group * 256; d < (group + 1) * 256; ++d) {
+                        partial += double(code_value(qc[qr * D + d])) * code_value(codes[kr * D + d]);
+                    }
+                    score += partial * double(half_value(qs[qr * 2 + group])) * half_value(scales[kr * 2 + group]);
+                }
+                logits[key] = score;
+                maximum = std::max(maximum, score);
+            }
+            double sum = 0.0;
+            for (auto& logit : logits) { logit = std::exp(logit - maximum); sum += logit; }
+            for (int key = 0; key <= positions[token]; ++key) {
+                if (logits[key] == 0.0) { continue; }
+                const auto kr = ops::detail::gemma4_kv_row(table[key / 64], Heads, head / 2, key % 64);
+                const double weight = logits[key] / sum;
+                for (int d = 0; d < D; ++d) {
+                    expected[qr * D + d] += weight * bf16_to_f32(values[kr * D + d]);
+                }
+            }
+        }
+    }
+    return expected;
+}
+
+int attention_test(int tokens, bool invalid_high_page = true, bool fp8_qk = false) {
     // Sparse mapping exercises invalid pages, the page/row-half boundary and unused tail.
     const std::vector<int> table{2, -1, 0, invalid_high_page ? Pages : 1};
     std::vector<int> positions(tokens);
     for (int i = 0; i < tokens; ++i) { positions[i] = 65 + i; }
     std::vector<float> query(D * 4 * tokens);
     fill_uniform(query, 301, -0.05f, 0.05f);
+    if (fp8_qk) {
+        for (std::size_t i = 0; i < query.size(); ++i) {
+            query[i] *= i % D < 256 ? 0.37f + (i / D % 5) * 0.1f : 7.1f + (i / D % 7) * 0.2f;
+        }
+        std::fill(query.begin(), query.begin() + D, 0.0f);
+        for (int d = 0; d < D; ++d) { query[D + d] *= 0x1p-100f; }
+        if (tokens > 1) { query[2 * D + 255] = 0.252f; query[3 * D + 256] = -1.125f; }
+    }
     auto dq = to_device_bf16(query), dp = to_device_i32(positions), dt = to_device_i32(table);
     std::vector<std::uint8_t> codes(Rows * D);
     std::vector<std::uint16_t> scales(Rows * 2), expanded(Rows * D);
@@ -235,13 +418,24 @@ int attention_test(int tokens, bool invalid_high_page = true) {
     Tensor et(de.p, DType::BF16, {D, 64, Heads, Pages});
     Tensor ot(out.data(), DType::BF16, {D, 4, tokens}), rt(reference.data(), DType::BF16, {D, 4, tokens});
     ops::Gemma4CacheView cache{ops::Gemma4KvFormat::Fp8E4m3Row256, &ct, &ct, &st, &st, &tt};
+    if (fp8_qk) { cache.qk_mode = ops::Gemma4QkMode::Fp8; }
     ops::Gemma4CacheView bf16{ops::Gemma4KvFormat::BFloat16, &et, &et, nullptr, nullptr, &tt};
     WorkspaceArena workspace(std::max<std::size_t>(256, ops::gemma4_attention_workspace_capacity_bytes(D, 4, Heads, tokens)));
     ops::gemma4_attention(qt, cache, pt, 0, 1.0f, ot, workspace, nullptr);
     ops::gemma4_attention(qt, bf16, pt, 0, 1.0f, rt, workspace, nullptr);
     cuda_synchronize();
-    int failures = verify_exact("attention same represented BF16 values", from_device<std::uint16_t>(out.data(), query.size()),
-                                 from_device<std::uint16_t>(reference.data(), query.size()));
+    const auto eager = from_device<std::uint16_t>(out.data(), query.size());
+    int failures = 0;
+    if (fp8_qk && tokens >= 64) {
+        const auto expected = fp8_attention_reference(from_device<std::uint16_t>(dq, query.size()),
+                                                      codes, scales, expanded, positions, table);
+        // BF16 output rounding plus FP32 tensor-core/online-softmax accumulation.
+        failures += verify_pointwise("FP8 QK represented attention",
+            from_device_bf16(out.data(), query.size()), expected, PointwiseCriterion{0.002, 0.006});
+    } else {
+        failures += verify_exact("attention same represented BF16 values", eager,
+                                  from_device<std::uint16_t>(reference.data(), query.size()));
+    }
     for (auto bits : from_device<std::uint16_t>(out.data(), query.size())) {
         if (!std::isfinite(bf16_to_f32(bits))) {
             std::cerr << "attention consumed poisoned unused tail\n"; ++failures; break;
@@ -258,8 +452,8 @@ int attention_test(int tokens, bool invalid_high_page = true) {
     cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "cudaGraphInstantiate");
     cuda_check(cudaGraphLaunch(executable, stream), "cudaGraphLaunch");
     cuda_synchronize(stream);
-    failures += verify_exact("FP8 graph replay", from_device<std::uint16_t>(out.data(), query.size()),
-                              from_device<std::uint16_t>(reference.data(), query.size()));
+    failures += verify_exact("FP8 eager versus graph replay",
+                              from_device<std::uint16_t>(out.data(), query.size()), eager);
     cuda_check(cudaGraphExecDestroy(executable), "cudaGraphExecDestroy");
     cuda_check(cudaGraphDestroy(graph), "cudaGraphDestroy");
     cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");
@@ -337,14 +531,138 @@ int append_test() {
     }
     return failures + kp.verify_guards("external append K") + vp.verify_guards("external append V");
 }
+
+// Synthetic data is generated once, outside all event intervals. Power-of-two
+// row scales make FP8 code*scale exactly BF16 representable for a fair storage
+// comparison; separate K/V allocations preserve the actual read-traffic shape.
+__global__ void benchmark_cache_kernel(std::uint8_t* k, std::uint8_t* v,
+                                        __half* ks, __half* vs, __nv_bfloat16* kb,
+                                        __nv_bfloat16* vb, std::int64_t elements) {
+    for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < elements; i += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
+        const auto row = i / D;
+        const int d = static_cast<int>(i % D);
+        const auto kc = static_cast<std::uint8_t>((16 + (i * 17 + row * 13) % 96) |
+                                                  ((i + row) & 1 ? 128 : 0));
+        const auto vc = static_cast<std::uint8_t>((8 + (i * 23 + row * 7) % 104) |
+                                                  ((i / 3 + row) & 1 ? 128 : 0));
+        const __half kscale = __float2half_rn(d < 256 ? 0x1p-6f : 0x1p-4f);
+        const __half vscale = __float2half_rn(d < 256 ? 0x1p-5f : 0x1p-3f);
+        k[i] = kc; v[i] = vc;
+        kb[i] = ops::detail::gemma4_fp8_expand(kc, kscale);
+        vb[i] = ops::detail::gemma4_fp8_expand(vc, vscale);
+        if (d % 256 == 0) { ks[row * 2 + d / 256] = kscale; vs[row * 2 + d / 256] = vscale; }
+    }
+}
+
+void attention_benchmark(int history) {
+    constexpr int QHeads = 32;
+    constexpr int KvHeads = 4;
+    constexpr int Chunk = 128;
+    constexpr int Warmups = 3;
+    constexpr int Samples = 7;
+    constexpr int Repetitions = 3;
+    const int pages = (history + Chunk + 63) / 64;
+    const std::int64_t elements = static_cast<std::int64_t>(pages) * 64 * KvHeads * D;
+    const std::size_t code_bytes = static_cast<std::size_t>(elements);
+    DeviceBuffer k(code_bytes), v(code_bytes), ks(code_bytes / 128), vs(code_bytes / 128);
+    DeviceBuffer kb(code_bytes * 2), vb(code_bytes * 2);
+    benchmark_cache_kernel<<<4096, 256>>>(static_cast<std::uint8_t*>(k.p), static_cast<std::uint8_t*>(v.p),
+        static_cast<__half*>(ks.p), static_cast<__half*>(vs.p),
+        static_cast<__nv_bfloat16*>(kb.p), static_cast<__nv_bfloat16*>(vb.p), elements);
+    cuda_check_last_launch("benchmark_cache_kernel");
+    std::vector<float> query(D * QHeads * Chunk);
+    fill_uniform(query, 20261104, -0.15f, 0.15f);
+    std::vector<int> positions(Chunk), table(pages);
+    fill_iota_i32(positions, history);
+    fill_iota_i32(table);
+    auto dq = to_device_bf16(query), dp = to_device_i32(positions), dt = to_device_i32(table);
+    DeviceBuffer output(query.size() * 2);
+    Tensor qt(dq.p, DType::BF16, {D, QHeads, Chunk}), pt(dp.p, DType::I32, {Chunk});
+    Tensor tt(dt.p, DType::I32, {pages}), ot(output.p, DType::BF16, {D, QHeads, Chunk});
+    Tensor kt(k.p, DType::U8, {D, 64, KvHeads, pages}), vt(v.p, DType::U8, {D, 64, KvHeads, pages});
+    Tensor kst(ks.p, DType::FP16, {2, 64, KvHeads, pages}), vst(vs.p, DType::FP16, {2, 64, KvHeads, pages});
+    Tensor kbt(kb.p, DType::BF16, {D, 64, KvHeads, pages}), vbt(vb.p, DType::BF16, {D, 64, KvHeads, pages});
+    ops::Gemma4CacheView modes[]{
+        {ops::Gemma4KvFormat::BFloat16, &kbt, &vbt, nullptr, nullptr, &tt},
+        {ops::Gemma4KvFormat::Fp8E4m3Row256, &kt, &vt, &kst, &vst, &tt},
+        {ops::Gemma4KvFormat::Fp8E4m3Row256, &kt, &vt, &kst, &vst, &tt}};
+    modes[2].qk_mode = ops::Gemma4QkMode::Fp8;
+    const char* labels[]{"bf16", "fp8_phase1", "fp8_phase2"};
+    WorkspaceArena workspace(std::max<std::size_t>(256,
+        ops::gemma4_attention_workspace_capacity_bytes(D, QHeads, KvHeads, Chunk)));
+    cudaStream_t stream;
+    cudaEvent_t begin, end;
+    cuda_check(cudaStreamCreate(&stream), "cudaStreamCreate");
+    cuda_check(cudaEventCreate(&begin), "cudaEventCreate");
+    cuda_check(cudaEventCreate(&end), "cudaEventCreate");
+    const auto launch = [&](int mode) {
+        ops::gemma4_attention(qt, modes[mode], pt, 0, 1.0f, ot, workspace, stream);
+    };
+    cuda_synchronize();
+    for (int warmup = 0; warmup < Warmups; ++warmup) {
+        for (int mode = 0; mode < 3; ++mode) { launch(mode); }
+    }
+    cuda_synchronize(stream);
+    std::vector<float> timings[3];
+    for (int sample = 0; sample < Samples; ++sample) {
+        for (int order = 0; order < 3; ++order) {
+            const int mode = (sample + order) % 3;
+            cuda_check(cudaEventRecord(begin, stream), "cudaEventRecord");
+            for (int repeat = 0; repeat < Repetitions; ++repeat) { launch(mode); }
+            cuda_check(cudaEventRecord(end, stream), "cudaEventRecord");
+            cuda_check(cudaEventSynchronize(end), "cudaEventSynchronize");
+            float ms = 0.0f;
+            cuda_check(cudaEventElapsedTime(&ms, begin, end), "cudaEventElapsedTime");
+            timings[mode].push_back(ms / Repetitions);
+            std::cout << "GEMMA4_QK_EVENT_SAMPLE history=" << history << " chunk=" << Chunk
+                      << " mode=" << labels[mode] << " sample=" << sample
+                      << " repetitions=" << Repetitions << " ms_per_op=" << ms / Repetitions << '\n';
+        }
+    }
+    for (int mode = 0; mode < 3; ++mode) {
+        std::sort(timings[mode].begin(), timings[mode].end());
+        std::cout << "GEMMA4_QK_EVENT_MEDIAN history=" << history << " chunk=" << Chunk
+                  << " q_heads=" << QHeads << " kv_heads=" << KvHeads << " mode=" << labels[mode]
+                  << " warmups=" << Warmups << " samples=" << Samples << " repetitions=" << Repetitions
+                  << " median_ms=" << timings[mode][Samples / 2]
+                  << " min_ms=" << timings[mode].front() << " max_ms=" << timings[mode].back()
+                  << " execution=eager data=synthetic_represented_equal\n";
+    }
+    cuda_check(cudaEventDestroy(begin), "cudaEventDestroy");
+    cuda_check(cudaEventDestroy(end), "cudaEventDestroy");
+    cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");
+}
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1) {
+        if (argc != 2 || std::string_view(argv[1]) != "--benchmark") {
+            std::cerr << "usage: test_gemma4_fp8_kv [--benchmark]\n";
+            return 2;
+        }
+        if (cuda_unavailable()) { std::cout << "SKIP: no usable CUDA device\n"; return 77; }
+        int device = 0;
+        cudaDeviceProp properties{};
+        cuda_check(cudaGetDevice(&device), "cudaGetDevice");
+        cuda_check(cudaGetDeviceProperties(&properties, device), "cudaGetDeviceProperties");
+        std::cout << "GEMMA4_QK_BENCHMARK gpu=" << properties.name
+                  << " sm=" << properties.major << properties.minor
+                  << " timing=cuda_events order=rotating_paired\n";
+        for (int history : {32768, 131072}) { attention_benchmark(history); }
+        return 0; // Deliberately no performance assertions.
+    }
     int failures = validation_test();
     if (cuda_unavailable()) { std::cout << "SKIP: no usable CUDA device\n"; return failures ? 1 : 77; }
     failures += codec_test() + expansion_boundary_test() + qkv_test() + append_test();
+    failures += qk_probe_test(2, 63) + qk_probe_test(0, 52) + qk_probe_test(-1, 63);
+    failures += qk_probe_test(2, 63, true);
     for (int tokens : {1, 63, 64, 65, 129}) { failures += attention_test(tokens); }
     failures += attention_test(129, false);
+    for (int tokens : {1, 63, 64, 65, 127, 128, 129}) {
+        failures += attention_test(tokens, true, true);
+    }
+    failures += attention_test(129, false, true);
     std::cout << (failures ? "FAIL" : "OK") << " gemma4_fp8_kv\n";
     return failures ? 1 : 0;
 }

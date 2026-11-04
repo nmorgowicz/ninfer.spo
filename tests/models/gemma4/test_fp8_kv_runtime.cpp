@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -77,7 +78,7 @@ struct Cache {
     DeviceBuffer table_store{3 * sizeof(std::int32_t)};
     Tensor table;
     std::vector<g4::Gemma4CacheLayer> views;
-    Cache(const g4::LoadedText& model) {
+    Cache(const g4::LoadedText& model, ops::Gemma4QkMode qk_mode) {
         const std::int32_t ids[] = {0, 1, 2};
         table_store.copy_from_host(ids, sizeof(ids));
         table = Tensor(table_store.p, DType::I32, {3});
@@ -100,6 +101,7 @@ struct Cache {
             const bool global = model.layers[i].global_layer;
             views.push_back({.format = global ? ops::Gemma4KvFormat::Fp8E4m3Row256
                                                : ops::Gemma4KvFormat::BFloat16,
+                .qk_mode = global ? qk_mode : ops::Gemma4QkMode::BFloat16,
                 .k_pages = &code_tensors[2*i], .v_pages = &code_tensors[2*i+1],
                 .k_scales = global ? &scale_tensors[2*i] : nullptr,
                 .v_scales = global ? &scale_tensors[2*i+1] : nullptr, .block_table = &table});
@@ -107,8 +109,11 @@ struct Cache {
     }
 };
 
-void target_and_draft(Fixture& fixture, cudaStream_t stream) {
-    Cache cache(fixture.model);
+void target_and_draft(Fixture& fixture, cudaStream_t stream, ops::Gemma4QkMode qk_mode) {
+    Cache cache(fixture.model, qk_mode);
+    require(cache.views[0].qk_mode == qk_mode &&
+                cache.views[1].qk_mode == ops::Gemma4QkMode::BFloat16,
+            "QK selector applies only to global cache");
     DeviceArena workspace(64U << 20U);
     ops::Bf16GemmContext gemm(stream);
     std::vector<std::int32_t> ids(65), positions(65);
@@ -205,14 +210,18 @@ void four_plane_checkpoint(cudaStream_t stream) {
 }
 
 void program_summary(Fixture& fixture, cudaStream_t stream) {
+    for (auto qk : {ops::Gemma4QkMode::BFloat16, ops::Gemma4QkMode::Fp8})
     for (auto format : {KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4M3Row256}) {
+        if (qk == ops::Gemma4QkMode::Fp8 && format != KvCacheStorage::Fp8E4M3Row256) continue;
         g4::Program program(fixture.model,128,16,2,stream,
-                            {.history=false,.extra_tokens=64},format);
+                            {.history=false,.extra_tokens=64},format,qk);
         const auto memory = program.memory_summary();
         const auto global = g4::kv_layer_layout(format,true,512,1).page_bytes()*3;
         const auto sliding = g4::kv_layer_layout(format,false,256,1).page_bytes()*2;
         require(memory.gemma4_kv && memory.gemma4_kv->requested == format &&
                     memory.gemma4_kv->global == format &&
+                    memory.gemma4_kv->qk_mode == qk &&
+                    std::string(gemma4_qk_scope(qk)).find(qk == ops::Gemma4QkMode::Fp8 ? "tokens>=64" : "Phase1") != std::string::npos &&
                     memory.gemma4_kv->sliding == KvCacheStorage::BFloat16 &&
                     memory.gemma4_kv->global_payload_bytes == global &&
                     memory.gemma4_kv->sliding_payload_bytes == sliding &&
@@ -229,7 +238,8 @@ int main() {
         cuda(cudaStreamCreate(&stream));
         {
             Fixture fixture;
-            target_and_draft(fixture,stream);
+            target_and_draft(fixture,stream,ops::Gemma4QkMode::BFloat16);
+            target_and_draft(fixture,stream,ops::Gemma4QkMode::Fp8);
             four_plane_checkpoint(stream);
             program_summary(fixture,stream);
         }

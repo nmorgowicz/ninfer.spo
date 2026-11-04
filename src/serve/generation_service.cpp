@@ -317,6 +317,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
+    engine_options.gemma4_qk                 = options_.gemma4_qk;
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
@@ -382,6 +383,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
     ninfer::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
     prepared.thinking_budget     = request_options.execution.thinking.budget;
+    prepared.gemma4_qk           = engine_->options().gemma4_qk;
     prepared.reasoning_effort    = semantics.reasoning_effort;
     prepared.preserve_thinking   = semantics.preserve_thinking;
     if (request.capture && options_.capture_path.empty()) {

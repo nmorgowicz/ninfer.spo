@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/dtype.h"
 #include "ninfer/ops/gemma4_cache.h"
 #include "ninfer/types/engine.h"
 

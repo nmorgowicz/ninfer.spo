@@ -25,6 +25,7 @@ struct RequestLogContext {
     ToolChoice tool_choice;
     bool has_tool_history = false;
     bool enable_thinking  = true;
+    ops::Gemma4QkMode gemma4_qk = ops::Gemma4QkMode::BFloat16;
     std::optional<std::uint32_t> thinking_budget;
     std::optional<RequestedReasoningEffort> requested_reasoning_effort;
     std::optional<bool> preserve_thinking;

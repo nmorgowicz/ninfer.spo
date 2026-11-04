@@ -28,6 +28,32 @@ ServeOptions parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures = 0;
+    using Qk = ninfer::ops::Gemma4QkMode;
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).gemma4_qk == Qk::BFloat16, "Gemma QK default changed");
+    for (const auto& mode : {"bf16", "fp8"}) {
+        const auto options = parse({"ninfer-serve", "model.ninfer", "--gemma4-qk", mode});
+        failures += check(options.gemma4_qk == ninfer::parse_gemma4_qk(mode), "QK parser lost mode");
+    }
+    for (const auto& mode : {"", "int8", "FP8"}) {
+        bool rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--gemma4-qk", mode}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid QK mode accepted");
+    }
+    bool missing_qk_rejected = false;
+    try { (void)parse({"ninfer-serve", "model.ninfer", "--gemma4-qk"}); }
+    catch (const std::invalid_argument&) { missing_qk_rejected = true; }
+    failures += check(missing_qk_rejected, "missing QK value accepted");
+    for (bool gemma : {false, true}) {
+        for (auto storage : {ninfer::KvCacheStorage::BFloat16, ninfer::KvCacheStorage::Fp8E4M3Row256}) {
+            bool rejected = false;
+            try { ninfer::validate_gemma4_qk(Qk::Fp8, storage, gemma); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected == (!gemma || storage != ninfer::KvCacheStorage::Fp8E4M3Row256),
+                              "FP8 QK runtime compatibility gate mismatch");
+            ninfer::validate_gemma4_qk(Qk::BFloat16, storage, gemma);
+        }
+    }
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");

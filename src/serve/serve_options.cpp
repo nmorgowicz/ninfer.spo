@@ -127,6 +127,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--device-state-slots N] [--host-context-mib N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
+           "[--gemma4-qk bf16|fp8] (default bf16; fp8 requires Gemma global FP8 KV) "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens auto|N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--capture-path DIR] [--capture-sites prompt_last,completion_last] "
@@ -299,6 +300,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
+        } else if (arg == "--gemma4-qk") {
+            options.gemma4_qk = parse_gemma4_qk(require_value("--gemma4-qk"));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {
