@@ -29,8 +29,10 @@ from .quantization.groupwise import (
     VIRTUAL_GROUP_SIZES,
     quantize_matrix,
     quantize_q4_g32_qat,
+    quantize_q4_scale_search,
     quantize_q4_virtual_groups,
 )
+from .quantization.importance import importance_for
 from .quantization.nvfp4 import nvfp4_divisor, quantize_nvfp4_rows
 from .sources.logical import EncodedRows, LogicalSource
 
@@ -282,6 +284,48 @@ def grouped_absmax_emulated(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
+def grouped_mse_search(request: PrepareRequest) -> PreparedMethod:
+    """Squared-error scale search over logical groups, stored as ordinary q4_g32 words.
+
+    ``group_size`` (required) is the logical group; ``weighted`` (default false) weights each
+    column's error by the imatrix importance registered for the parent's logical inputs. The
+    unweighted arm sets every weight to 1 and changes nothing else. Quality-only like
+    ``grouped_absmax_emulated`` when ``group_size`` > 32.
+    """
+    if request.target.format != "q4_g32_fp16" or len(request.target.shape) != 2:
+        raise ValueError("grouped_mse_search requires the q4_g32_fp16 matrix format")
+    group_size = request.parameters.get("group_size")
+    weighted = request.parameters.get("weighted", False)
+    if type(group_size) is not int or group_size not in VIRTUAL_GROUP_SIZES:
+        raise ValueError(
+            f"grouped_mse_search requires parameters.group_size in {VIRTUAL_GROUP_SIZES}"
+        )
+    if type(weighted) is not bool:
+        raise ValueError("grouped_mse_search parameters.weighted must be a boolean")
+    _preflight(request, allowed=("group_size", "weighted"))
+    n, k = request.target.shape
+    importance = (
+        importance_for(tuple(item.parameter for item in request.inputs), k)
+        if weighted
+        else None
+    )
+
+    def produce(output):
+        for begin in range(0, n, request.rows_per_chunk):
+            end = min(n, begin + request.rows_per_chunk)
+            values = request.values(begin * k, end * k).reshape(end - begin, k)
+            if not values.dtype.is_floating_point:
+                raise TypeError(
+                    "grouped_mse_search source must provide floating-point values"
+                )
+            encoded = quantize_q4_scale_search(
+                values, group_size, importance, device=request.device
+            )
+            output.write_codes(begin, encoded.codes, encoded.scales)
+
+    return request.job(produce=produce)
+
+
 def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
     """Round inputs to BF16, then quantize to FP8 codes with BF16 row scales."""
     if request.target.format != "fp8_e4m3fn_row_bf16" or len(request.target.shape) != 2:
@@ -413,6 +457,7 @@ METHODS: dict[str, Method] = {
     "cast_direct": cast_direct,
     "grouped_absmax": grouped_absmax,
     "grouped_absmax_emulated": grouped_absmax_emulated,
+    "grouped_mse_search": grouped_mse_search,
     "fp8_row_maxabs": fp8_row_maxabs,
     "nvfp4_mse46": nvfp4_mse46,
     "nvfp4_absmax": nvfp4_absmax,

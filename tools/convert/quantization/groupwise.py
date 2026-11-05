@@ -211,3 +211,88 @@ def quantize_q4_virtual_groups(
         torch.round(grouped * reciprocal.unsqueeze(-1)), spec.qmin, spec.qmax
     ).to(torch.int8)
     return QuantizedMatrix(codes=codes, scales=scales.contiguous())
+
+
+SEARCH_DIVISORS = (7.0,) + tuple(float(d) for d in np.arange(5.0, 9.0001, 0.25) if d != 7.0)
+REFINE_PASSES = 2
+
+
+def quantize_q4_scale_search(
+    weight: torch.Tensor,
+    group_size: int,
+    importance: torch.Tensor | None = None,
+    *,
+    device: str | torch.device | None = None,
+) -> QuantizedMatrix:
+    """Choose each logical group's binary16 scale by minimizing the (weighted) squared error.
+
+    Candidates are ``absmax/d`` for ``d`` in ``SEARCH_DIVISORS`` (``d == 7`` is the ordinary
+    absmax scale and wins every tie), then ``REFINE_PASSES`` rounds of the weighted
+    least-squares scale for the current codes, rounded to binary16. Codes are always the nearest
+    in [-8, 7] for the exact stored scale, and the error that is compared is evaluated with
+    that stored scale and those codes. ``importance`` is one non-negative weight per logical
+    column (None means every weight is 1, the unweighted MSE arm). The result uses the same
+    q4_g32 words as ``quantize_q4_virtual_groups``.
+    """
+
+    if group_size not in VIRTUAL_GROUP_SIZES:
+        raise ValueError(f"group_size must be one of {VIRTUAL_GROUP_SIZES}")
+    if weight.dim() != 2 or not weight.dtype.is_floating_point:
+        raise ValueError("scale search requires a floating-point rank-2 matrix")
+    spec = get_format(Q4_G32_NAME)
+    geometry = row_split_geometry(spec, weight.shape)
+    target = pick_device() if device is None else pick_device(device)
+    if importance is not None:
+        if tuple(importance.shape) != (geometry.k,):
+            raise ValueError(
+                f"importance has shape {tuple(importance.shape)}; expected ({geometry.k},)"
+            )
+        if not bool(torch.isfinite(importance).all()) or bool((importance < 0).any()):
+            raise ValueError("importance must be finite and non-negative")
+    ratio = group_size // spec.group_size
+    coarse = -(-geometry.k_pad // group_size)
+    columns = coarse * group_size
+    grouped = torch.zeros((geometry.n, columns), dtype=torch.float32, device=target)
+    grouped[:, : geometry.k].copy_(weight.detach().to(device=target, dtype=torch.float32))
+    grouped = grouped.reshape(geometry.n, coarse, group_size)
+    weights = torch.zeros(columns, dtype=torch.float32, device=target)
+    weights[: geometry.k] = 1.0 if importance is None else importance.to(device=target, dtype=torch.float32)
+    weights = weights.reshape(1, coarse, group_size)
+    max_abs = grouped.abs().amax(dim=2)
+
+    def evaluate(words: torch.Tensor, reciprocal: torch.Tensor):
+        scale = words.to(target)
+        codes = torch.clamp(
+            torch.round(grouped * reciprocal.to(target).unsqueeze(-1)), spec.qmin, spec.qmax
+        ).to(torch.int8)
+        residual = codes.float() * scale.float().unsqueeze(-1) - grouped
+        return codes, scale, (weights * residual.square()).sum(dim=2)
+
+    best_codes = best_scale = best_error = None
+    for divisor in SEARCH_DIVISORS:
+        words, reciprocal = _canonical_scale_words(max_abs, divisor)
+        codes, scale, error = evaluate(words, reciprocal)
+        if best_error is None:
+            best_codes, best_scale, best_error = codes, scale, error
+            continue
+        take = error < best_error
+        best_codes = torch.where(take.unsqueeze(-1), codes, best_codes)
+        best_scale = torch.where(take, scale, best_scale)
+        best_error = torch.where(take, error, best_error)
+    for _ in range(REFINE_PASSES):
+        q = best_codes.float()
+        numerator = (weights * q * grouped).sum(dim=2)
+        denominator = (weights * q.square()).sum(dim=2)
+        ideal = torch.where(denominator > 0, numerator / denominator.clamp_min(1e-30), torch.zeros_like(numerator))
+        words, reciprocal = _canonical_scale_words(ideal.clamp_min(0), 1.0)
+        codes, scale, error = evaluate(words, reciprocal)
+        take = error < best_error
+        best_codes = torch.where(take.unsqueeze(-1), codes, best_codes)
+        best_scale = torch.where(take, scale, best_scale)
+        best_error = torch.where(take, error, best_error)
+    keep = geometry.groups_per_row
+    codes = best_codes.reshape(geometry.n, columns)[:, : geometry.k_pad].reshape(
+        geometry.n, keep, spec.group_size
+    )
+    scales = best_scale.repeat_interleave(ratio, dim=1)[:, :keep].contiguous()
+    return QuantizedMatrix(codes=codes.contiguous(), scales=scales)
