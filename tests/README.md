@@ -125,11 +125,13 @@ Run the native Python suites with the project Python environment:
 
 ```bash
 python3 -m pytest \
-  tests/artifact tests/convert tests/bench/ttft \
+  tests/artifact tests/convert tests/bench/ttft tests/bench/kv_eval \
   tests/test_serve_corpus.py
 ```
 
-The Python suites exercise conversion, encoded output and measurement tools without model inference.
+The Python suites exercise conversion, encoded output and measurement tools without model inference;
+`tests/bench/kv_eval` checks the KV-format analysis (PPL, top-1, truncated KL, paired `t`, McNemar) against
+hand-computed values on synthetic reports and dumps and needs only `numpy` and `tokenizers`.
 The maintained environment uses Python 3.11 with the dependencies for those suites. C++ binding and Engine tests
 cover consumption of their resulting representation.
 

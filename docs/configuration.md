@@ -155,6 +155,12 @@ sliding rings, snapshots, workspace, MTP and CUDA graphs. Sliding storage is
 unchanged: chunk 128 uses a 900 MiB ring and up to 900 MiB per device snapshot.
 Host checkpoint storage is not active-context offload.
 
+FP8 and FP8+QK were compared with BF16 and INT8 on one artifact and corpus (teacher-forced fidelity,
+needle retrieval, speed). FP8 halved the global KV payload with a per-position fidelity cost far above the
+run-to-run noise floor and no resolvable perplexity change; `--gemma4-qk fp8` recovered most of the long-context
+prefill speed at a small extra divergence. The reproducible method, the instruments, the evidence a comparison
+must carry and the results are in [KV-format evaluation](kv-evaluation.md).
+
 ### Opt-in Gemma 4 INT8 KV (unqualified)
 
 `--kv-dtype int8` is an opt-in, global-layer-only runtime cache format. It is
@@ -176,7 +182,8 @@ quality fallback hypothesis, not a capacity lever over FP8. Measured on one
 artifact and corpus (teacher-forced, 4096 and 65536/32768 contexts, plus a
 120-case needle grid), INT8 was indistinguishable from FP8 in fidelity and
 retrieval and slower in long-context decode (MTP at 100k: 18.3 vs 26.5 tok/s), so
-it showed no advantage; it remains unqualified. Any NaN, infinity
+it showed no advantage; it remains unqualified (method, definitions, noise floor and
+numbers: [KV-format evaluation](kv-evaluation.md)). Any NaN, infinity
 or FP16-overflowing scale in a 64-element group poisons that group (NaN scale,
 zero codes). Checkpoints, copy-on-write and host restore cover all four
 global code/scale planes.

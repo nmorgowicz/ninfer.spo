@@ -20,6 +20,13 @@ client, stages the NVFP4 artifact once in `/dev/shm`, stores raw/progress/Serve 
 JSON, and CSV summaries. The case catalog, exact profiles, TTFT boundary, and fixture qualification
 are documented in the dedicated README.
 
+## KV-format evaluation
+
+[`kv_eval/README.md`](kv_eval/README.md) is a reproducible kit for comparing KV-cache and quantization arms
+against a reference arm on one artifact: perplexity runs with top-k dumps and receipts, the fidelity analysis,
+a needle-in-haystack harness and a speed client. The protocol, metric definitions and the measured Gemma 4 31B
+results are in [KV-format evaluation](../../docs/kv-evaluation.md).
+
 ## Corpus baker
 
 `ninfer_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a

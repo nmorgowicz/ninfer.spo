@@ -53,6 +53,12 @@ products. The report records requested/resolved QK mode and scope under
 identical histories to isolate query quantization, and against BF16 KV
 separately. Top-k dumps do not establish full-distribution KL or model quality.
 
+[KV-format evaluation](kv-evaluation.md) defines the full comparison protocol built on this tool: the short
+(4096/2048) and long (65536/32768) profiles, a same-flags noise-floor repeat, the metrics computed from the report
+and the top-k dump (paired window statistics, top-1 agreement, truncated KL, target-token log-probability change,
+position bins), the evidence a result must carry, and the measured Gemma 4 31B BF16, FP8, FP8+QK and INT8 results. Its
+kit lives in `tools/bench/kv_eval/`.
+
 `--prefix-ids 2,105,...` prepends the same token ids to every window. They are context only: the
 scored targets and token counts do not change. Use it for models that are far from their training
 distribution on bare text. Gemma 4 instruction-tuned models score raw prose near perplexity 1,000
