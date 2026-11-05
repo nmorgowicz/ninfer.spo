@@ -106,11 +106,10 @@ def test_unit_weights_equal_the_unweighted_arm_and_zero_weights_fall_back_to_abs
 
 def test_search_is_deterministic():
     values = torch.from_numpy(_random(300))
-    first = quantize_q4_scale_search(values, 64, torch.rand(300), device="cpu")
-    again = quantize_q4_scale_search(values, 64, first_importance := torch.rand(300), device="cpu")
-    again2 = quantize_q4_scale_search(values, 64, first_importance, device="cpu")
-    assert torch.equal(again.codes, again2.codes) and torch.equal(again.scales, again2.scales)
-    assert first.codes.shape == again.codes.shape
+    importance = torch.rand(300)
+    first = quantize_q4_scale_search(values, 64, importance, device="cpu")
+    again = quantize_q4_scale_search(values, 64, importance, device="cpu")
+    assert torch.equal(first.codes, again.codes) and torch.equal(first.scales, again.scales)
 
 
 @pytest.mark.parametrize("bad", [torch.tensor([-1.0] + [1.0] * 127), torch.tensor([float("nan")] + [1.0] * 127), torch.ones(127)])
