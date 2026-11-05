@@ -19,6 +19,7 @@ from .methods import (
     METHODS,
     cast_direct,
     grouped_absmax,
+    grouped_absmax_emulated,
     fp8_row_maxabs,
     import_encoded,
     q4_g32_qat,
@@ -385,6 +386,7 @@ class Recipe:
         standard = (
             cast_direct,
             grouped_absmax,
+            grouped_absmax_emulated,
             fp8_row_maxabs,
             import_encoded,
             q4_g32_qat,

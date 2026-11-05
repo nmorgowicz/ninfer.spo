@@ -158,3 +158,56 @@ def quantize_matrix(
         torch.round(grouped * reciprocal.unsqueeze(-1)), spec.qmin, spec.qmax
     ).to(torch.int8)
     return QuantizedMatrix(codes=codes, scales=scales)
+
+
+VIRTUAL_GROUP_SIZES = (32, 64, 128, 256)
+
+
+def quantize_q4_virtual_groups(
+    weight: torch.Tensor,
+    group_size: int,
+    *,
+    device: str | torch.device | None = None,
+) -> QuantizedMatrix:
+    """Absmax-quantize logical groups of ``group_size`` into ordinary q4_g32 words.
+
+    One binary16 scale and one reciprocal are derived from the absolute maximum
+    of each logical group (the last group of a row may be partial; registered K
+    padding is zero and adds nothing).  The same scale word is stored for each
+    of the group's 32-wide physical subgroups, so the g32 decoder reproduces the
+    coarse-group dequantization exactly.  ``group_size`` 32 equals
+    ``quantize_matrix`` for q4_g32_fp16.
+    """
+
+    if group_size not in VIRTUAL_GROUP_SIZES:
+        raise ValueError(f"group_size must be one of {VIRTUAL_GROUP_SIZES}")
+    if weight.dim() != 2 or not weight.dtype.is_floating_point:
+        raise ValueError("virtual groups require a floating-point rank-2 matrix")
+    spec = get_format(Q4_G32_NAME)
+    geometry = row_split_geometry(spec, weight.shape)
+    target = pick_device() if device is None else pick_device(device)
+    logical = weight.detach().to(device=target, dtype=torch.float32)
+    if geometry.k_pad != geometry.k:
+        physical = torch.zeros(
+            (geometry.n, geometry.k_pad), dtype=torch.float32, device=target
+        )
+        physical[:, : geometry.k].copy_(logical)
+        logical = physical
+
+    grouped = logical.reshape(geometry.n, geometry.groups_per_row, spec.group_size)
+    sub_max = grouped.abs().amax(dim=2)
+    ratio = group_size // spec.group_size
+    coarse = -(-geometry.groups_per_row // ratio)
+    if coarse * ratio != geometry.groups_per_row:
+        padded = torch.zeros((geometry.n, coarse * ratio), dtype=sub_max.dtype, device=target)
+        padded[:, : geometry.groups_per_row].copy_(sub_max)
+        sub_max = padded
+    max_abs = sub_max.reshape(geometry.n, coarse, ratio).amax(dim=2)
+    host_scales, host_reciprocal = _canonical_scale_words(max_abs, spec.qmax)
+    keep = geometry.groups_per_row
+    scales = host_scales.to(target).repeat_interleave(ratio, dim=1)[:, :keep]
+    reciprocal = host_reciprocal.to(target).repeat_interleave(ratio, dim=1)[:, :keep]
+    codes = torch.clamp(
+        torch.round(grouped * reciprocal.unsqueeze(-1)), spec.qmin, spec.qmax
+    ).to(torch.int8)
+    return QuantizedMatrix(codes=codes, scales=scales.contiguous())

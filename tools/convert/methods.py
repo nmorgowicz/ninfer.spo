@@ -25,7 +25,12 @@ from tools.artifact.schema import TensorSpec
 from tools.artifact.tensor_output import TensorOutput
 
 from .quantization.fp8_row import quantize_bf16_rows
-from .quantization.groupwise import quantize_matrix, quantize_q4_g32_qat
+from .quantization.groupwise import (
+    VIRTUAL_GROUP_SIZES,
+    quantize_matrix,
+    quantize_q4_g32_qat,
+    quantize_q4_virtual_groups,
+)
 from .quantization.nvfp4 import nvfp4_divisor, quantize_nvfp4_rows
 from .sources.logical import EncodedRows, LogicalSource
 
@@ -149,10 +154,14 @@ Method = Callable[[PrepareRequest], PreparedMethod]
 _DIRECT_DTYPES = {"bf16": torch.bfloat16, "fp32": torch.float32, "int32": torch.int32}
 
 
-def _preflight(request: PrepareRequest, *, values: bool = True) -> None:
-    if request.parameters:
+def _preflight(
+    request: PrepareRequest, *, values: bool = True, allowed: tuple[str, ...] = ()
+) -> None:
+    if set(request.parameters) - set(allowed):
         raise ValueError(
             f"{request.target.id}: this method accepts no numerical parameters"
+            if not allowed
+            else f"{request.target.id}: this method accepts only parameters {allowed}"
         )
     if prod(request.target.shape) != sum(
         prod(item.source.shape) for item in request.inputs
@@ -234,6 +243,40 @@ def q4_g32_qat(request: PrepareRequest) -> PreparedMethod:
             if not values.dtype.is_floating_point:
                 raise TypeError("q4_g32_qat source must provide floating-point values")
             encoded = quantize_q4_g32_qat(values, device=request.device)
+            output.write_codes(begin, encoded.codes, encoded.scales)
+
+    return request.job(produce=produce)
+
+
+def grouped_absmax_emulated(request: PrepareRequest) -> PreparedMethod:
+    """Absmax over logical groups of 32/64/128/256 stored as ordinary q4_g32 words.
+
+    Parameter ``group_size`` (required) is the logical group. The physical format
+    stays q4_g32_fp16 and the coarse scale is repeated per 32-wide subgroup, so the
+    stored bytes decode exactly to the coarse-group values. This measures quality
+    only: it does not shrink the artifact.
+    """
+    if request.target.format != "q4_g32_fp16" or len(request.target.shape) != 2:
+        raise ValueError("grouped_absmax_emulated requires the q4_g32_fp16 matrix format")
+    group_size = request.parameters.get("group_size")
+    if type(group_size) is not int or group_size not in VIRTUAL_GROUP_SIZES:
+        raise ValueError(
+            f"grouped_absmax_emulated requires parameters.group_size in {VIRTUAL_GROUP_SIZES}"
+        )
+    _preflight(request, allowed=("group_size",))
+    n, k = request.target.shape
+
+    def produce(output):
+        for begin in range(0, n, request.rows_per_chunk):
+            end = min(n, begin + request.rows_per_chunk)
+            values = request.values(begin * k, end * k).reshape(end - begin, k)
+            if not values.dtype.is_floating_point:
+                raise TypeError(
+                    "grouped_absmax_emulated source must provide floating-point values"
+                )
+            encoded = quantize_q4_virtual_groups(
+                values, group_size, device=request.device
+            )
             output.write_codes(begin, encoded.codes, encoded.scales)
 
     return request.job(produce=produce)
@@ -369,6 +412,7 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
 METHODS: dict[str, Method] = {
     "cast_direct": cast_direct,
     "grouped_absmax": grouped_absmax,
+    "grouped_absmax_emulated": grouped_absmax_emulated,
     "fp8_row_maxabs": fp8_row_maxabs,
     "nvfp4_mse46": nvfp4_mse46,
     "nvfp4_absmax": nvfp4_absmax,
