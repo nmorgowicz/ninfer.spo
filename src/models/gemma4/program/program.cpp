@@ -623,7 +623,10 @@ struct Program::Impl {
                       "top logits copy");
             }
             check(cudaStreamSynchronize(stream), "score sync");
-            if (top != nullptr) { append_top_tokens(top_logits, vocab, columns, *top); }
+            if (top != nullptr) {
+                if (top->logits_observer) { top->logits_observer(top_logits, vocab, columns); }
+                if (top->k > 0) { append_top_tokens(top_logits, vocab, columns, *top); }
+            }
         }
     }
 
@@ -802,10 +805,11 @@ std::size_t Program::kv_bytes_per_token(const LoadedText& model, KvCacheStorage 
 }
 
 std::size_t Program::fixed_bytes(const LoadedText& model, std::uint32_t prefill_chunk,
-                                 std::uint32_t device_slots) {
+                                 std::uint32_t device_slots, std::uint32_t logical_pages) {
     const std::uint32_t chunk = std::clamp<std::uint32_t>(prefill_chunk, kMinChunk, kMaxChunk);
     const int window          = sliding_window(model);
-    const int ring_pages      = sliding_ring_pages(chunk, window);
+    int ring_pages            = sliding_ring_pages(chunk, window);
+    if (logical_pages != 0) { ring_pages = std::min(ring_pages, static_cast<int>(logical_pages)); }
     std::size_t rings         = 0;
     std::vector<std::size_t> ring_page_bytes;
     for (const Gemma4LayerWeights& layer : model.layers) {

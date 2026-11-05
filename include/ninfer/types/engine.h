@@ -220,6 +220,8 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // CausalScoring only: nonzero replaces the default 3 GiB device headroom used to size KV.
+    std::size_t scoring_headroom_bytes = 0;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     ops::Gemma4QkMode gemma4_qk = ops::Gemma4QkMode::BFloat16;
     SpeculativeOptions speculative;

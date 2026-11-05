@@ -41,10 +41,12 @@ public:
     [[nodiscard]] static std::size_t kv_bytes_per_token(
         const LoadedText& model, KvCacheStorage kv_cache = KvCacheStorage::BFloat16);
     // Device bytes the Program needs besides the global layers' KV, with `device_slots`
-    // checkpoint snapshots.
+    // checkpoint snapshots. A nonzero `logical_pages` (the KV page count when it is already
+    // known) caps the sliding ring at that many pages, as the Program constructor does.
     [[nodiscard]] static std::size_t fixed_bytes(const LoadedText& model,
                                                  std::uint32_t prefill_chunk,
-                                                 std::uint32_t device_slots = 0);
+                                                 std::uint32_t device_slots = 0,
+                                                 std::uint32_t logical_pages = 0);
 
 #include "program/program_methods.inc"
 

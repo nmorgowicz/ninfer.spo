@@ -323,7 +323,9 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
         throw std::invalid_argument("score_tokens first_target must be in [1,token_count-1]");
     }
     if (top != nullptr) {
-        if (top->k == 0) { throw std::invalid_argument("score_tokens top-k must be positive"); }
+        if (top->k == 0 && !top->logits_observer) {
+            throw std::invalid_argument("score_tokens top-k must be positive or a logits observer set");
+        }
         top->ids.clear();
         top->logprobs.clear();
     }

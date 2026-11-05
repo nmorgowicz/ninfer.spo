@@ -1,6 +1,7 @@
 #include "core/console_output.h"
 #include "corpus.h"
 #include "evaluation.h"
+#include "kl.h"
 
 #include "ninfer/engine.h"
 #include "product/host_options.h"
@@ -12,6 +13,8 @@
 #include <spdlog/logger.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <charconv>
 #include <chrono>
 #include <cctype>
@@ -30,6 +33,8 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <memory>
+#include <span>
 #include <vector>
 
 namespace {
@@ -55,14 +60,23 @@ struct Options {
     ninfer::ops::Gemma4QkMode gemma4_qk = ninfer::ops::Gemma4QkMode::BFloat16;
     bool quick                          = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
+    std::optional<std::filesystem::path> kl_reference_write;
+    std::optional<std::filesystem::path> kl_reference;
+    std::uint64_t kl_seed        = 20261105;
+    std::uint32_t kl_resamples   = 1000;
+    std::uint32_t prefill_chunk  = 1024;
+    std::uint32_t headroom_mib   = 0;
 };
 
 std::string usage_text() {
     return "usage: ninfer-spo-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
-           "       [--context N] [--stride N] [--device N] [--gemma4-qk bf16|fp8] (default bf16)\n"
+           "       [--context N] [--stride N] [--prefill-chunk N] [--headroom-mib N] [--device N]\n"
+           "       [--gemma4-qk bf16|fp8] (default bf16)\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
            "       [--dump-topk <file>] [--prefix-ids <id,id,...>]\n"
+           "       [--kl-reference-write <cache> | --kl-reference <cache>] [--kl-seed N]\n"
+           "       [--kl-resamples N]  (exact paired full-vocabulary KL; see docs/perplexity.md)\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -105,6 +119,11 @@ Options parse_options(int argc, char** argv) {
             out.context = parse_integer<std::uint32_t>(value("--context"), "context");
         } else if (option == "--stride") {
             out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
+        } else if (option == "--prefill-chunk") {
+            out.prefill_chunk = parse_integer<std::uint32_t>(value("--prefill-chunk"), "prefill chunk");
+            if (out.prefill_chunk < 16) { usage_error("--prefill-chunk must be at least 16"); }
+        } else if (option == "--headroom-mib") {
+            out.headroom_mib = parse_integer<std::uint32_t>(value("--headroom-mib"), "headroom MiB");
         } else if (option == "--device") {
             out.device = parse_integer<int>(value("--device"), "device");
         } else if (option == "--gemma4-qk") {
@@ -139,6 +158,14 @@ Options parse_options(int argc, char** argv) {
                 list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
             }
             if (out.prefix.empty()) { usage_error("--prefix-ids requires at least one id"); }
+        } else if (option == "--kl-reference-write") {
+            out.kl_reference_write = std::filesystem::path(value("--kl-reference-write"));
+        } else if (option == "--kl-reference") {
+            out.kl_reference = std::filesystem::path(value("--kl-reference"));
+        } else if (option == "--kl-seed") {
+            out.kl_seed = parse_integer<std::uint64_t>(value("--kl-seed"), "kl seed");
+        } else if (option == "--kl-resamples") {
+            out.kl_resamples = parse_integer<std::uint32_t>(value("--kl-resamples"), "kl resamples");
         } else if (option == "--log-level") {
             out.log_level = ninfer::product::parse_log_level(value("--log-level"));
         } else {
@@ -149,6 +176,13 @@ Options parse_options(int argc, char** argv) {
         usage_error("exactly one of --corpus and --text is required");
     }
     if (out.quick && !out.corpus) { usage_error("--quick requires --corpus"); }
+    if (out.kl_reference_write && out.kl_reference) {
+        usage_error("--kl-reference-write and --kl-reference are mutually exclusive");
+    }
+    if ((out.kl_reference_write || out.kl_reference) && out.dump_topk) {
+        usage_error("--dump-topk cannot be combined with the KL modes");
+    }
+    if (out.kl_resamples == 0) { usage_error("--kl-resamples must be positive"); }
     if (out.context < 2 || out.stride == 0 || out.stride >= out.context) {
         usage_error("context/stride must satisfy context>=2 and 1<=stride<context");
     }
@@ -256,6 +290,220 @@ void write_topk(std::ofstream& out, const ninfer::TopTokenScores& top) {
     if (!out) { throw std::runtime_error("cannot write top-k dump"); }
 }
 
+namespace kl = ninfer::perplexity::kl;
+
+// Exact paired full-vocabulary KL. Receives each score tile's BF16 logits from the engine, turns
+// them into F32 log-probabilities and either appends them to the reference cache or compares them
+// with the cached reference rows. The cache stores no logits and is bound to the run protocol.
+class KlRun {
+public:
+    KlRun(const Options& options, const ninfer::LoadSummary& load, const CorpusSelection& corpus,
+          const std::vector<EvaluationStream>& streams, const ninfer::EngineOptions& engine,
+          std::uint64_t total_positions)
+        : options_(options), writing_(options.kl_reference_write.has_value()),
+          total_(total_positions) {
+        kl::Fnv64 hash;
+        json stream_ids = json::array();
+        for (const auto& stream : streams) {
+            stream_ids.push_back({{"id", stream.source.id},
+                                  {"domain", stream.source.domain},
+                                  {"tokens", stream.tokens.size()}});
+            hash.add(stream.tokens.data(), stream.tokens.size() * sizeof(ninfer::TokenId));
+            for (const WindowPlan& window : stream.windows) {
+                hash.add_value(window.input_begin);
+                hash.add_value(window.input_end);
+                hash.add_value(window.target_begin);
+                hash.add_value(window.target_end);
+            }
+        }
+        if (!options.prefix.empty()) {
+            hash.add(options.prefix.data(), options.prefix.size() * sizeof(ninfer::TokenId));
+        }
+        std::ostringstream hex;
+        hex << std::hex << std::setw(16) << std::setfill('0') << hash.value();
+        protocol_ = {{"schema", "ninfer-kl-protocol/1"},
+                     {"corpus_id", corpus.corpus_id},
+                     {"corpus_mode", corpus.mode},
+                     {"streams", std::move(stream_ids)},
+                     {"token_window_hash_fnv64", hex.str()},
+                     {"context_tokens", options.context},
+                     {"stride_tokens", options.stride},
+                     {"prefill_chunk_tokens", options.prefill_chunk},
+                     {"prefix_ids", options.prefix},
+                     {"kv_dtype", kv_name(options.kv)},
+                     {"gemma4_qk", ninfer::gemma4_qk_name(engine.gemma4_qk)},
+                     {"positions", total_positions}};
+        std::error_code size_error;
+        const auto bytes = std::filesystem::file_size(options.artifact, size_error);
+        reference_ = {{"artifact",
+                       std::filesystem::absolute(options.artifact).lexically_normal().string()},
+                      {"artifact_file_bytes", size_error ? json(nullptr) : json(bytes)},
+                      {"name", load.model_name},
+                      {"architecture", load.architecture},
+                      {"prefill_signature", load.prefill_signature},
+                      {"formats", load.weight_formats}};
+        stats_.kl.assign(total_, 0.0F);
+        stats_.ref_lp.assign(total_, 0.0F);
+        stats_.cand_lp.assign(total_, 0.0F);
+        stats_.top1_agree.assign(total_, 1);
+        scores_.k               = 0;
+        scores_.logits_observer = [this](std::span<const std::uint16_t> logits, std::int32_t vocab,
+                                         std::int32_t columns) { tile(logits, vocab, columns); };
+    }
+
+    [[nodiscard]] ninfer::TopTokenScores& scores() noexcept { return scores_; }
+
+    void begin_window(std::span<const ninfer::TokenId> targets, const std::string& stream,
+                      const std::string& domain) {
+        targets_       = targets;
+        stream_        = stream;
+        domain_        = domain;
+        window_cursor_ = 0;
+        window_begin_  = position_;
+    }
+
+    void end_window(std::span<const float> engine_logprobs) {
+        if (window_cursor_ != targets_.size() || engine_logprobs.size() != targets_.size()) {
+            throw std::runtime_error("KL observer saw " + std::to_string(window_cursor_) +
+                                     " columns for a window of " + std::to_string(targets_.size()) +
+                                     " targets");
+        }
+        for (std::size_t i = 0; i < targets_.size(); ++i) {
+            const double diff = std::abs(static_cast<double>(engine_logprobs[i]) -
+                                         static_cast<double>(stats_.cand_lp[window_begin_ + i]));
+            max_target_diff_  = std::max(max_target_diff_, diff);
+        }
+        // The host log-softmax of the BF16 logits must agree with the engine's own target
+        // log-probability; a larger gap means the observer columns are misaligned with targets.
+        if (max_target_diff_ > 0.05) {
+            throw std::runtime_error("KL observer target log-probability disagrees with the "
+                                     "engine by " + std::to_string(max_target_diff_));
+        }
+        windows_.push_back(
+            kl::WindowRecord{.stream = stream_, .domain = domain_, .begin = window_begin_,
+                             .count = targets_.size()});
+    }
+
+    [[nodiscard]] json finish(const std::filesystem::path& output_directory) {
+        if (position_ != total_) {
+            throw std::runtime_error("KL run scored " + std::to_string(position_) + " of " +
+                                     std::to_string(total_) + " positions");
+        }
+        json out{{"mode", writing_ ? "reference_write" : "compare"},
+                 {"protocol", protocol_},
+                 {"target_logprob_max_abs_diff", max_target_diff_},
+                 {"dtype", "f32"}};
+        if (writing_) {
+            writer_->finish();
+            out["cache"]     = std::filesystem::absolute(*options_.kl_reference_write).string();
+            out["positions"] = writer_->positions();
+            return out;
+        }
+        if (reader_->consumed() != reader_->positions()) {
+            throw std::runtime_error("KL reference cache holds " +
+                                     std::to_string(reader_->positions()) +
+                                     " positions but this run consumed " +
+                                     std::to_string(reader_->consumed()));
+        }
+        out["reference_cache"]    = std::filesystem::absolute(*options_.kl_reference).string();
+        out["reference_artifact"] = reader_->reference();
+        out["candidate_artifact"] = reference_;
+        out["statistics"]         = kl::summarize(stats_, windows_, options_.kl_resamples,
+                                                  options_.kl_seed);
+        const std::filesystem::path sidecar = output_directory / "kl_positions.f32";
+        std::ofstream file(sidecar, std::ios::binary | std::ios::trunc);
+        for (std::size_t i = 0; i < total_; ++i) {
+            const float record[4] = {stats_.kl[i], stats_.ref_lp[i], stats_.cand_lp[i],
+                                     static_cast<float>(stats_.top1_agree[i])};
+            file.write(reinterpret_cast<const char*>(record), sizeof(record));
+        }
+        if (!file) { throw std::runtime_error("cannot write " + sidecar.string()); }
+        out["per_position_file"] = {{"path", sidecar.string()},
+                                    {"record", "f32 x4: kl, ref_target_lp, cand_target_lp, top1_agree"}};
+        return out;
+    }
+
+private:
+    void open(std::int32_t vocab) {
+        vocab_             = vocab;
+        protocol_["vocab"] = vocab;
+        if (writing_) {
+            writer_ = std::make_unique<kl::CacheWriter>(*options_.kl_reference_write, vocab,
+                                                        protocol_, reference_);
+        } else {
+            reader_ = std::make_unique<kl::CacheReader>(*options_.kl_reference, vocab, protocol_);
+        }
+    }
+
+    void tile(std::span<const std::uint16_t> logits, std::int32_t vocab, std::int32_t columns) {
+        if (vocab_ == 0) { open(vocab); }
+        if (vocab != vocab_ || logits.size() != static_cast<std::size_t>(vocab) * columns) {
+            throw std::runtime_error("KL observer tile has an inconsistent shape");
+        }
+        if (window_cursor_ + static_cast<std::size_t>(columns) > targets_.size() ||
+            position_ + static_cast<std::uint64_t>(columns) > total_) {
+            throw std::runtime_error("KL observer received more columns than scored positions");
+        }
+        const std::size_t cells = static_cast<std::size_t>(vocab) * columns;
+        cand_.resize(cells);
+        kl::parallel_columns(columns, [&](std::int32_t begin, std::int32_t end) {
+            for (std::int32_t c = begin; c < end; ++c) {
+                kl::log_softmax_bf16(logits.data() + static_cast<std::size_t>(c) * vocab, vocab,
+                                     cand_.data() + static_cast<std::size_t>(c) * vocab);
+            }
+        });
+        if (writing_) {
+            writer_->append(cand_, columns);
+        } else {
+            ref_.resize(cells);
+            reader_->read(columns, ref_);
+        }
+        std::atomic<bool> bad_target{false};
+        kl::parallel_columns(columns, [&](std::int32_t begin, std::int32_t end) {
+            for (std::int32_t c = begin; c < end; ++c) {
+                const float* q = cand_.data() + static_cast<std::size_t>(c) * vocab;
+                const auto t   = targets_[window_cursor_ + static_cast<std::size_t>(c)];
+                if (t < 0 || t >= vocab) {
+                    bad_target = true;
+                    continue;
+                }
+                const std::size_t at = position_ + static_cast<std::size_t>(c);
+                stats_.cand_lp[at]   = q[t];
+                if (!writing_) {
+                    const float* r      = ref_.data() + static_cast<std::size_t>(c) * vocab;
+                    stats_.ref_lp[at]   = r[t];
+                    stats_.kl[at]       = static_cast<float>(kl::kl_divergence(r, q, vocab));
+                    stats_.top1_agree[at] = kl::argmax(r, vocab) == kl::argmax(q, vocab) ? 1 : 0;
+                }
+            }
+        });
+        if (bad_target) { throw std::runtime_error("KL observer target id is outside the vocab"); }
+        position_ += static_cast<std::uint64_t>(columns);
+        window_cursor_ += static_cast<std::size_t>(columns);
+    }
+
+    const Options& options_;
+    bool writing_;
+    std::uint64_t total_;
+    json protocol_;
+    json reference_;
+    ninfer::TopTokenScores scores_;
+    std::unique_ptr<kl::CacheWriter> writer_;
+    std::unique_ptr<kl::CacheReader> reader_;
+    std::int32_t vocab_ = 0;
+    std::vector<float> cand_;
+    std::vector<float> ref_;
+    kl::PositionStats stats_;
+    std::vector<kl::WindowRecord> windows_;
+    std::span<const ninfer::TokenId> targets_;
+    std::string stream_;
+    std::string domain_;
+    std::size_t window_cursor_ = 0;
+    std::uint64_t window_begin_ = 0;
+    std::uint64_t position_     = 0;
+    double max_target_diff_     = 0.0;
+};
+
 int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         ninfer::product::StartupLogRenderer& startup_log,
         const std::shared_ptr<ninfer::product::TerminalProgress>& progress) {
@@ -267,6 +515,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.max_context = options.context + static_cast<std::uint32_t>(options.prefix.size());
     engine_options.kv_cache         = options.kv;
     engine_options.gemma4_qk        = options.gemma4_qk;
+    engine_options.prefill_chunk    = options.prefill_chunk;
+    engine_options.scoring_headroom_bytes = static_cast<std::size_t>(options.headroom_mib) << 20U;
     engine_options.startup_observer = startup_log.observer();
     ninfer::Engine engine(std::move(engine_options));
     const ninfer::LoadSummary load = engine.load_summary();
@@ -312,6 +562,11 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     std::optional<std::ofstream> topk_dump;
     if (options.dump_topk) { topk_dump.emplace(open_topk_dump(*options.dump_topk)); }
     ninfer::TopTokenScores top{.k = kDumpTopK};
+    std::unique_ptr<KlRun> kl_run;
+    if (options.kl_reference_write || options.kl_reference) {
+        kl_run = std::make_unique<KlRun>(options, load, corpus, streams, engine.options(),
+                                         total_scored_tokens);
+    }
     const Clock::time_point scoring_started = Clock::now();
     logger->info("scoring | {} streams | {} tokens | {} windows",
                  ninfer::product::format_pretty_count(streams.size()),
@@ -348,9 +603,16 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                 static_cast<std::uint32_t>(window.first_target + options.prefix.size());
             const Clock::time_point window_started = Clock::now();
             std::vector<float> logprobs;
+            const std::size_t window_targets = window.target_end - window.target_begin;
+            ninfer::TopTokenScores* score_top =
+                topk_dump ? &top : (kl_run ? &kl_run->scores() : nullptr);
+            if (kl_run) {
+                kl_run->begin_window(std::span<const ninfer::TokenId>(stream.tokens)
+                                         .subspan(window.target_begin, window_targets),
+                                     stream.source.id, stream.source.domain);
+            }
             try {
-                logprobs = engine.score_tokens(std::move(input), first_target,
-                                               topk_dump ? &top : nullptr);
+                logprobs = engine.score_tokens(std::move(input), first_target, score_top);
             } catch (const std::exception& error) {
                 throw std::runtime_error("scoring " + stream.source.id + " window " +
                                          std::to_string(window_index) + " failed: " + error.what());
@@ -361,6 +623,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                                          stream.source.id);
             }
             if (topk_dump) { write_topk(*topk_dump, top); }
+            if (kl_run) { kl_run->end_window(logprobs); }
             ScoreAggregate window_score;
             window_score.add(logprobs);
             stream_score.add(window_score);
@@ -450,7 +713,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"context_tokens", options.context},
           {"stride_tokens", options.stride},
           {"prefix_ids", options.prefix},
-          {"prefill_chunk_tokens", 1024},
+          {"prefill_chunk_tokens", options.prefill_chunk},
           {"score_tile_tokens", 1024},
           {"gemma4_qk_requested", ninfer::gemma4_qk_name(options.gemma4_qk)},
           {"gemma4_qk_resolved", ninfer::gemma4_qk_name(engine.options().gemma4_qk)},
@@ -467,6 +730,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         {"domains", std::move(domain_reports)},
         {"overall", aggregate_json(overall)},
     };
+    if (kl_run) { report["kl"] = kl_run->finish(output_directory); }
 
     const std::filesystem::path temporary = output_directory / "report.json.tmp";
     const std::filesystem::path final     = output_directory / "report.json";

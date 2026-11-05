@@ -260,7 +260,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     case EnginePurpose::CausalScoring:
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
-        options.prefill_chunk        = 1024;
+        // prefill_chunk stays the caller's (default 1024); it changes numerics, so a score
+        // comparison must hold it fixed across arms.
         options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
         options.speculative          = {};
         options.enable_vision        = false;
@@ -342,10 +343,15 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
             formats.emplace(artifact::format_name(weight->qtype));
         }
     }
-    const std::size_t kHeadroom  = options.kv_capacity.mode == KvCapacityMode::Automatic &&
-                                          options.kv_capacity.automatic_headroom_bytes != 0
-                                       ? options.kv_capacity.automatic_headroom_bytes
-                                       : std::size_t{3} << 30U;
+    const bool scoring_engine = options.purpose == EnginePurpose::CausalScoring;
+    // Scoring instantiates no decode/MTP graphs, so its caller may shrink the 3 GiB default
+    // headroom (`scoring_headroom_bytes`) to fit a trunk that nearly fills the device.
+    const std::size_t kHeadroom =
+        scoring_engine && options.scoring_headroom_bytes != 0 ? options.scoring_headroom_bytes
+        : options.kv_capacity.mode == KvCapacityMode::Automatic &&
+                options.kv_capacity.automatic_headroom_bytes != 0
+            ? options.kv_capacity.automatic_headroom_bytes
+            : std::size_t{3} << 30U;
     // Checkpoints: device snapshot slots, a pinned host arena (8 GiB unless set), and spare
     // global KV pages for the prefixes they keep, up to 64k tokens.
     const ContextCacheOptions& history = options.context_cache;
@@ -353,8 +359,12 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
     const std::size_t host_bytes =
         history.enabled ? history.host_capacity_bytes.value_or(std::size_t{8} << 30U) : 0U;
     const std::size_t free_bytes = current_free_device_bytes();
-    const std::size_t fixed =
-        models::gemma4::Program::fixed_bytes(*loaded, options.prefill_chunk, slots);
+    // An explicit request fixes the page count up front, so the ring cap matches the Program's.
+    const std::uint32_t explicit_pages =
+        options.kv_capacity.mode == KvCapacityMode::Explicit
+            ? (options.kv_capacity.explicit_tokens + 63U) / 64U : 0U;
+    const std::size_t fixed = models::gemma4::Program::fixed_bytes(
+        *loaded, options.prefill_chunk, slots, explicit_pages);
     const std::size_t per_token =
         models::gemma4::Program::kv_bytes_per_token(*loaded, options.kv_cache);
     if (per_token == 0) {
@@ -364,8 +374,19 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
     const std::size_t fit = free_bytes > fixed && free_bytes - fixed > kHeadroom
                                ? (free_bytes - fixed - kHeadroom) / per_token : 0;
     const std::uint32_t requested_context = options.max_context;
-    const auto capacity = models::gemma4::kv_page_capacity(
-        options.kv_capacity, requested_context, native_context, fit, slots);
+    models::gemma4::KvPageCapacity capacity;
+    try {
+        capacity = models::gemma4::kv_page_capacity(options.kv_capacity, requested_context,
+                                                    native_context, fit, slots);
+    } catch (const std::invalid_argument& error) {
+        constexpr double kMiB = 1048576.0;
+        throw std::invalid_argument(
+            std::string(error.what()) + " (device free after weights " +
+            std::to_string(static_cast<double>(free_bytes) / kMiB) + " MiB, fixed rings+workspace " +
+            std::to_string(static_cast<double>(fixed) / kMiB) + " MiB, headroom " +
+            std::to_string(static_cast<double>(kHeadroom) / kMiB) + " MiB, KV " +
+            std::to_string(per_token) + " B/token)");
+    }
     options.max_context = capacity.tokens;
     const auto extra_tokens = capacity.extra_tokens;
     auto program = std::make_unique<models::gemma4::Program>(

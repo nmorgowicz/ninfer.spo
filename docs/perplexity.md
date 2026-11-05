@@ -111,3 +111,47 @@ today; other families reject the option.
 The file is little-endian: the 8 bytes `NTOPK001`, a `u32` k (64), a `u32` 0, then per scored
 position k `i32` ids (most likely first) followed by k `f32` log-probabilities. Positions follow
 the stream, window and target order of the scoring itself.
+
+## Exact paired full-vocabulary KL
+
+`--kl-reference-write CACHE` and `--kl-reference CACHE` measure `D_KL(reference || candidate)` over the
+whole vocabulary at every scored position. Gemma 4 artifacts only; other families reject the option. They
+are mutually exclusive and cannot be combined with `--dump-topk`.
+
+1. **Reference run** (`--kl-reference-write`): scores the reference artifact once and writes the F32
+   log-softmax row of every scored position to `CACHE` (never raw logits, never BF16 rows). The cache is
+   `positions x vocab x 4` bytes, about 1 MiB per position at vocab 262144: 16k positions is about 16 GiB and
+   64k positions about 64 GiB. The full 1M-token corpus would need about 1 TB, so use a head-truncated subset
+   (`python -m tools.bench.kv_eval.kl_corpus`). It refuses to overwrite an existing cache.
+2. **Candidate run** (`--kl-reference`): scores the candidate and streams the cache sequentially, never
+   holding more than one score tile of rows. Per position it computes in F64
+   `sum_v exp(r_v) (r_v - c_v)` from the two F32 rows, unclamped, so same-arm noise stays visible as small
+   signed values.
+
+The cache header binds a **protocol**: corpus id and mode, per-stream ids/domains/token counts, an FNV-64
+hash of every token and window boundary, context, stride, prefix ids, KV dtype, resolved Gemma QK mode,
+scored-position count and vocab. A candidate run with any difference is refused with the differing field
+named; a truncated, never-finished or foreign file is refused. A filename is not identity. The
+reference artifact's path, file size, formats and prefill signature are stored as informational provenance
+and copied into candidate reports (`kl.reference_artifact`); hash the artifact separately for a published
+result.
+
+The report gains a `kl` object: `protocol`, `reference_cache`, `reference_artifact`, `candidate_artifact`,
+`target_logprob_max_abs_diff` (host log-softmax of the BF16 logits against the engine's own target
+log-probability; a gap above 0.05 aborts the run as a column misalignment), and `statistics`. `statistics`
+holds, overall and per domain: positions, windows, mean KL with a 95% percentile interval from a bootstrap
+that resamples **whole windows** (`--kl-resamples`, default 1000; `--kl-seed`, default 20261105), median,
+p95, p99 and p99.9 KL, mean change in target NLL (candidate minus reference) with its interval, and top-1
+disagreement, plus per-window sums for pairing two arms. `kl_positions.f32` in the output directory holds
+four F32 values per position (KL, reference target log-probability, candidate target log-probability,
+top-1 agreement).
+
+Interpretation rules: a candidate's KL is its distance from the *reference arm*, so it ranks candidates only
+when the reference is closer to the unquantized model than every candidate (see the
+[weight-quantization plan](https://github.com/nmorgowicz-org/llama-local-tooling/blob/research/tooling-reorganization/docs/plans/20261105-ninfer.spo_gemma4_weight_quantization.md)).
+Run the same arm twice first: GPU scoring is not bit-reproducible, so the same-arm KL is a noise floor and
+its tail (a few positions with large KL) bounds how small a difference can be resolved.
+`python -m tools.bench.kv_eval.kl_compare --baseline A/report.json --candidate B/report.json` pairs two
+candidate reports scored against one cache (same windows) and reports the mean-KL ratio and the paired
+change in NLL with window-bootstrap intervals; `--delta` applies an operator-set acceptance factor and has no
+default.

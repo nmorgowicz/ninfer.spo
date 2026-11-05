@@ -14,7 +14,8 @@ target_link_libraries(ninfer-spo-serve PRIVATE ninfer_serve ninfer_product_loggi
 add_executable(ninfer-spo-perplexity
   perplexity/main.cpp
   perplexity/corpus.cpp
-  perplexity/evaluation.cpp)
+  perplexity/evaluation.cpp
+  perplexity/kl.cpp)
 ninfer_internal_includes(ninfer-spo-perplexity)
 target_link_libraries(ninfer-spo-perplexity PRIVATE
   ninfer_engine ninfer_product_logging ninfer::json)

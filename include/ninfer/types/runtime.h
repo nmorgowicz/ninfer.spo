@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -46,11 +47,19 @@ struct GenerationResult {
 };
 
 // The `k` most likely tokens at each scored position, most likely first, as ids and natural-log
-// probabilities in row-major [position][k] order.
+// probabilities in row-major [position][k] order. `k` may be zero only when `logits_observer` is set.
+//
+// `logits_observer`, when set, receives the final-softcapped BF16 logits of every score tile as host
+// bits, column-major [vocab, columns] (one column per scored position, in scoring order), before the
+// tile's buffer is reused. It runs synchronously on the scoring thread. Families that cannot provide
+// the logits reject any non-null TopTokenScores.
 struct TopTokenScores {
+    using LogitsObserver = std::function<void(std::span<const std::uint16_t> logits,
+                                              std::int32_t vocab, std::int32_t columns)>;
     std::uint32_t k = 0;
     std::vector<TokenId> ids;
     std::vector<float> logprobs;
+    LogitsObserver logits_observer;
 };
 
 struct ArenaMemorySummary {

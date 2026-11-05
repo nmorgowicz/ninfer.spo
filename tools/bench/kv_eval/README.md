@@ -42,6 +42,8 @@ is the Gemma 4 31B set:
 | `speed_client` / `speed_summary` | Warmup + timed requests with unique prompts and pinned sampling; median (min-max) tables and server memory/capacity |
 | `gpu_state` | One GPU/process idle-state row for the receipts |
 | `metrics` | The analysis core (pure numpy functions); the instrument definition |
+| `kl_corpus` | Head-truncated subset of a perplexity corpus sized for the exact-KL reference cache (about 1 MiB per scored position), with a hashed `subset.json` receipt |
+| `kl_compare` | Paired window-bootstrap comparison of two `--kl-reference` reports scored against one cache; optional operator-set `--delta` verdict (see [docs/perplexity.md](../../../docs/perplexity.md#exact-paired-full-vocabulary-kl)) |
 | `corpus_pool`, `common` | Haystack text pool; shared helpers |
 
 Every module is run as `python -m tools.bench.kv_eval.<module>` and has `--help`.
