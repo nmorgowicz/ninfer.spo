@@ -41,8 +41,8 @@ def parse_chars(items: list[str]) -> dict[str, int]:
     chars = dict(DEFAULT_CHARS)
     for item in items:
         domain, separator, value = item.partition("=")
-        if not separator or not value.isdigit() or int(value) <= 0:
-            raise SystemExit(f"--chars expects domain=positive-integer, got {item!r}")
+        if not separator or not value.isdigit() or int(value) < 0:
+            raise SystemExit(f"--chars expects domain=non-negative-integer, got {item!r}")
         chars[domain] = int(value)
     return chars
 
@@ -57,8 +57,8 @@ def build(source: Path, out: Path, chars: dict[str, int], scale: float, corpus_s
     records = []
     for stream in manifest["streams"]:
         domain = stream["domain"]
-        if domain not in chars:
-            raise SystemExit(f"no character budget for domain {domain!r}; pass --chars {domain}=N")
+        if chars.get(domain, 0) == 0:
+            continue
         budget = max(1, round(chars[domain] * scale))
         text = (base / stream["path"]).read_text(encoding="utf-8")[:budget]
         if not text.strip():
