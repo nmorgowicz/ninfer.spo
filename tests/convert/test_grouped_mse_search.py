@@ -152,3 +152,34 @@ def test_weighted_method_needs_a_matching_vector_for_every_packed_input():
 def test_invalid_parameters_are_refused(parameters):
     with pytest.raises(ValueError):
         _prepare(("gate",), parameters)
+
+
+@pytest.mark.parametrize("bits", [8, 6, 4])
+def test_emulated_two_level_scales_are_integer_multiples_of_a_shared_super_scale(bits):
+    values = torch.from_numpy(_random(512))[:2] * torch.rand(2, 1) * 3
+    two = quantize_q4_scale_search(values, 32, None, device="cpu", scale_bits=bits)
+    plain = quantize_q4_scale_search(values, 32, None, device="cpu")
+    scales = two.scales.float()
+    levels = (1 << bits) - 1
+    for row in range(2):
+        for start in range(0, 16, 8):  # eight g32 scales per 256 columns
+            run = scales[row, start : start + 8]
+            super_scale = float(run.max()) / levels
+            multiples = run / super_scale
+            assert torch.allclose(multiples, multiples.round(), atol=0.02 * levels / 255 + 1e-3 * multiples.max().item())
+            assert float(multiples.max()) <= levels + 0.5
+    assert two.scales.shape == plain.scales.shape and two.codes.shape == plain.codes.shape
+    # Coarser scales cannot beat the exact binary16 scales on the same unweighted error.
+    error = lambda m: float(((m.codes.float() * m.scales.float().unsqueeze(-1)).reshape(values.shape) - values).square().sum())
+    assert error(two) >= error(plain) * (1 - 1e-6)
+
+
+def test_scale_bits_refuses_unsupported_shapes():
+    for parameters in (
+        {"group_size": 128, "scale_bits": 8},
+        {"group_size": 32, "scale_bits": 3},
+        {"group_size": 32, "scale_bits": 9},
+        {"group_size": 32, "scale_bits": "8"},
+    ):
+        with pytest.raises(ValueError, match="scale_bits"):
+            _prepare(("gate",), parameters)

@@ -215,6 +215,7 @@ def quantize_q4_virtual_groups(
 
 SEARCH_DIVISORS = (7.0,) + tuple(float(d) for d in np.arange(5.0, 9.0001, 0.25) if d != 7.0)
 REFINE_PASSES = 2
+SUPER_GROUP_COLUMNS = 256
 
 
 def quantize_q4_scale_search(
@@ -223,6 +224,7 @@ def quantize_q4_scale_search(
     importance: torch.Tensor | None = None,
     *,
     device: str | torch.device | None = None,
+    scale_bits: int | None = None,
 ) -> QuantizedMatrix:
     """Choose each logical group's binary16 scale by minimizing the (weighted) squared error.
 
@@ -290,6 +292,24 @@ def quantize_q4_scale_search(
         best_codes = torch.where(take.unsqueeze(-1), codes, best_codes)
         best_scale = torch.where(take, scale, best_scale)
         best_error = torch.where(take, error, best_error)
+    if scale_bits is not None:
+        # Emulated two-level scales (screening only): each run of eight g32 scales shares one binary16 super
+        # scale S = max/(2^bits - 1) and stores an integer multiplier in [1, 2^bits - 1]; the scale used is
+        # S * multiplier (rounded to binary16 for the g32 word). Codes are redone for those scales.
+        levels = (1 << scale_bits) - 1
+        per_super = SUPER_GROUP_COLUMNS // group_size
+        supers = -(-coarse // per_super)
+        scale = best_scale.float()
+        padded = torch.zeros((geometry.n, supers * per_super), dtype=torch.float32, device=target)
+        padded[:, :coarse].copy_(scale)
+        super_scale = (padded.reshape(geometry.n, supers, per_super).amax(dim=2) / levels).to(torch.float16).float()
+        super_scale = super_scale.clamp_min(_FP16_MIN_SUBNORMAL).repeat_interleave(per_super, dim=1)[:, :coarse]
+        multiplier = torch.clamp(torch.round(scale / super_scale), 1, levels)
+        quantized = (super_scale * multiplier).to(torch.float16)
+        reciprocal = torch.where(
+            quantized > 0, (1.0 / quantized.double()).float(), torch.zeros((), dtype=torch.float32, device=target)
+        )
+        best_codes, best_scale, _ = evaluate(quantized, reciprocal)
     keep = geometry.groups_per_row
     codes = best_codes.reshape(geometry.n, columns)[:, : geometry.k_pad].reshape(
         geometry.n, keep, spec.group_size

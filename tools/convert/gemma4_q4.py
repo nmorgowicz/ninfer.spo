@@ -223,6 +223,7 @@ class Q4Options:
     native_groups: bool = False
     imatrix: Path | None = None
     mtp_weights: str = "bf16"
+    scale_bits: int | None = None
 
     def __post_init__(self):
         if self.weights not in Q4_WEIGHTS:
@@ -243,6 +244,14 @@ class Q4Options:
             raise ValueError(f"--mtp-weights must be one of {MTP_WEIGHTS}, got {self.mtp_weights!r}")
         if self.mtp_weights != "bf16" and not self.quantized:
             raise ValueError("--mtp-weights fp8|q4 applies only to the q4_g32 and q4_g32_a16 weights")
+        if self.scale_bits is not None:
+            if not self.quantized or self.scale_search == "absmax" or regions or self.group_size != 32 or self.native_groups:
+                raise ValueError(
+                    "--scale-bits (emulated two-level scales) needs a q4 weight with --scale-search mse|weighted, "
+                    "--group-size 32, no --region-group and no --native-groups"
+                )
+            if not 4 <= self.scale_bits <= 8:
+                raise ValueError("--scale-bits must be 4..8")
 
     @property
     def quantized(self) -> bool:
@@ -314,12 +323,15 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
                 raise ValueError("--native-groups supports logical groups 32, 128 and 256 (no Gemma g64 kernels)")
             target = f"q4_g{groups[name]}_fp16" if options.native_groups else "q4_g32_fp16"
             if options.scale_search != "absmax":
+                parameters = {"group_size": groups[name], "weighted": options.scale_search == "weighted"}
+                if options.scale_bits is not None:
+                    parameters["scale_bits"] = options.scale_bits
                 recipe.assign(
                     name,
                     format=target,
                     layout="auto",
                     method="grouped_mse_search",
-                    parameters={"group_size": groups[name], "weighted": options.scale_search == "weighted"},
+                    parameters=parameters,
                 )
             elif groups[name] == 32:
                 recipe.assign(name, format="q4_g32_fp16", layout="auto", method="grouped_absmax")
@@ -354,6 +366,9 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
         name += "_native_groups" if options.native_groups else "_virtual_groups"
     if options.scale_search != "absmax":
         name = name.replace("absmax", options.scale_search + "_search")
+    if options.scale_bits is not None:
+        name += f"_emulated_scale{options.scale_bits}"
+        scale_search["scale_bits"] = options.scale_bits
     if options.mtp_weights != "bf16":
         name += "_mtp_" + options.mtp_weights
     prepared = recipe.prepare(device=device, rows_per_chunk=rows_per_chunk)
@@ -365,6 +380,10 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
         if job.spec.format == "q4_g32_fp16" and size != 32:
             n, k = job.spec.shape
             saved += n * k * (2 / 32 - 2 / size)
+        elif options.scale_bits is not None and job.spec.format == "q4_g32_fp16" and job.parameters[0] in groups:
+            # Emulated two-level scale: one `scale_bits` multiplier per 32 weights plus one binary16 super scale per 256.
+            n, k = job.spec.shape
+            saved += n * k * (2 / 32 - (options.scale_bits / 8 / 32 + 2 / 256))
     histogram: dict[int, int] = {}
     for size in groups.values():
         histogram[size] = histogram.get(size, 0) + 1

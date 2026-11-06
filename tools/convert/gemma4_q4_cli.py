@@ -81,6 +81,7 @@ def options_from(args: argparse.Namespace) -> Q4Options:
         native_groups=args.native_groups,
         imatrix=args.imatrix,
         mtp_weights=args.mtp_weights,
+        scale_bits=args.scale_bits,
     )
 
 
@@ -340,6 +341,14 @@ def build_parser() -> argparse.ArgumentParser:
         "unchanged), fp8 (FP8 per-row) or q4 (q4_g32, absmax). They always run on 16-bit activations; the "
         "assistant's FP8 head and outer projections are unchanged. Draft quality, not target output, is at risk: "
         "measure MTP acceptance before shipping",
+    )
+    build.add_argument(
+        "--scale-bits",
+        type=int,
+        help="EXPERIMENTAL, quality screening only: emulate two-level scales (one integer multiplier of this many "
+        "bits per 32 weights, one binary16 super scale per 256) on ordinary q4_g32 words. Needs --scale-search "
+        "mse|weighted and --group-size 32. The file does not shrink; no kernel reads this layout. The receipt's "
+        "projected_real_weight_bytes counts the saving a real format would give",
     )
     build.add_argument(
         "--dry-run", action="store_true", help="Read-only shape/recipe preflight; writes nothing"

@@ -313,6 +313,7 @@ def grouped_mse_search(request: PrepareRequest) -> PreparedMethod:
         raise ValueError("grouped_mse_search requires a rank-2 q4 matrix")
     group_size = request.parameters.get("group_size")
     weighted = request.parameters.get("weighted", False)
+    scale_bits = request.parameters.get("scale_bits")
     if type(group_size) is not int or group_size not in VIRTUAL_GROUP_SIZES:
         raise ValueError(
             f"grouped_mse_search requires parameters.group_size in {VIRTUAL_GROUP_SIZES}"
@@ -320,7 +321,14 @@ def grouped_mse_search(request: PrepareRequest) -> PreparedMethod:
     native = _q4_native_target(request, "grouped_mse_search", group_size)
     if type(weighted) is not bool:
         raise ValueError("grouped_mse_search parameters.weighted must be a boolean")
-    _preflight(request, allowed=("group_size", "weighted"))
+    if scale_bits is not None and (
+        type(scale_bits) is not int or not 4 <= scale_bits <= 8 or group_size != 32 or native
+    ):
+        raise ValueError(
+            "grouped_mse_search parameters.scale_bits is an emulated two-level scale (integer 4..8) "
+            "and needs group_size 32 stored as ordinary q4_g32 words"
+        )
+    _preflight(request, allowed=("group_size", "weighted", "scale_bits"))
     n, k = request.target.shape
     importance = (
         importance_for(tuple(item.parameter for item in request.inputs), k)
@@ -337,7 +345,7 @@ def grouped_mse_search(request: PrepareRequest) -> PreparedMethod:
                     "grouped_mse_search source must provide floating-point values"
                 )
             encoded = quantize_q4_scale_search(
-                values, group_size, importance, device=request.device
+                values, group_size, importance, device=request.device, scale_bits=scale_bits
             )
             if native:
                 encoded = to_native_groups(encoded, group_size)
