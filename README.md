@@ -112,6 +112,8 @@ Expect about 15–19 tok/s and a first token in up to a second, against 240–29
 
 Convert `gemma4_31b_fp8` with `--components text,vision,mtp` and `--override gemma4_fp8_a8` (`docs/weight-conversion.md`). That artifact has the FP8 A8 text trunk, one FP8 vocabulary table, the MTP assistant, and the vision tower. The text-only FP8 artifact has no vision. The NVFP4 recipes missed the quality gate.
 
+For the 17 GB 4-bit file that fits 131,072 tokens of context on one 5090 (calibrated group-wise Q4, FP8 KV, MTP), see `docs/gemma4-31b-conversion.md`: sizes, KL/PPL table, commands.
+
 ```
 ninfer-spo-serve <artifact> --port 8080 --model-id local --max-context 16384 --kv-dtype bf16 \
     --spec mtp --draft-tokens 4 --vision --no-thinking \

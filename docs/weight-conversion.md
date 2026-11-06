@@ -28,7 +28,9 @@ downloaded files.
 
 Source-weight conversion requires a Python 3.11 environment with PyTorch and NumPy. It uses CUDA
 by default; `--device cpu` selects CPU conversion. The input paths below are placeholders for your
-local checkpoint directories.
+local checkpoint directories. The Gemma 4 31B Q4 command (`python -m tools.convert.gemma4_q4`) also
+needs `gguf` (`pip install gguf`) only for `--imatrix`, and `tokenizers` only for `calibration-text`.
+The step-by-step guide with sizes and quality numbers is [gemma4-31b-conversion.md](gemma4-31b-conversion.md).
 
 For Qwen3.6-27B floating-point source weights:
 

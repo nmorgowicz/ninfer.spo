@@ -7,4 +7,5 @@ supplies the maintained assignments; proposal adds the indexed proposal head.
 methods adapts numerical quantization or encoded import to artifact.tensor_output.
 pipeline prepares jobs, runs them through the artifact writer, and reports results.
 __main__ supplies the CLI and loads explicitly selected recipe functions.
+gemma4_q4 composes the Gemma 4 31B Q4/FP8 recipe; gemma4_q4_cli is its `python -m tools.convert.gemma4_q4` CLI.
 """

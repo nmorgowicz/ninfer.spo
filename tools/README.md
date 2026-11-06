@@ -6,6 +6,8 @@ To build your own weights, use the [weight conversion guide](../docs/weight-conv
 
 Run commands from the repository root with a Python environment containing the dependencies
 for the selected tool. The maintained environment uses Python 3.11.
+The Gemma 4 31B Q4 commands (`python -m tools.convert.gemma4_q4`) additionally use `gguf`
+(`pip install gguf`, only for `--imatrix`) and `tokenizers` (only for `calibration-text`).
 
 Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 
@@ -14,6 +16,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Task | Location |
 |---|---|
 | Convert weights with an official or custom recipe | [`convert/`](convert/); [user guide](../docs/weight-conversion.md) |
+| Convert, verify, and calibrate a Gemma 4 31B Q4 custom model | [`convert/gemma4_q4.py`](convert/gemma4_q4.py), [`convert/gemma4_q4_cli.py`](convert/gemma4_q4_cli.py); [guide](../docs/gemma4-31b-conversion.md) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
