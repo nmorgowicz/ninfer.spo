@@ -12,7 +12,7 @@ The storage registry contains exactly these identities:
 | Identity | Kind | Compatible numeric formats | Logical shape | Object alignment |
 |---|---|---|---|---:|
 | `contiguous_le_v1` | tensor layout | `bf16`, `fp32`, `int32` | rank `0..16` | 256 bytes |
-| `row_split_k128_v1` | tensor layout | `q4_g64_fp16`, `q4_g32_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]` | 256 bytes |
+| `row_split_k128_v1` | tensor layout | `q4_g64_fp16`, `q4_g32_fp16`, `q4_g128_fp16`, `q4_g256_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]`; `q4_g256_fp16` also requires `K` padded to 128 to be a multiple of 256 | 256 bytes |
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
@@ -87,6 +87,8 @@ group size `G`:
 |---|---:|---:|---:|---:|
 | `q4_g64_fp16` | 4 | 64 | 32 | 0 |
 | `q4_g32_fp16` | 4 | 32 | 16 | 0 |
+| `q4_g128_fp16` | 4 | 128 | 64 | 0 |
+| `q4_g256_fp16` | 4 | 256 | 128 | 0 |
 | `q5_g64_fp16` | 5 | 64 | 32 | 8 |
 | `q6_g64_fp16` | 6 | 64 | 32 | 16 |
 | `q8_g32_fp16` | 8 | 32 | 32 | 0 |

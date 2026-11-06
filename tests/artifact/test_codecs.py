@@ -123,6 +123,28 @@ def test_direct_layout_preserves_exact_little_endian_words(
             id="q4-g32",
         ),
         pytest.param(
+            "q4_g128_fp16",
+            129,
+            128,
+            256,
+            256,
+            (-8, -7, -1, 0, 1, 7),
+            b"\x98\x0f\x71",
+            b"",
+            id="q4-g128",
+        ),
+        pytest.param(
+            "q4_g256_fp16",
+            512,
+            256,
+            512,
+            256,
+            (-8, -7, -1, 0, 1, 7),
+            b"\x98\x0f\x71",
+            b"",
+            id="q4-g256",
+        ),
+        pytest.param(
             "q8_g32_fp16",
             33,
             32,
@@ -197,3 +219,12 @@ def test_nvfp4_known_vector_geometry_swizzle_tail_and_round_trip():
     assert torch.equal(decoded_packed, packed)
     assert torch.equal(decoded_scales, scales)
     assert bytes(decoded_divisor.reshape(1).view(torch.uint8).numpy()) == divisor
+
+
+@pytest.mark.parametrize("k", [100, 128, 384, 640])
+def test_g256_refuses_k_whose_padded_width_is_not_a_multiple_of_256(k):
+    from tools.artifact.layouts import row_split_geometry
+
+    with pytest.raises(ValueError, match="multiple of its group size"):
+        row_split_geometry("q4_g256_fp16", (4, k))
+    assert row_split_geometry("q4_g128_fp16", (4, k)).groups_per_row == -(-k // 128)

@@ -9,6 +9,8 @@ namespace ninfer {
 enum class QType : std::uint16_t {
     Q4_G64_FP16         = 0,
     Q4_G32_FP16         = 10,
+    Q4_G128_FP16        = 11,
+    Q4_G256_FP16        = 12,
     Q5_G64_FP16         = 1,
     Q6_G64_FP16         = 2,
     Q8_G32_FP16         = 3,

@@ -296,3 +296,23 @@ def quantize_q4_scale_search(
     )
     scales = best_scale.repeat_interleave(ratio, dim=1)[:, :keep].contiguous()
     return QuantizedMatrix(codes=codes.contiguous(), scales=scales)
+
+
+def to_native_groups(encoded: QuantizedMatrix, group_size: int) -> QuantizedMatrix:
+    """Re-shape g32-emulated coarse-group words into a native q4_g{G}_fp16 matrix.
+
+    The emulated matrix repeats each coarse scale ``G/32`` times; the native matrix keeps one. The
+    codes are untouched (they are already the coarse-group codes), so decoded values are identical.
+    """
+
+    n, subgroups, width = encoded.codes.shape
+    ratio = group_size // 32
+    if width != 32 or group_size not in VIRTUAL_GROUP_SIZES or subgroups % ratio:
+        raise ValueError(f"cannot form q4_g{group_size} groups from {subgroups} g32 subgroups")
+    words = encoded.scales.view(torch.int16).reshape(n, subgroups // ratio, ratio)
+    if not bool((words == words[:, :, :1]).all()):
+        raise ValueError("emulated scales are not constant inside a coarse group")
+    return QuantizedMatrix(
+        codes=encoded.codes.reshape(n, subgroups // ratio, group_size).contiguous(),
+        scales=encoded.scales.reshape(n, subgroups // ratio, ratio)[:, :, 0].contiguous(),
+    )

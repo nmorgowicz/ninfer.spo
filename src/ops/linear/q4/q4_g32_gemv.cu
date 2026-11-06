@@ -1,5 +1,6 @@
 #include "ops/linear/q4/q4_g32_gemv.cuh"
 
+#include "ops/common/q4_scale_shift.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/q4/q4_g32_tc.cuh"
 #include "ops/linear/q4/q4_g32_wide.cuh"
@@ -29,7 +30,7 @@ __device__ __forceinline__ void q4g32_decode_group(std::uint32_t packed, float (
     Q4SimtDecodeAtom::decode_eight(packed, 0x3c00u, w);
 }
 
-template <int kTokens, int kRowsPerWarp, int kWarps>
+template <int kTokens, int kRowsPerWarp, int kWarps, int kScaleShift>
 __global__ void q4g32_gemv_fast(const __nv_bfloat16* __restrict__ x,
                                 const std::uint8_t* __restrict__ codes,
                                 const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out,
@@ -79,8 +80,9 @@ __global__ void q4g32_gemv_fast(const __nv_bfloat16* __restrict__ x,
                 const int group = group0 + lane;
                 const std::uint8_t* code =
                     codes + (static_cast<long long>(row) * groups + group) * 16;
-                const std::uint16_t scale_bits =
-                    *reinterpret_cast<const std::uint16_t*>(scales + (static_cast<long long>(row) * groups + group) * 2);
+                const std::uint16_t scale_bits = *reinterpret_cast<const std::uint16_t*>(
+                    scales + (static_cast<long long>(row) * (groups >> kScaleShift) +
+                              (group >> kScaleShift)) * 2);
                 const float scale = __half2float(__ushort_as_half(scale_bits));
                 float weights[32];
 #pragma unroll
@@ -127,13 +129,18 @@ __global__ void q4g32_gemv_fast(const __nv_bfloat16* __restrict__ x,
 // T=1 from DRAM. One group of 32 per lane per phase with K fixed at compile time, so every phase
 // unrolls and the 16-byte code loads of all rows and phases can be in flight together. The
 // activation comes straight from L1 (the whole vector is at most 43 KB), no shared tile or barrier.
+// kScaleShift = log2(G / 32): codes are indexed by 32-group as ever; the binary16 scale of a
+// 32-group is element (group >> kScaleShift) of the row's K >> (5 + kScaleShift) scales. Scale
+// row strides of coarse formats are not 16-byte aligned, so scales load as 2-byte words.
 constexpr int kQ4T1Warps = 8;
 
-template <int K, int kRowsPerWarp>
+template <int K, int kRowsPerWarp, int kScaleShift>
 __global__ void __launch_bounds__(kQ4T1Warps * 32)
     q4g32_gemv_t1(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
                   const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out) {
     constexpr int kGroups = K / 32;
+    constexpr int kScaleGroups = K >> (5 + kScaleShift);
+    static_assert(K % (32 << kScaleShift) == 0);
     constexpr int kPhases = (kGroups + 31) / 32;
     const int lane        = static_cast<int>(threadIdx.x) & 31;
     const int warp        = static_cast<int>(threadIdx.x) >> 5;
@@ -149,8 +156,10 @@ __global__ void __launch_bounds__(kQ4T1Warps * 32)
 #pragma unroll
         for (int r = 0; r < kRowsPerWarp; ++r) {
             const long long index = static_cast<long long>(row_base + r) * kGroups + group;
+            const long long scale_index =
+                static_cast<long long>(row_base + r) * kScaleGroups + (group >> kScaleShift);
             packed[r]     = __ldcs(reinterpret_cast<const uint4*>(codes) + index);
-            scale_bits[r] = __ldcs(scale_words + index);
+            scale_bits[r] = __ldcs(scale_words + scale_index);
         }
         const auto* activation = reinterpret_cast<const uint4*>(x + group * 32);
         uint4 act[4];
@@ -185,12 +194,12 @@ __global__ void __launch_bounds__(kQ4T1Warps * 32)
     }
 }
 
-template <int K>
+template <int K, int kScaleShift>
 bool launch_q4g32_t1_rows(const Q4LinearOperands& operands, __nv_bfloat16* out, cudaStream_t stream) {
     const auto launch = [&]<int kRowsPerWarp>() {
         constexpr int kRows = kQ4T1Warps * kRowsPerWarp;
         if (operands.rows % kRows != 0) { return false; }
-        q4g32_gemv_t1<K, kRowsPerWarp><<<operands.rows / kRows, kQ4T1Warps * 32, 0, stream>>>(
+        q4g32_gemv_t1<K, kRowsPerWarp, kScaleShift><<<operands.rows / kRows, kQ4T1Warps * 32, 0, stream>>>(
             operands.x, operands.codes, operands.scales, out);
         return true;
     };
@@ -200,53 +209,73 @@ bool launch_q4g32_t1_rows(const Q4LinearOperands& operands, __nv_bfloat16* out, 
     return launch.template operator()<2>();
 }
 
-bool launch_q4g32_t1(const Q4LinearOperands& operands, __nv_bfloat16* out, cudaStream_t stream) {
+template <int kScaleShift>
+bool launch_q4g32_t1_shift(const Q4LinearOperands& operands, __nv_bfloat16* out, cudaStream_t stream) {
     switch (operands.k) {
-    case 5376: return launch_q4g32_t1_rows<5376>(operands, out, stream);
-    case 8192: return launch_q4g32_t1_rows<8192>(operands, out, stream);
-    case 16384: return launch_q4g32_t1_rows<16384>(operands, out, stream);
-    case 21504: return launch_q4g32_t1_rows<21504>(operands, out, stream);
+    case 5376: return launch_q4g32_t1_rows<5376, kScaleShift>(operands, out, stream);
+    case 8192: return launch_q4g32_t1_rows<8192, kScaleShift>(operands, out, stream);
+    case 16384: return launch_q4g32_t1_rows<16384, kScaleShift>(operands, out, stream);
+    case 21504: return launch_q4g32_t1_rows<21504, kScaleShift>(operands, out, stream);
+    default: return false;
+    }
+}
+
+bool launch_q4g32_t1(const Q4LinearOperands& operands, __nv_bfloat16* out, cudaStream_t stream,
+                     int scale_shift) {
+    switch (scale_shift) {
+    case 0: return launch_q4g32_t1_shift<0>(operands, out, stream);
+    case 2: return launch_q4g32_t1_shift<2>(operands, out, stream);
+    case 3: return launch_q4g32_t1_shift<3>(operands, out, stream);
     default: return false;
     }
 }
 
 template <int kTokens, int kRowsPerWarp, int kWarps>
-void launch_q4g32_gemv_fast(const Q4LinearOperands& operands, __nv_bfloat16* out, cudaStream_t stream) {
-    if (operands.k % 32 != 0) {
-        throw std::invalid_argument("q4_g32 gemv requires K divisible by 32");
+void launch_q4g32_gemv_fast(const Q4LinearOperands& operands, __nv_bfloat16* out, cudaStream_t stream,
+                            int scale_shift) {
+    if (operands.k % (32 << scale_shift) != 0) {
+        throw std::invalid_argument("q4 gemv requires K divisible by its scale group size");
     }
     constexpr int kRows = kWarps * kRowsPerWarp;
     const dim3 block(kWarps * 32);
     const dim3 grid((operands.rows + kRows - 1) / kRows);
-    q4g32_gemv_fast<kTokens, kRowsPerWarp, kWarps>
-        <<<grid, block, 0, stream>>>(operands.x, operands.codes, operands.scales, out, operands.rows,
-                                     operands.k);
+    const auto launch = [&]<int kScaleShift>() {
+        q4g32_gemv_fast<kTokens, kRowsPerWarp, kWarps, kScaleShift>
+            <<<grid, block, 0, stream>>>(operands.x, operands.codes, operands.scales, out,
+                                         operands.rows, operands.k);
+    };
+    switch (scale_shift) {
+    case 0: launch.template operator()<0>(); break;
+    case 2: launch.template operator()<2>(); break;
+    case 3: launch.template operator()<3>(); break;
+    default: throw std::invalid_argument("q4 gemv: unsupported scale group size");
+    }
 }
 
 template <int kTokens>
 void launch_q4g32_gemv_tokens(const Q4LinearOperands& operands, __nv_bfloat16* out,
-                              cudaStream_t stream) {
+                              cudaStream_t stream, int scale_shift) {
     // One row per warp keeps the token accumulators in registers. Wide output shapes can
     // afford four rows per warp at T=1, which is what saturates the bus there.
     if (kTokens == 1 && operands.rows >= 8192) {
-        launch_q4g32_gemv_fast<1, 4, 8>(operands, out, stream);
+        launch_q4g32_gemv_fast<1, 4, 8>(operands, out, stream, scale_shift);
         return;
     }
     if (kTokens == 1) {
-        launch_q4g32_gemv_fast<1, 1, 8>(operands, out, stream);
+        launch_q4g32_gemv_fast<1, 1, 8>(operands, out, stream, scale_shift);
         return;
     }
     // T>1 reuses one weight read across tokens. Four rows per warp keeps enough
     // weight bytes in flight to cover the extra FMAs on the trunk shapes.
     if (kTokens <= 8) {
-        launch_q4g32_gemv_fast<kTokens, 4, 8>(operands, out, stream);
+        launch_q4g32_gemv_fast<kTokens, 4, 8>(operands, out, stream, scale_shift);
         return;
     }
     if (operands.rows >= 8192) {
-        launch_q4g32_gemv_fast<kTokens, 2, 8>(operands, out, stream);
+        launch_q4g32_gemv_fast<kTokens, 2, 8>(operands, out, stream, scale_shift);
         return;
     }
-    launch_q4g32_gemv_fast<kTokens, 1, 8>(operands, out, stream);
+    launch_q4g32_gemv_fast<kTokens, 1, 8>(operands, out, stream, scale_shift);
 }
 
 } // namespace
@@ -255,8 +284,12 @@ void q4_g32_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearP
                      WorkspaceArena* workspace, cudaStream_t stream) {
     const Q4LinearOperands operands = q4_linear_operands(x, weight);
     validate_q4_operands(operands);
-    if (weight.qtype != QType::Q4_G32_FP16 || weight.group_size != 32) {
-        throw std::invalid_argument("q4_g32 requires q4_g32_fp16 weights");
+    // q4_g32 / q4_g128 / q4_g256: the code plane is identical, only the scale plane coarsens.
+    const int shift = q4_scale_shift(weight.qtype);
+    if (shift < 0 || weight.group_size != (32u << shift) ||
+        operands.k % (32 << shift) != 0) {
+        throw std::invalid_argument(
+            "q4 fp16 dispatch requires a q4_g32/g128/g256 weight with K divisible by its group size");
     }
     // Weights from DRAM (cold-L2 bench, NINFER_Q4_COLD): T=1 on the unrolled GEMV is
     // 1.45-1.53 TB/s on the six trunk shapes and the head. T=2..8 uses the K-split
@@ -265,7 +298,14 @@ void q4_g32_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearP
     // (q4_g32_route.h); the 8-token passes then serve other shapes and A16-only calls.
     auto* output = static_cast<__nv_bfloat16*>(out.data);
     const int tokens = operands.tokens;
-    switch (q4_g32_route(operands.rows, operands.k, tokens, policy, q4_exact_prefill())) {
+    const Q4Route route = q4_g32_route(operands.rows, operands.k, tokens, policy, q4_exact_prefill());
+    if (is_q4_coarse(weight.qtype) &&
+        (route == Q4Route::Fused || route == Q4Route::Baked || route == Q4Route::Exact)) {
+        throw std::invalid_argument(
+            "q4_g128/q4_g256 weights have no W4A8 route yet: call with LinearPolicy::A16Only "
+            "(and without NINFER_Q4_EXACT)");
+    }
+    switch (route) {
     case Q4Route::Fused:
     case Q4Route::Baked:
     case Q4Route::Exact:
@@ -280,23 +320,23 @@ void q4_g32_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearP
             Q4LinearOperands chunk = operands;
             chunk.x                = operands.x + static_cast<long long>(first) * operands.k;
             chunk.tokens           = std::min(8, tokens - first);
-            q4_g32_tc8(chunk, output + static_cast<long long>(first) * operands.rows, stream);
+            q4_g32_tc8(chunk, output + static_cast<long long>(first) * operands.rows, stream, shift);
         }
         return;
-    case Q4Route::Wide: q4_g32_wide(operands, output, stream); return;
+    case Q4Route::Wide: q4_g32_wide(operands, output, stream, shift); return;
     case Q4Route::Gemv: break;
     }
-    if (tokens == 1 && launch_q4g32_t1(operands, output, stream)) { return; }
+    if (tokens == 1 && launch_q4g32_t1(operands, output, stream, shift)) { return; }
     switch (tokens) {
-    case 1: launch_q4g32_gemv_tokens<1>(operands, output, stream); return;
-    case 2: launch_q4g32_gemv_tokens<2>(operands, output, stream); return;
-    case 3: launch_q4g32_gemv_tokens<3>(operands, output, stream); return;
-    case 4: launch_q4g32_gemv_tokens<4>(operands, output, stream); return;
-    case 5: launch_q4g32_gemv_tokens<5>(operands, output, stream); return;
-    case 6: launch_q4g32_gemv_tokens<6>(operands, output, stream); return;
-    case 7: launch_q4g32_gemv_tokens<7>(operands, output, stream); return;
-    case 8: launch_q4g32_gemv_tokens<8>(operands, output, stream); return;
-    case 16: launch_q4g32_gemv_tokens<16>(operands, output, stream); return;
+    case 1: launch_q4g32_gemv_tokens<1>(operands, output, stream, shift); return;
+    case 2: launch_q4g32_gemv_tokens<2>(operands, output, stream, shift); return;
+    case 3: launch_q4g32_gemv_tokens<3>(operands, output, stream, shift); return;
+    case 4: launch_q4g32_gemv_tokens<4>(operands, output, stream, shift); return;
+    case 5: launch_q4g32_gemv_tokens<5>(operands, output, stream, shift); return;
+    case 6: launch_q4g32_gemv_tokens<6>(operands, output, stream, shift); return;
+    case 7: launch_q4g32_gemv_tokens<7>(operands, output, stream, shift); return;
+    case 8: launch_q4g32_gemv_tokens<8>(operands, output, stream, shift); return;
+    case 16: launch_q4g32_gemv_tokens<16>(operands, output, stream, shift); return;
     default: throw std::logic_error("q4_g32: no GEMV for this token count");
     }
 }

@@ -16,6 +16,9 @@ constexpr int kWideRows = kWideWarps * kWideRowsPerWarp;
 constexpr int kWideTokens = 8;
 constexpr int kWideTileGroups = 32;
 
+// kScaleShift = log2(G / 32): the code plane is K/2 bytes per row for every G, one binary16 scale
+// covers 32 << kScaleShift columns. kScaleShift = 0 is q4_g32.
+template <int kScaleShift>
 __global__ void q4g32_wide_kernel(const __nv_bfloat16* __restrict__ x,
                                   const std::uint8_t* __restrict__ codes,
                                   const std::uint8_t* __restrict__ scales,
@@ -56,7 +59,8 @@ __global__ void q4g32_wide_kernel(const __nv_bfloat16* __restrict__ x,
                     codes + (static_cast<long long>(row) * groups + group) * 16;
                 const float scale = __half2float(__ushort_as_half(
                     *reinterpret_cast<const std::uint16_t*>(
-                        scales + (static_cast<long long>(row) * groups + group) * 2)));
+                        scales + (static_cast<long long>(row) * (groups >> kScaleShift) +
+                                  (group >> kScaleShift)) * 2)));
                 float weights[32];
 #pragma unroll
                 for (int word = 0; word < 4; ++word) {
@@ -97,14 +101,24 @@ __global__ void q4g32_wide_kernel(const __nv_bfloat16* __restrict__ x,
 
 } // namespace
 
-void q4_g32_wide(const Q4LinearOperands& operands, __nv_bfloat16* out, cudaStream_t stream) {
+void q4_g32_wide(const Q4LinearOperands& operands, __nv_bfloat16* out, cudaStream_t stream,
+                 int scale_shift) {
     const dim3 block(kWideWarps * 32);
     const dim3 grid((operands.rows + kWideRows - 1) / kWideRows);
-    for (int done = 0; done < operands.tokens; done += kWideTokens) {
-        const int tile = std::min(kWideTokens, operands.tokens - done);
-        q4g32_wide_kernel<<<grid, block, 0, stream>>>(
-            operands.x + static_cast<long long>(done) * operands.k, operands.codes, operands.scales,
-            out + static_cast<long long>(done) * operands.rows, operands.rows, operands.k, tile);
+    const auto run = [&]<int kScaleShift>() {
+        for (int done = 0; done < operands.tokens; done += kWideTokens) {
+            const int tile = std::min(kWideTokens, operands.tokens - done);
+            q4g32_wide_kernel<kScaleShift><<<grid, block, 0, stream>>>(
+                operands.x + static_cast<long long>(done) * operands.k, operands.codes,
+                operands.scales, out + static_cast<long long>(done) * operands.rows, operands.rows,
+                operands.k, tile);
+        }
+    };
+    switch (scale_shift) {
+    case 0: run.template operator()<0>(); break;
+    case 2: run.template operator()<2>(); break;
+    case 3: run.template operator()<3>(); break;
+    default: throw std::invalid_argument("q4 wide GEMV: unsupported scale group size");
     }
 }
 

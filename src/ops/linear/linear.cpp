@@ -10,6 +10,8 @@
 #include "ops/linear/fp8/shapes/gemma4_a8.h"
 #include "ops/linear/q4/q4_g32_gemv.cuh"
 #include "ops/linear/q4/q4_g32_w4a8.cuh"
+#include "ops/linear/q4/q4_g32_route.h"
+#include "ops/common/q4_scale_shift.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_dispatch.h"
@@ -105,6 +107,8 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::Q4_G32_FP16:
+    case QType::Q4_G128_FP16:
+    case QType::Q4_G256_FP16:
         detail::q4_g32_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::FP32:
@@ -151,6 +155,18 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP8_E4M3FN_ROW_BF16:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
+    case QType::Q4_G128_FP16:
+    case QType::Q4_G256_FP16: {
+        // A16 only for now. Reject a planned A8 route here instead of at the first call.
+        const auto route = detail::q4_g32_route(output_rows, input_rows, max_tokens, policy,
+                                                detail::q4_exact_prefill());
+        if (route == detail::Q4Route::Fused || route == detail::Q4Route::Baked ||
+            route == detail::Q4Route::Exact) {
+            throw std::invalid_argument(
+                "linear workspace: q4_g128/q4_g256 weights have no W4A8 route yet; use A16Only");
+        }
+        return 0;
+    }
     case QType::Q4_G32_FP16:
         if (policy == LinearPolicy::A16Only) { return 0; }
         return detail::q4_g32_w4a8_workspace_bytes(output_rows, input_rows, max_tokens);
@@ -183,6 +199,9 @@ void linear_a8_ready(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
                      std::uint8_t* codes, float* scales, WorkspaceArena& workspace,
                      cudaStream_t stream) {
     validate_linear_semantics(x, w, out, policy);
+    if (detail::is_q4_coarse(w.qtype)) {
+        throw std::invalid_argument("linear: q4_g128/q4_g256 weights have no W4A8 ready-codes route");
+    }
     if (w.qtype == QType::Q4_G32_FP16) {
         if (!allows_a8(policy) || codes == nullptr || scales == nullptr) {
             throw std::invalid_argument("q4_g32 ready: needs the A8 policy, codes, and scales");

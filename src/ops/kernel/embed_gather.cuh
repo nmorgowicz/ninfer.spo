@@ -158,15 +158,19 @@ __global__ void embed_gather_q8_kernel(const std::int32_t* ids, const std::uint8
     }
 }
 
-// One thread per (token, group of 32): 16 code bytes, one binary16 scale, 32 BF16 outputs.
+// One thread per (token, group of 32 output columns): 16 code bytes, one binary16 scale, 32 BF16
+// outputs. kScaleShift is log2(G / 32) of the table's scale group: the code plane is K/2 bytes per
+// row for every G, only the scale index coarsens (one scale per 32 << kScaleShift columns).
 // Even lanes are the low nibble, odd lanes the high nibble, both two's complement. The BF16
 // factor applies as in embed_gather_fp8_kernel.
-__global__ void embed_gather_q4g32_kernel(const std::int32_t* ids, const std::uint8_t* codes,
-                                          const std::uint8_t* scales, float factor,
-                                          __nv_bfloat16* out, std::int32_t d, std::int32_t T,
-                                          std::int32_t padded_d) {
+template <int kScaleShift>
+__global__ void embed_gather_q4_kernel(const std::int32_t* ids, const std::uint8_t* codes,
+                                       const std::uint8_t* scales, float factor,
+                                       __nv_bfloat16* out, std::int32_t d, std::int32_t T,
+                                       std::int32_t padded_d) {
     constexpr std::int32_t kGroup = 32;
     const std::int32_t kg         = padded_d / kGroup;
+    const std::int32_t kscale     = kg >> kScaleShift;
     const std::int32_t live       = (d + kGroup - 1) / kGroup;
     const std::int64_t n          = static_cast<std::int64_t>(live) * T;
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
@@ -175,9 +179,11 @@ __global__ void embed_gather_q4g32_kernel(const std::int32_t* ids, const std::ui
         const std::int32_t t = static_cast<std::int32_t>(i / live);
         const std::int32_t g = static_cast<std::int32_t>(i - static_cast<std::int64_t>(t) * live);
         const std::int64_t group_index = static_cast<std::int64_t>(ids[t]) * kg + g;
+        const std::int64_t scale_index =
+            static_cast<std::int64_t>(ids[t]) * kscale + (g >> kScaleShift);
         const std::uint16_t scale_bits =
-            static_cast<std::uint16_t>(scales[group_index * 2]) |
-            static_cast<std::uint16_t>(static_cast<std::uint16_t>(scales[group_index * 2 + 1])
+            static_cast<std::uint16_t>(scales[scale_index * 2]) |
+            static_cast<std::uint16_t>(static_cast<std::uint16_t>(scales[scale_index * 2 + 1])
                                        << 8);
         const float scale = __half2float(__ushort_as_half(scale_bits));
         const std::uint8_t* code = codes + group_index * (kGroup / 2);

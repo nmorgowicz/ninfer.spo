@@ -123,6 +123,14 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
             out.group_size   = 32;
             code_per_group   = 16;
             break;
+        case QType::Q4_G128_FP16:
+            out.group_size = 128;
+            code_per_group = 64;
+            break;
+        case QType::Q4_G256_FP16:
+            out.group_size = 256;
+            code_per_group = 128;
+            break;
         case QType::Q5_G64_FP16:
             out.group_size = 64;
             high_per_group = 8;
@@ -136,6 +144,9 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
             break;
         default:
             throw std::invalid_argument("RowSplit requires a grouped integer format");
+        }
+        if ((format == QType::Q4_G128_FP16 || format == QType::Q4_G256_FP16) && k % out.group_size != 0) {
+            throw std::invalid_argument("coarse-group q4 weight requires K divisible by its group size");
         }
         out.padded_columns      = aligned(k, 128);
         const auto groups       = out.padded_columns / out.group_size;

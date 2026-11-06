@@ -31,6 +31,7 @@ from .quantization.groupwise import (
     quantize_q4_g32_qat,
     quantize_q4_scale_search,
     quantize_q4_virtual_groups,
+    to_native_groups,
 )
 from .quantization.importance import importance_for
 from .quantization.nvfp4 import nvfp4_divisor, quantize_nvfp4_rows
@@ -250,21 +251,35 @@ def q4_g32_qat(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
-def grouped_absmax_emulated(request: PrepareRequest) -> PreparedMethod:
-    """Absmax over logical groups of 32/64/128/256 stored as ordinary q4_g32 words.
+def _q4_native_target(request: PrepareRequest, method: str, group_size: int) -> bool:
+    """True for a native q4_g{G}_fp16 target, False for emulation in q4_g32_fp16; otherwise refuse."""
+    native_name = f"q4_g{group_size}_fp16"
+    if request.target.format == "q4_g32_fp16":
+        return False
+    if request.target.format == native_name and group_size > 32:
+        return True
+    raise ValueError(
+        f"{method} with group_size {group_size} requires target format q4_g32_fp16 (emulated) "
+        f"or {native_name} (native), not {request.target.format}"
+    )
 
-    Parameter ``group_size`` (required) is the logical group. The physical format
-    stays q4_g32_fp16 and the coarse scale is repeated per 32-wide subgroup, so the
-    stored bytes decode exactly to the coarse-group values. This measures quality
-    only: it does not shrink the artifact.
+
+def grouped_absmax_emulated(request: PrepareRequest) -> PreparedMethod:
+    """Absmax over logical groups of 32/64/128/256.
+
+    Parameter ``group_size`` (required) is the logical group. With target q4_g32_fp16 the
+    coarse scale is repeated per 32-wide subgroup, so the stored bytes decode exactly to the
+    coarse-group values (quality only: the artifact does not shrink). With the matching native
+    target q4_g128_fp16 / q4_g256_fp16 one scale is stored per group.
     """
-    if request.target.format != "q4_g32_fp16" or len(request.target.shape) != 2:
-        raise ValueError("grouped_absmax_emulated requires the q4_g32_fp16 matrix format")
+    if len(request.target.shape) != 2:
+        raise ValueError("grouped_absmax_emulated requires a rank-2 q4 matrix")
     group_size = request.parameters.get("group_size")
     if type(group_size) is not int or group_size not in VIRTUAL_GROUP_SIZES:
         raise ValueError(
             f"grouped_absmax_emulated requires parameters.group_size in {VIRTUAL_GROUP_SIZES}"
         )
+    native = _q4_native_target(request, "grouped_absmax_emulated", group_size)
     _preflight(request, allowed=("group_size",))
     n, k = request.target.shape
 
@@ -279,6 +294,8 @@ def grouped_absmax_emulated(request: PrepareRequest) -> PreparedMethod:
             encoded = quantize_q4_virtual_groups(
                 values, group_size, device=request.device
             )
+            if native:
+                encoded = to_native_groups(encoded, group_size)
             output.write_codes(begin, encoded.codes, encoded.scales)
 
     return request.job(produce=produce)
@@ -292,14 +309,15 @@ def grouped_mse_search(request: PrepareRequest) -> PreparedMethod:
     unweighted arm sets every weight to 1 and changes nothing else. Quality-only like
     ``grouped_absmax_emulated`` when ``group_size`` > 32.
     """
-    if request.target.format != "q4_g32_fp16" or len(request.target.shape) != 2:
-        raise ValueError("grouped_mse_search requires the q4_g32_fp16 matrix format")
+    if len(request.target.shape) != 2:
+        raise ValueError("grouped_mse_search requires a rank-2 q4 matrix")
     group_size = request.parameters.get("group_size")
     weighted = request.parameters.get("weighted", False)
     if type(group_size) is not int or group_size not in VIRTUAL_GROUP_SIZES:
         raise ValueError(
             f"grouped_mse_search requires parameters.group_size in {VIRTUAL_GROUP_SIZES}"
         )
+    native = _q4_native_target(request, "grouped_mse_search", group_size)
     if type(weighted) is not bool:
         raise ValueError("grouped_mse_search parameters.weighted must be a boolean")
     _preflight(request, allowed=("group_size", "weighted"))
@@ -321,6 +339,8 @@ def grouped_mse_search(request: PrepareRequest) -> PreparedMethod:
             encoded = quantize_q4_scale_search(
                 values, group_size, importance, device=request.device
             )
+            if native:
+                encoded = to_native_groups(encoded, group_size)
             output.write_codes(begin, encoded.codes, encoded.scales)
 
     return request.job(produce=produce)

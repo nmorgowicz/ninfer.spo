@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -153,15 +154,24 @@ void embed_gather_q8_launch(const Tensor& ids, const Weight& table, Tensor& out,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void embed_gather_q4g32_launch(const Tensor& ids, const Weight& table, float factor, Tensor& out,
-                               cudaStream_t stream) {
+void embed_gather_q4_launch(const Tensor& ids, const Weight& table, float factor, Tensor& out,
+                            cudaStream_t stream) {
     const std::int32_t d = out.ne[0];
     const std::int32_t T = ids.ne[0];
     const std::int64_t n = div_up(static_cast<std::int64_t>(d), std::int64_t{32}) * T;
-    embed_gather_q4g32_kernel<<<grid_for(n), kBlock, 0, stream>>>(
-        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata),
-        static_cast<const std::uint8_t*>(table.scales), bf16_factor(factor),
-        static_cast<__nv_bfloat16*>(out.data), d, T, table.padded_shape[1]);
+    const auto launch    = [&]<int kScaleShift>() {
+        embed_gather_q4_kernel<kScaleShift><<<grid_for(n), kBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(ids.data),
+            static_cast<const std::uint8_t*>(table.qdata),
+            static_cast<const std::uint8_t*>(table.scales), bf16_factor(factor),
+            static_cast<__nv_bfloat16*>(out.data), d, T, table.padded_shape[1]);
+    };
+    switch (table.qtype) {
+    case QType::Q4_G32_FP16: launch.template operator()<0>(); break;
+    case QType::Q4_G128_FP16: launch.template operator()<2>(); break;
+    case QType::Q4_G256_FP16: launch.template operator()<3>(); break;
+    default: throw std::invalid_argument("embed_gather: not a q4 fp16 table");
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
