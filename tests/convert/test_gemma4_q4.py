@@ -476,3 +476,60 @@ def test_options_refuse_unknown_choices_and_malformed_regions():
         Q4Options(scale_search="entropy")
     with pytest.raises(ValueError, match="region-group"):
         Q4Options(region_groups=("mlp_down=48",))
+
+
+def mtp_model():
+    model, kinds = gemma_model()
+    model.components["mtp"] = {"config": {}}
+
+    def add(name, shape, inputs=()):
+        values = torch.randn(*shape).to(torch.bfloat16)
+        model.add(Parameter(name, shape, array_source(values, name), inputs=inputs))
+
+    add("mtp/input_projection", (4, WIDTH), inputs=("stem",))
+    add("mtp/output_head", (8, WIDTH), inputs=("final",))
+    for role in PROJECTIONS:
+        add(f"mtp/layers/0/{role}", (4, WIDTH), inputs=("input",))
+    add("mtp/layers/0/input_norm", (WIDTH,))
+    return model, kinds
+
+
+def mtp_build(**options):
+    model, _ = mtp_model()
+    return model, build_recipe(model, None, Q4Options(weights="q4_g32", **options), device="cpu", rows_per_chunk=512)
+
+
+@pytest.mark.parametrize(
+    ("mode", "layer_format", "suffix"),
+    [("bf16", "bf16", ""), ("fp8", "fp8_e4m3fn_row_bf16", "_mtp_fp8"), ("q4", "q4_g32_fp16", "_mtp_q4")],
+)
+def test_mtp_weights_change_only_the_assistant_layer_projections(mode, layer_format, suffix):
+    model, built = mtp_build(mtp_weights=mode)
+    layers = [name for name in model.parameters if name.startswith("mtp/layers/0/") and model.parameters[name].projection]
+    assert {selection(built, name).format for name in layers} == {layer_format}
+    # Head stays FP8, the outer projection and the norm stay direct BF16, whatever the mode.
+    assert selection(built, "mtp/output_head").format == "fp8_e4m3fn_row_bf16"
+    assert selection(built, "mtp/input_projection").format == "bf16"
+    assert selection(built, "mtp/layers/0/input_norm").format == "bf16"
+    assert built.name == "q4_g32_absmax_fp8_vocab_a8" + suffix
+    # The assistant never gets A8; only text projections do.
+    assert not any(name.startswith("mtp/") for name in allow_a8(built))
+    assert allow_a8(built)
+
+
+def test_mtp_weights_leave_the_text_recipe_identical():
+    model, plain = mtp_build()
+    _, fp8 = mtp_build(mtp_weights="fp8")
+    for name in projections(model):
+        a, b = selection(plain, name), selection(fp8, name)
+        assert (a.format, a.method, a.parameters) == (b.format, b.method, b.parameters)
+    assert plain.payload > fp8.payload
+
+
+def test_mtp_weights_need_the_assistant_and_a_q4_recipe():
+    with pytest.raises(ValueError, match="needs the mtp component"):
+        build(Q4Options(weights="q4_g32", mtp_weights="fp8"))
+    with pytest.raises(ValueError, match="applies only to the q4_g32"):
+        Q4Options(weights="fp8_row", mtp_weights="q4")
+    with pytest.raises(ValueError, match="--mtp-weights"):
+        Q4Options(mtp_weights="q8")

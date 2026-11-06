@@ -166,12 +166,30 @@ What the options mean:
 | `--group-size 32\|64\|128\|256` | Weights per scale. With `--native-groups` 128/256 are stored in real `q4_g128_fp16`/`q4_g256_fp16`; without it the scales are repeated so the file stays 4.5 bits per weight (only useful for measuring). 64 has no Gemma kernel. |
 | `--region-group REGION=G` | Per-region group size, for example `mlp_gate_up=256`. First match wins. Regions: `mlp_gate_up`, `mlp_down`, `attn_qkv`, `attn_out`, `global_layers`, `first4_layers`, `last4_layers`. |
 | `--text-only` | Leave out the vision tower. |
+| `--mtp-weights bf16\|fp8\|q4` | How the MTP assistant's layer projections are stored (default `bf16`, unchanged). See the MTP note below. |
 
 `--region-group` is for experimenters. With uncalibrated scales, making a region coarse cost least in `mlp_gate_up`
 and the first four layers, and most in `mlp_down`, the last four layers, the global-attention layers and
 `attn_out`. A calibrated mixed allocation (`alloc-a`, A16, in the author's plan) scored KL 0.192, between g32 (0.150) and
 uniform g256 (0.236). It was measured only weight-only, so treat any mix as unqualified until you score it
 as in section 6; every row in section 2 is a uniform group size.
+
+**MTP assistant storage.** The assistant's output head is always FP8 and its two outer projections stay BF16 (loaded
+as FP8). `--mtp-weights` changes only the 20 layer projections (query, output, gate, up, down in 4 layers), which
+are BF16 by default. On the calibrated g256 file, eight fixed greedy prompts, three rounds each, FP8 KV, 131,072
+context:
+
+| `--mtp-weights` | File | Draft acceptance | tok/s | Greedy text vs bf16 |
+|---|---|---|---|---|
+| `bf16` (default) | 16.99 GB | 30.0% | 165.1 | reference |
+| `fp8` | 16.80 GB (-0.18 GB) | 30.0% | 164.6 | 8 of 8 identical |
+| `q4` | 16.72 GB (-0.27 GB) | 28.8% | 163.6 | 8 of 8 identical |
+
+`fp8` is free on this test: identical acceptance and output, and the file is 184 MB smaller. `q4` saves another 81 MB
+for 1.2 points of acceptance, so we do not recommend it. Draft errors never change the target's output (the target
+verifies every token); they can only lower acceptance. The speed column is flat because the draft step is not
+limited by weight traffic. Eight prompts is a smoke test: re-measure acceptance on your own workload before
+switching.
 
 ## 6. Check the quality of your own conversion
 

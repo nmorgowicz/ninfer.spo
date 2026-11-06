@@ -83,6 +83,13 @@ def test_mtp_assistant_and_no_mtp_are_mutually_exclusive_and_one_is_required(tmp
     assert code == 1 and "MTP assistant not found" in err
 
 
+@pytest.mark.parametrize("mode", ["fp8", "q4"])
+def test_mtp_weights_cannot_be_combined_with_no_mtp(tmp_path, capsys, clean_fork, mode):
+    code, err = run(convert_args(tmp_path, "--mtp-weights", mode), capsys)
+    assert code == 1 and "needs the MTP assistant" in err
+    assert not (tmp_path / "out").exists()
+
+
 def test_valid_arguments_become_options_without_touching_the_filesystem(tmp_path):
     args = cli.build_parser().parse_args(
         convert_args(
