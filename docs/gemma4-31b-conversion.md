@@ -167,6 +167,7 @@ What the options mean:
 | `--region-group REGION=G` | Per-region group size, for example `mlp_gate_up=256`. First match wins. Regions: `mlp_gate_up`, `mlp_down`, `attn_qkv`, `attn_out`, `global_layers`, `first4_layers`, `last4_layers`. |
 | `--text-only` | Leave out the vision tower. |
 | `--mtp-weights bf16\|fp8\|q4` | How the MTP assistant's layer projections are stored (default `bf16`, unchanged). See the MTP note below. |
+| `--scale-bits 4..8` | **Experimental, measurement only.** Emulates two-level scales (a small integer multiplier per 32 weights plus one FP16 scale per 256) on ordinary g32 words, so the file does not shrink and no kernel reads that layout yet. On the author's model 8- and 6-bit multipliers scored the same KL as FP16 scales (0.150) and 5-bit about 0.003 worse, so a real format would save about 0.7 to 1.1 GB at g32 quality. Needs `--scale-search mse\|weighted` and `--group-size 32`. |
 
 `--region-group` is for experimenters. With uncalibrated scales, making a region coarse cost least in `mlp_gate_up`
 and the first four layers, and most in `mlp_down`, the last four layers, the global-attention layers and
