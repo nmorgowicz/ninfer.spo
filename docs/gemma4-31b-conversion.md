@@ -32,19 +32,21 @@ every domain) over 13,728 English positions at context 512, with the chat prefix
 uses. Lower is better. The reference scores PPL 11.277 on the same positions. Every row was scored on the
 identical windows, so differences between rows are paired.
 
-| Recipe | Flags (besides `--model/--out`) | File, text only / with MTP | KL (W4A8) | KL (A16) | ΔNLL (W4A8) | PPL (W4A8) |
+| Recipe | Flags (besides `--model/--out`) | File, text only / with MTP (fp8) | KL (W4A8) | KL (A16) | ΔNLL (W4A8) | PPL (W4A8) |
 |---|---|---|---|---|---|---|
 | Reference, never ship | `--weights fp8_row` | 30.7 GB / n.a. | 0 | 0 | 0 | 11.277 |
-| g32 absmax (the old default) | `--weights q4_g32` | 17.9 GB / 18.6 GB | 0.265 | 0.258 | +0.149 | 13.087 |
-| **g32 calibrated** | `--scale-search weighted --imatrix F` | 17.9 GB / 18.6 GB | **0.157** | 0.150 | +0.061 | 11.982 |
-| g128 calibrated | `... --group-size 128 --native-groups` | 16.5 GB / about 17.2 GB | 0.233 | 0.229 | +0.106 | 12.542 |
-| **g256 calibrated** | `... --group-size 256 --native-groups` | **16.3 GB / 17.0 GB** | 0.238 | 0.236 | +0.052 | 11.881 |
+| g32 absmax (the old default) | `--weights q4_g32` | 17.9 GB / 18.4 GB | 0.265 | 0.258 | +0.149 | 13.087 |
+| **g32 calibrated** | `--scale-search weighted --imatrix F` | 17.9 GB / 18.4 GB | **0.157** | 0.150 | +0.061 | 11.982 |
+| **g32 calibrated, 6-bit scales** | `... --scale-bits 6 --native-groups` | 17.0 GB / 17.5 GB | **0.154** | 0.149 | +0.060 | 11.969 |
+| g128 calibrated | `... --group-size 128 --native-groups` | 16.5 GB / about 17.0 GB | 0.233 | 0.229 | +0.106 | 12.542 |
+| **g256 calibrated** | `... --group-size 256 --native-groups` | **16.3 GB / 16.8 GB** | 0.238 | 0.236 | +0.052 | 11.881 |
 
 Paired differences on the same windows, with 95% bootstrap intervals (W4A8):
 
 | Comparison | ΔKL | ΔΔNLL |
 |---|---|---|
 | calibrated g32 vs absmax g32 | -0.108 (-0.129, -0.090) | -0.088 (-0.113, -0.064) |
+| calibrated g32 with 6-bit scales vs calibrated g32 | -0.003 (-0.007, +0.002) | -0.001 (-0.008, +0.006) |
 | calibrated g128 vs calibrated g32 | +0.076 (+0.059, +0.093) | +0.046 (+0.020, +0.072) |
 | calibrated g256 vs calibrated g32 | +0.081 (+0.066, +0.095) | -0.008 (-0.035, +0.017) |
 | calibrated g256 vs calibrated g128 | +0.005 (-0.009, +0.016) | -0.054 (-0.075, -0.036) |
@@ -53,7 +55,7 @@ Notes on reading it:
 
 - **Calibration is the big lever.** It cuts KL by about 40% at the same file size and needs no new kernels.
 - **g128 is not worth choosing.** g256 is smaller and indistinguishable from g128 on KL (the interval spans
-  zero). Pick g32 or g256.
+  zero). Pick g32, g32 with 6-bit scales, or g256.
 - **KL and ΔNLL measure different things, and here they disagree.** KL compares the whole next-token
   distribution with the reference at every position. ΔNLL (and PPL, which is just its exponential) looks only at
   the probability given to the token that actually came next. Quantization noise can flatten an over-confident
@@ -64,17 +66,24 @@ Notes on reading it:
 - **Statistics must come from the model you are converting.** On this model, statistics collected on the
   converted model itself beat the published base-model and published fine-tune files by 0.016 to 0.017 KL at g32.
   Do not reuse another model's imatrix for a deliverable.
-- **Decode speed.** On the g256 file with MTP and FP8 KV, five fixed 400-token greedy prompts averaged 155 tok/s
-  against 138 tok/s for the uncalibrated g32 file, and MTP draft acceptance was equal within noise (22% on
-  sampled roleplay). That is a smoke test, not a benchmark.
+- **MTP and long context.** Three calibrated files (g32, g32 with 6-bit scales, g256), each with the default FP8
+  assistant, FP8 KV, 131,072 context, MTP on. Eight fixed greedy 400-token prompts, three rounds: draft acceptance
+  30.5% (g32), 31.6% (6-bit scales), 30.0% (g256); mean tok/s 157.1, 164.6 and 166.6. A roleplay run of about
+  9,000 tokens: acceptance 23.5%, 23.3% and 22.1%. One 128,674-token prompt plus 2,048 generated: 21.6%, 21.8% and
+  22.1%. All six long runs completed with the full 131,072 KV. This is the author's one fine-tune; differences of
+  about a point are within what these runs can resolve, and the tok/s ordering (6-bit scales and g256 faster than
+  g32) is single-run per file.
 - **Scope.** One fine-tune, English text, one corpus. A different model can move every number. Section 6 shows
   how to reproduce the table for yours; do that before publishing your own numbers.
 
 ### Which one should I pick?
 
-- You want the best quality at roughly the old size: **g32 calibrated**.
-- You want a 9% smaller file (1.6 GB) that is still clearly better than the uncalibrated g32 default (KL 0.238
-  against 0.265, ΔNLL +0.052 against +0.149): **g256 calibrated**.
+- You want the best quality: **g32 calibrated with 6-bit scales** (`--scale-bits 6 --native-groups`). It scored the
+  same KL as plain calibrated g32 (0.154 against 0.157, not a resolved difference), is 0.9 GB smaller, and its
+  prefill and decode speed matched or beat g32 in our runs. Plain calibrated g32 is the fallback if you cannot use
+  a build that has the new format.
+- You want the smallest file that is still clearly better than the uncalibrated g32 default (a further 0.7 GB
+  smaller, KL 0.238 against 0.265, ΔNLL +0.052 against +0.149): **g256 calibrated**.
 - Skip calibration only if you cannot run llama.cpp; it costs 0.1 KL.
 
 ## 3. Requirements
