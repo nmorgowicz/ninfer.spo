@@ -85,7 +85,7 @@ Notes on reading it:
 - Python 3.11 with PyTorch and NumPy (the converter's own requirement), plus `pip install gguf` **only** if you
   pass `--imatrix`.
 - The BF16 checkpoint of your 31B model (Hugging Face layout, safetensors), and for MTP the
-  `google/gemma-4-31B-it-assistant` directory.
+  `google/gemma-4-31B-it-assistant` directory (`hf download google/gemma-4-31B-it-assistant --local-dir <DIR>`).
 - For calibration: a llama.cpp build with `convert_hf_to_gguf.py` and `llama-imatrix`. About 35 GB of disk for a
   Q8_0 GGUF and about 12 minutes of GPU time.
 - Free disk: the output is 17–19 GB, intermediates are not kept.
@@ -110,7 +110,14 @@ inside the source tree, and refuses a source that is not BF16 or not Gemma 4 31B
 have no uncommitted tracked changes (the receipt records the revision).
 
 Every conversion writes `<out>.build.json`: source hashes, recipe name, group layout, calibration file hash,
-revision and the verified file size. Keep it with the artifact.
+revision and the verified file size. Keep it with the artifact. The converter verifies storage when it finishes;
+to re-check a file later (every object read and hashed, not a quality check):
+
+```bash
+python -m tools.convert.gemma4_q4 verify --artifact models/my-31b-q4_g32.ninfer
+```
+
+Leave out `--text-only` to keep the vision tower in the file. The quality numbers in this guide are text only.
 
 ## 5. Convert with calibration (recommended)
 
@@ -159,6 +166,12 @@ What the options mean:
 | `--group-size 32\|64\|128\|256` | Weights per scale. With `--native-groups` 128/256 are stored in real `q4_g128_fp16`/`q4_g256_fp16`; without it the scales are repeated so the file stays 4.5 bits per weight (only useful for measuring). 64 has no Gemma kernel. |
 | `--region-group REGION=G` | Per-region group size, for example `mlp_gate_up=256`. First match wins. Regions: `mlp_gate_up`, `mlp_down`, `attn_qkv`, `attn_out`, `global_layers`, `first4_layers`, `last4_layers`. |
 | `--text-only` | Leave out the vision tower. |
+
+`--region-group` is for experimenters. With uncalibrated scales, making a region coarse cost least in `mlp_gate_up`
+and the first four layers, and most in `mlp_down`, the last four layers, the global-attention layers and
+`attn_out`. A calibrated mixed allocation (`alloc-a`, A16, in the author's plan) scored KL 0.192, between g32 (0.150) and
+uniform g256 (0.236). It was measured only weight-only, so treat any mix as unqualified until you score it
+as in section 6; every row in section 2 is a uniform group size.
 
 ## 6. Check the quality of your own conversion
 
