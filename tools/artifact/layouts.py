@@ -24,6 +24,7 @@ from .formats import (
 )
 
 PLANE_ALIGNMENT = 256
+S6_SUPER_COLUMNS = 256
 K_ALIGNMENT = 128
 
 
@@ -82,7 +83,7 @@ ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
     256,
     frozenset((
-        "q4_g64_fp16", "q4_g32_fp16", "q4_g128_fp16", "q4_g256_fp16",
+        "q4_g64_fp16", "q4_g32_fp16", "q4_g128_fp16", "q4_g256_fp16", "q4_g32_s6_fp16",
         "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16",
     )),
 )
@@ -171,6 +172,10 @@ def row_split_geometry(
         raise ValueError(
             f"{spec.name} requires K padded to 128 ({k_pad}) to be a multiple of its group size"
         )
+    if spec.two_level_scale and k_pad % S6_SUPER_COLUMNS:
+        raise ValueError(
+            f"{spec.name} requires K padded to 128 ({k_pad}) to be a multiple of {S6_SUPER_COLUMNS}"
+        )
     groups_per_row = k_pad // spec.group_size
     base_bytes_per_group = spec.group_size if spec.bits == 8 else spec.group_size // 2
     high_bytes_per_group = (
@@ -178,7 +183,8 @@ def row_split_geometry(
     )
     base_row_bytes = groups_per_row * base_bytes_per_group
     high_row_bytes = groups_per_row * high_bytes_per_group
-    scale_row_bytes = groups_per_row * 2
+    # S6: K_pad/256 eight-byte blocks per row = K_pad/32 bytes (one byte per group-32).
+    scale_row_bytes = groups_per_row if spec.two_level_scale else groups_per_row * 2
     base_bytes = n * base_row_bytes
     high_bytes = n * high_row_bytes
     scale_bytes = n * scale_row_bytes

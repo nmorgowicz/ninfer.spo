@@ -2,7 +2,7 @@
 #include "ninfer/ops/embedding.h"
 
 #include "ops/common/math.h"
-#include "ops/common/q4_scale_shift.h"
+#include "ops/common/q4_scale_mode.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/launcher/embed_gather.h" // detail::embed_gather_*_launch
 #include "core/weight_view.h"
@@ -171,12 +171,14 @@ void require_q8_metadata(const Weight& table, const Tensor& out) {
 }
 
 void require_q4_metadata(const Weight& table, const Tensor& out) {
-    const int shift = detail::q4_scale_shift(table.qtype);
-    if (shift < 0) { throw std::invalid_argument("embedding: not a q4 fp16 table"); }
-    const std::uint32_t group = 32u << shift;
-    const char* name = table.qtype == QType::Q4_G32_FP16    ? "Q4_G32_FP16"
-                       : table.qtype == QType::Q4_G128_FP16 ? "Q4_G128_FP16"
-                                                            : "Q4_G256_FP16";
+    const int mode = detail::q4_scale_mode(table.qtype);
+    if (!detail::q4_scale_mode_valid(mode)) { throw std::invalid_argument("embedding: not a q4 fp16 table"); }
+    const bool s6             = mode == detail::kQ4ScaleS6;
+    const std::uint32_t group = s6 ? 32u : 32u << mode;
+    const char* name = table.qtype == QType::Q4_G32_FP16      ? "Q4_G32_FP16"
+                       : table.qtype == QType::Q4_G128_FP16   ? "Q4_G128_FP16"
+                       : table.qtype == QType::Q4_G256_FP16   ? "Q4_G256_FP16"
+                                                              : "Q4_G32_S6_FP16";
     const std::string prefix = std::string("embedding: ") + name;
     if (table.layout != QuantLayout::RowSplit) {
         throw std::invalid_argument(prefix + " table must be RowSplit");
@@ -185,15 +187,19 @@ void require_q4_metadata(const Weight& table, const Tensor& out) {
     if (table.group_size != group || table.group != static_cast<std::int32_t>(group)) {
         throw std::invalid_argument(prefix + " table group must be " + std::to_string(group));
     }
-    if (table.scale_dtype != DType::FP16) {
-        throw std::invalid_argument(prefix + " table scale dtype must be FP16");
+    // The S6 scale plane is a byte plane of 8-byte two-level blocks, the others binary16 scales.
+    if (table.scale_dtype != (s6 ? DType::U8 : DType::FP16)) {
+        throw std::invalid_argument(prefix + (s6 ? " table scale dtype must be U8" : " table scale dtype must be FP16"));
     }
     if (table.padded_shape[0] != table.shape[0] ||
         table.padded_shape[1] != align_up_i32(table.shape[1], 128)) {
         throw std::invalid_argument(prefix + " padded shape is invalid");
     }
-    if (shift != 0 && table.shape[1] % static_cast<std::int32_t>(group) != 0) {
+    if (mode != 0 && !s6 && table.shape[1] % static_cast<std::int32_t>(group) != 0) {
         throw std::invalid_argument(prefix + " table d must be divisible by its group size");
+    }
+    if (s6 && table.padded_shape[1] % detail::q4_scale_span(mode) != 0) {
+        throw std::invalid_argument(prefix + " table d padded to 128 must be divisible by 256");
     }
     if (table.shape[1] != out.ne[0]) {
         throw std::invalid_argument(prefix + " table d must match out.ne[0]");
@@ -201,8 +207,10 @@ void require_q4_metadata(const Weight& table, const Tensor& out) {
     const std::uint64_t rows = static_cast<std::uint64_t>(table.shape[0]);
     const std::uint64_t code_plane_bytes =
         checked_mul_u64(rows, static_cast<std::uint64_t>(table.padded_shape[1])) / 2;
-    const std::uint64_t scale_groups = static_cast<std::uint64_t>(table.padded_shape[1]) / group;
-    const std::uint64_t scale_plane_bytes = checked_mul_u64(checked_mul_u64(rows, scale_groups), 2);
+    // Bytes of one row's scale plane for the padded width: K / 32 for S6, two per scale otherwise.
+    const std::uint64_t scale_row_bytes = static_cast<std::uint64_t>(
+        detail::q4_scale_row_bytes(mode, table.padded_shape[1]));
+    const std::uint64_t scale_plane_bytes = checked_mul_u64(rows, scale_row_bytes);
     const std::uint64_t scale_plane_off = ((code_plane_bytes + 255u) / 256u) * 256u;
     if (table.payload_bytes != 0 && table.payload_bytes < scale_plane_off + scale_plane_bytes) {
         throw std::invalid_argument(prefix + " payload is too small");
@@ -288,6 +296,7 @@ void embedding(const Tensor& ids, const Weight& table, float scale, Tensor& out,
     case QType::Q4_G32_FP16:
     case QType::Q4_G128_FP16:
     case QType::Q4_G256_FP16:
+    case QType::Q4_G32_S6_FP16:
         require_q4_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);

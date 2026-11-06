@@ -26,6 +26,7 @@ Grouped quantized-weight formats preserve signed codes plus one scale per logica
 | `q4_g32_fp16` | 4 | 32 | `[-8, 7]` | one binary16 scale/group | 4.50 |
 | `q4_g128_fp16` | 4 | 128 | `[-8, 7]` | one binary16 scale/group | 4.125 |
 | `q4_g256_fp16` | 4 | 256 | `[-8, 7]` | one binary16 scale/group | 4.0625 |
+| `q4_g32_s6_fp16` | 4 | 32 | `[-8, 7]` | two-level: per 256 weights one binary16 super scale and eight 6-bit multipliers (8 bytes) | 4.25 |
 | `q5_g64_fp16` | 5 | 64 | `[-16, 15]` | one binary16 scale/group | 5.25 |
 | `q6_g64_fp16` | 6 | 64 | `[-32, 31]` | one binary16 scale/group | 6.25 |
 | `q8_g32_fp16` | 8 | 32 | `[-127, 127]` | one binary16 scale/group | 8.50 |
@@ -222,6 +223,10 @@ The identifiers record code width, group size and scale type. For example, `q4_g
 4-bit signed codes and one IEEE-754 binary16 scale per group of 64 weights. `q4_g32_fp16`,
 `q5_g64_fp16`, `q6_g64_fp16`, and `q8_g32_fp16` follow the same naming convention.
 
+`q4_g32_s6_fp16` names a different scale representation of the same group-32 code domain: the
+group scale is derived from a binary16 super scale and a 6-bit multiplier (Section 6.4). Its code
+planes are those of `q4_g32_fp16`.
+
 The parser resolves names through the format registry. `Q4`, `Q5`, `Q6`, and `Q8` are prose
 abbreviations; artifacts store the complete canonical names.
 
@@ -373,6 +378,7 @@ The logical code is a two's-complement signed integer of the stated width:
 | `q4_g32_fp16` | 4 | `0x8` | `[-8, 7]` | 7 |
 | `q4_g128_fp16` | 4 | `0x8` | `[-8, 7]` | 7 |
 | `q4_g256_fp16` | 4 | `0x8` | `[-8, 7]` | 7 |
+| `q4_g32_s6_fp16` | 4 | `0x8` | `[-8, 7]` | 7 |
 | `q5_g64_fp16` | 5 | `0x10` | `[-16, 15]` | 15 |
 | `q6_g64_fp16` | 6 | `0x20` | `[-32, 31]` | 31 |
 
@@ -404,9 +410,10 @@ the complete Q8 payload solely to prove an invariant already established by its 
 
 ### 6.1 Scale representation
 
-Each logical group has exactly one IEEE-754 binary16 scale. It is a dequantization multiplier, not
+Each logical group has exactly one IEEE-754 binary16 scale (for `q4_g32_s6_fp16`, the one derived
+in Section 6.4). It is a dequantization multiplier, not
 an inverse scale. There is no zero point, offset, minimum, secondary scale, block exponent, or
-codebook.
+codebook; the two-level format keeps its super scale and multipliers only inside the derivation.
 
 A valid scale is either:
 
@@ -461,6 +468,47 @@ as the exact `.ninfer` artifact size.
 
 The 16-bit scale contributes 0.5 bit per weight at G32 and 0.25 bit per weight at G64. The choice
 of format for a model parameter belongs to its recipe.
+
+### 6.4 Two-level scales: `q4_g32_s6_fp16`
+
+`q4_g32_s6_fp16` has the logical groups, 4-bit codes and reconstruction of `q4_g32_fp16` (Sections
+5.1 and 6.2). Only the stored scale differs. For every row and every 256 consecutive K columns
+(eight consecutive groups of 32) one 8-byte little-endian block `W` holds:
+
+```text
+bits  0..15   S      IEEE-754 binary16 super scale
+bits 16..63   eight 6-bit multipliers; m_j = (W >> (16 + 6 j)) & 63,  j = 0..7
+```
+
+Byte 0 and byte 1 of the block are the low and high byte of `S`; bytes 2 to 7 are the 48-bit field
+holding `m_0` in its lowest six bits. The scale of group `j` of the block is:
+
+```text
+s_j = binary16_round_nearest_even(binary32(S) * binary32(m_j))
+```
+
+The binary32 product of an 11-bit significand and a 6-bit integer is exact, so the one rounding to
+binary16 is the only rounding. The result `s_j` then plays the role of the stored binary16 scale of
+Section 6.1 and 6.2 (`s[p, g]`). The rounding is part of the format: a native `q4_g32_s6_fp16`
+tensor decodes bit for bit like a `q4_g32_fp16` tensor whose scale words are `s_j`. A multiplier of
+0, or `S = 0`, gives scale `+0`, so every code of that group must be zero (Section 6.1). A block
+whose `S * m_j` rounds to infinity is invalid.
+Storage cost is 8 bytes per 256 weights, 0.25 bit per weight, so the logical cost is 4.25
+bits per weight (`4 + 64 / 256`).
+
+Golden vector. The block bytes `55 35 40 20 0c bf ff 45` have `S = 0x3555` (0.333251953125) and
+`m = [0, 1, 2, 3, 63, 62, 31, 17]`. They decode to the binary16 scale words:
+
+| `j` | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| `m_j` | 0 | 1 | 2 | 3 | 63 | 62 | 31 | 17 |
+| `s_j` bits | `0x0000` | `0x3555` | `0x3955` | `0x3c00` | `0x4d40` | `0x4d2a` | `0x492a` | `0x45aa` |
+
+Group 3 shows the rounding: `3 * S = 0.99975...` rounds to exactly `1.0` (`0x3c00`). The Python
+decoder is `decode_s6_scales` in
+[`scale_s6.py`](../../tools/artifact/codecs/scale_s6.py); the runtime decodes through
+`src/ops/common/q4_scale_mode.h`. The layout of the scale plane is in
+[storage-layouts.md](storage-layouts.md) Section 3.
 
 ## 7. Grouped signed-integer reference encoder
 

@@ -12,6 +12,7 @@ import torch
 from ..formats import QuantFormat
 from ..layouts import RowSplitGeometry, _format, row_split_geometry
 from ._tensor_bytes import Payload, _payload_length, _payload_tensor
+from .scale_s6 import decode_s6_scales
 
 _PACK_TEMP_BYTES = 256 * 1024 * 1024
 Plane: TypeAlias = bytes | bytearray | memoryview | torch.Tensor
@@ -90,6 +91,9 @@ def encode_row_split(
     ``codes`` has shape ``[N, groups_per_row, group_size]`` and dtype int8.
     ``scales`` has shape ``[N, groups_per_row]`` and dtype float16. The caller
     owns quantization and the required zero-filled physical padding groups.
+
+    Two-level formats (``q4_g32_s6_fp16``) store the scale plane as bytes: ``scales`` is the uint8
+    ``[N, groups_per_row]`` plane from ``pack_s6_scales`` (``K_pad / 32`` bytes per row), not group words.
     """
 
     spec = _format(format)
@@ -100,8 +104,9 @@ def encode_row_split(
     expected_scales = (geometry.n, geometry.groups_per_row)
     if codes.dtype != torch.int8 or tuple(codes.shape) != expected_codes:
         raise TypeError(f"codes must be int8 with shape {expected_codes}")
-    if scales.dtype != torch.float16 or tuple(scales.shape) != expected_scales:
-        raise TypeError(f"scales must be float16 with shape {expected_scales}")
+    scale_dtype = torch.uint8 if spec.two_level_scale else torch.float16
+    if scales.dtype != scale_dtype or tuple(scales.shape) != expected_scales:
+        raise TypeError(f"scales must be {scale_dtype} with shape {expected_scales} for {spec.name}")
     if codes.device != scales.device:
         raise ValueError("codes and scales must be on the same device")
     grouped = codes.reshape(-1, spec.group_size)
@@ -370,9 +375,12 @@ def _unpack_codes(
     assert isinstance(planes.high, torch.Tensor)
     assert isinstance(planes.scale, torch.Tensor)
     groups = geometry.n * geometry.groups_per_row
-    scales = planes.scale.view(torch.float16).reshape(
-        geometry.n, geometry.groups_per_row
-    )
+    if spec.two_level_scale:
+        scales = decode_s6_scales(planes.scale.reshape(geometry.n, geometry.groups_per_row))
+    else:
+        scales = planes.scale.view(torch.float16).reshape(
+            geometry.n, geometry.groups_per_row
+        )
     if spec.bits == 8:
         codes = planes.base.view(torch.int8).reshape(
             geometry.n, geometry.groups_per_row, spec.group_size
@@ -525,8 +533,11 @@ def dequantize_row_split(
         assert isinstance(planes.base, torch.Tensor)
         assert isinstance(planes.high, torch.Tensor)
         assert isinstance(planes.scale, torch.Tensor)
+        scale_plane = planes.scale
+        if spec.two_level_scale:
+            scale_plane = decode_s6_scales(scale_plane).reshape(-1).view(torch.uint8)
         physical = function(
-            planes.base, planes.high, planes.scale, byte_indices, shifts
+            planes.base, planes.high, scale_plane, byte_indices, shifts
         ).reshape(geometry.n, geometry.k_pad)
         return physical[:, : geometry.k]
     scales, codes = _unpack_codes(planes, spec, geometry)

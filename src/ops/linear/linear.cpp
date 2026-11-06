@@ -11,7 +11,7 @@
 #include "ops/linear/q4/q4_g32_gemv.cuh"
 #include "ops/linear/q4/q4_g32_w4a8.cuh"
 #include "ops/linear/q4/q4_g32_route.h"
-#include "ops/common/q4_scale_shift.h"
+#include "ops/common/q4_scale_mode.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_dispatch.h"
@@ -109,6 +109,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::Q4_G32_FP16:
     case QType::Q4_G128_FP16:
     case QType::Q4_G256_FP16:
+    case QType::Q4_G32_S6_FP16:
         detail::q4_g32_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::FP32:
@@ -158,6 +159,7 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::Q4_G32_FP16:
     case QType::Q4_G128_FP16:
     case QType::Q4_G256_FP16:
+    case QType::Q4_G32_S6_FP16:
         if (policy == LinearPolicy::A16Only) { return 0; }
         return detail::q4_g32_w4a8_workspace_bytes(output_rows, input_rows, max_tokens);
     }
@@ -215,9 +217,12 @@ void linear_prepare_a8_rows(Weight& w, DeviceBuffer& storage, cudaStream_t strea
         w.padded_shape[1] != w.k || !detail::q4_trunk_shape(w.n, w.k)) {
         return;
     }
+    const int scale_mode = detail::q4_scale_mode(w.qtype);
+    // Every mode reads whole scale units per row (an S6 block is 256 columns).
+    if (w.k % detail::q4_scale_span(scale_mode) != 0) { return; }
     DeviceBuffer rows(static_cast<std::size_t>(w.n) * 2);
     detail::q4_g32_row_multipliers(static_cast<const std::uint8_t*>(w.scales), rows.p, w.n, w.k,
-                                   detail::q4_scale_shift(w.qtype), stream);
+                                   scale_mode, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     storage      = std::move(rows);
     w.row_scales = storage.p;

@@ -82,6 +82,8 @@ Notes on reading it:
 - Windows with an NVIDIA RTX 5090 (the fork builds for sm_120a only), a build of this fork that includes
   `q4_g128_fp16`/`q4_g256_fp16` (fork commit `4cff979` or later), and the built `ninfer-spo-serve`,
   `ninfer-spo` and `ninfer-spo-perplexity` (see [building.md](building.md)). Older binaries cannot load g128/g256 files.
+- To store `--scale-bits 6 --native-groups` (the `q4_g32_s6_fp16` format), the binaries must be built from the
+  fork commit that adds `q4_g32_s6_fp16`; older binaries cannot load those files.
 - Python 3.11 with PyTorch and NumPy (the converter's own requirement), plus `pip install gguf` **only** if you
   pass `--imatrix`.
 - The BF16 checkpoint of your 31B model (Hugging Face layout, safetensors), and for MTP the
@@ -167,13 +169,36 @@ What the options mean:
 | `--region-group REGION=G` | Per-region group size, for example `mlp_gate_up=256`. First match wins. Regions: `mlp_gate_up`, `mlp_down`, `attn_qkv`, `attn_out`, `global_layers`, `first4_layers`, `last4_layers`. |
 | `--text-only` | Leave out the vision tower. |
 | `--mtp-weights fp8\|bf16\|q4` | How the MTP assistant's layer projections are stored (default `fp8` for the q4 weights). See the MTP note below. |
-| `--scale-bits 4..8` | **Experimental, measurement only.** Emulates two-level scales (a small integer multiplier per 32 weights plus one FP16 scale per 256) on ordinary g32 words, so the file does not shrink and no kernel reads that layout yet. On the author's model 8- and 6-bit multipliers scored the same KL as FP16 scales (0.150) and 5-bit about 0.003 worse, so a real format would save about 0.7 to 1.1 GB at g32 quality. Needs `--scale-search mse\|weighted` and `--group-size 32`. |
+| `--scale-bits 4..8` | Two-level scales: a small integer multiplier per 32 weights plus one FP16 super scale per 256. **`--scale-bits 6` with `--native-groups` stores the real `q4_g32_s6_fp16` format**: the same 4-bit codes as g32, but each row's scale plane is one byte per 32 weights instead of two (4.25 instead of 4.5 bits per weight), and it works with both `--weights q4_g32` and `q4_g32_a16`. The receipt's `weight_bytes` is then the real size. Any other value, or 6 without `--native-groups`, is **experimental, measurement only**: the scales are emulated on ordinary g32 words, so the file does not shrink and no kernel reads that layout. On the author's model, in that emulation, 8- and 6-bit multipliers scored the same KL as FP16 scales (0.150) and 5-bit about 0.003 worse. Needs `--scale-search mse\|weighted`, `--group-size 32` and no `--region-group`; the real format also needs every projection input width, padded to 128, to be a multiple of 256. |
 
 `--region-group` is for experimenters. With uncalibrated scales, making a region coarse cost least in `mlp_gate_up`
 and the first four layers, and most in `mlp_down`, the last four layers, the global-attention layers and
 `attn_out`. A calibrated mixed allocation (`alloc-a`, A16, in the author's plan) scored KL 0.192, between g32 (0.150) and
 uniform g256 (0.236). It was measured only weight-only, so treat any mix as unqualified until you score it
 as in section 6; every row in section 2 is a uniform group size.
+
+To store the two-level format, add `--scale-bits 6 --native-groups` to a g32 command (`--group-size 32`, which is the default):
+
+```bash
+python -m tools.convert.gemma4_q4 convert \
+  --model /path/to/gemma-4-31B-bf16 --mtp-assistant /path/to/gemma-4-31B-it-assistant --text-only \
+  --weights q4_g32 --scale-search weighted --imatrix model.imatrix.gguf \
+  --scale-bits 6 --native-groups \
+  --out models/my-31b-q4_g32_s6-cal.ninfer
+```
+
+The recipe name ends in `_native_scale6`. The converter derives each 256-column block's super scale and
+multipliers from the searched scales and refuses to write a block whose decoded scales would differ from them by
+even one bit; the file therefore decodes exactly like the `--scale-bits 6` emulation, in a smaller scale plane.
+
+Measured on the author's calibrated 31B (diode s15 t005, weighted search, text-only): the real file is 915,210,240
+bytes (0.85 GiB, 5.1%) smaller than the g32 file of the same recipe (16,971,047,664 against 17,886,257,904 bytes of
+weights). Scored as in section 6 (A16), the native artifact gives the same 47 windows with `kl_sum` identical to the
+bit, and a byte-identical `kl_positions.f32`, as the `--scale-bits 6` emulation: mean KL 0.14897 (g32 FP16 scales
+0.1504). With `NINFER_Q4_EXACT=1` the W4A8 native artifact scores 0.1543 (g32: 0.1569; the paired difference,
+-0.0034 with a standard error of 0.0028 over the 47 windows, is not resolved). On the same serving flags (131,072
+context, FP8 KV, prefill chunk 128, no speculation) the native file decodes at 70.6 tok/s against 68.2 for the g32
+file (+3.4%) and prefills a 3,000-token prompt at 3,049 tok/s against 3,046 (medians of six runs).
 
 **MTP assistant storage.** The assistant's output head is always FP8 and its two outer projections stay BF16 (loaded
 as FP8). `--mtp-weights` changes only the 20 layer projections (query, output, gate, up, down in 4 layers), which
@@ -243,9 +268,10 @@ can overstate an auto-sized pool. See [serving.md](serving.md).
 | Symptom | Cause |
 |---|---|
 | "ninfer.spo has tracked modifications" | Commit or stash changes in this checkout before converting. |
-| `K padded to 128 ... multiple of its group size` | Only `q4_g256_fp16` has this limit; every Gemma 4 31B trunk width satisfies it. |
+| `K padded to 128 ... multiple of its group size` or `... multiple of 256` | `q4_g256_fp16` and `q4_g32_s6_fp16` have this limit (for the latter, K padded to 128 must be a multiple of 256); every Gemma 4 31B trunk width satisfies it. |
 | `--imatrix` refused for missing statistics | The imatrix was collected on a different architecture or without the attention tensors. Collect it on the model you are converting. |
 | g128/g256 file will not load | The binary predates `4cff979`; rebuild `ninfer-spo-serve`. |
+| `q4_g32_s6_fp16` file will not load | The binary predates the commit that adds `q4_g32_s6_fp16`; rebuild `ninfer-spo-serve`. |
 | W4A8 KL changes between runs | Set `NINFER_Q4_EXACT=1` for evaluation. |
 | 26B-A4B (MoE) | Not supported by this route. |
 

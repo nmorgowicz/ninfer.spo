@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from tools.artifact.codecs.scale_s6 import GROUPS_PER_BLOCK, pack_s6_scales
 from tools.artifact.layouts import (
     row_split_geometry,
 )
@@ -22,7 +23,11 @@ _FP16_MIN_SUBNORMAL = 2.0**-24
 
 @dataclass(frozen=True, slots=True)
 class QuantizedMatrix:
-    """Physical code groups and binary16 scales for one logical matrix."""
+    """Physical code groups and scales for one logical matrix.
+
+    ``scales`` is float16 ``[N, groups]`` (one binary16 word per group) except after
+    ``to_native_scale6``, where it is the uint8 ``[N, groups]`` S6 scale plane.
+    """
 
     codes: torch.Tensor
     scales: torch.Tensor
@@ -132,6 +137,10 @@ def quantize_matrix(
     spec = get_format(format) if isinstance(format, str) else format
     if not isinstance(spec, QuantFormat):
         raise ValueError("grouped quantization requires a quantized numeric format")
+    if spec.two_level_scale:
+        raise ValueError(
+            f"{spec.name} is produced by grouped_mse_search with scale_bits=6 (native storage), not by absmax"
+        )
     if weight.dim() != 2:
         raise ValueError(
             f"grouped quantization requires rank 2, got {tuple(weight.shape)}"
@@ -336,3 +345,33 @@ def to_native_groups(encoded: QuantizedMatrix, group_size: int) -> QuantizedMatr
         codes=encoded.codes.reshape(n, subgroups // ratio, group_size).contiguous(),
         scales=encoded.scales.reshape(n, subgroups // ratio, ratio)[:, :, 0].contiguous(),
     )
+
+
+def to_native_scale6(encoded: QuantizedMatrix, logical_k: int | None = None) -> QuantizedMatrix:
+    """Turn g32 words from the scale-bits-6 emulation into the native ``q4_g32_s6_fp16`` planes.
+
+    The emulation (``quantize_q4_scale_search(..., scale_bits=6)``) stores ``fp16(S * m)`` with one
+    binary16 super scale ``S`` and a multiplier ``m`` in 1..63 per run of eight g32 groups. ``S`` and ``m``
+    are recovered from the words (not searched again) and the plane is verified to decode bit for bit to
+    the same words (``pack_s6_scales``); a block that cannot be reproduced exactly raises ``ValueError``.
+    The codes are untouched, so the decoded matrix is identical to the emulated one.
+
+    ``logical_k`` (the unpadded K) makes the physical padding canonical: a complete group past
+    ``ceil(logical_k / 32)`` has all-zero codes (checked) and scale word 0, as the row-split layout
+    requires, where the emulation would have given it ``S * 1``. Decoded values do not change.
+    """
+
+    n, groups, width = encoded.codes.shape
+    if width != 32 or groups % GROUPS_PER_BLOCK or encoded.scales.dtype != torch.float16:
+        raise ValueError(f"cannot form S6 blocks from {groups} g32 groups of width {width}")
+    if tuple(encoded.scales.shape) != (n, groups):
+        raise ValueError("scales must be one binary16 word per g32 group")
+    words = encoded.scales
+    if logical_k is not None:
+        logical_groups = -(-logical_k // 32)
+        if logical_groups < groups:
+            if bool(encoded.codes[:, logical_groups:].any()):
+                raise ValueError("physical padding groups must have zero codes")
+            words = words.clone()
+            words[:, logical_groups:] = 0
+    return QuantizedMatrix(codes=encoded.codes, scales=pack_s6_scales(words).to(encoded.codes.device))

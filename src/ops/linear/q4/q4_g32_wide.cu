@@ -1,5 +1,6 @@
 #include "ops/linear/q4/q4_g32_wide.cuh"
 
+#include "ops/common/q4_scale_mode.h"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>
@@ -16,9 +17,10 @@ constexpr int kWideRows = kWideWarps * kWideRowsPerWarp;
 constexpr int kWideTokens = 8;
 constexpr int kWideTileGroups = 32;
 
-// kScaleShift = log2(G / 32): the code plane is K/2 bytes per row for every G, one binary16 scale
-// covers 32 << kScaleShift columns. kScaleShift = 0 is q4_g32.
-template <int kScaleShift>
+// kScaleMode (q4_scale_mode.h): the code plane is K/2 bytes per row for every format. Modes 0, 2, 3:
+// one binary16 scale covers 32 << kScaleMode columns (0 is q4_g32). kQ4ScaleS6: the lane's group
+// scale is decoded from the row's 8-byte block (group >> 3), field (group & 7).
+template <int kScaleMode>
 __global__ void q4g32_wide_kernel(const __nv_bfloat16* __restrict__ x,
                                   const std::uint8_t* __restrict__ codes,
                                   const std::uint8_t* __restrict__ scales,
@@ -57,10 +59,17 @@ __global__ void q4g32_wide_kernel(const __nv_bfloat16* __restrict__ x,
                 const int group = group0 + lane;
                 const std::uint8_t* code =
                     codes + (static_cast<long long>(row) * groups + group) * 16;
-                const float scale = __half2float(__ushort_as_half(
-                    *reinterpret_cast<const std::uint16_t*>(
-                        scales + (static_cast<long long>(row) * (groups >> kScaleShift) +
-                                  (group >> kScaleShift)) * 2)));
+                float scale;
+                if constexpr (kScaleMode == kQ4ScaleS6) {
+                    const auto* blocks = reinterpret_cast<const unsigned long long*>(scales);
+                    scale = q4_s6_scale(blocks[static_cast<long long>(row) * (groups >> 3) + (group >> 3)],
+                                        group & 7);
+                } else {
+                    scale = __half2float(__ushort_as_half(
+                        *reinterpret_cast<const std::uint16_t*>(
+                            scales + (static_cast<long long>(row) * (groups >> kScaleMode) +
+                                      (group >> kScaleMode)) * 2)));
+                }
                 float weights[32];
 #pragma unroll
                 for (int word = 0; word < 4; ++word) {
@@ -102,23 +111,24 @@ __global__ void q4g32_wide_kernel(const __nv_bfloat16* __restrict__ x,
 } // namespace
 
 void q4_g32_wide(const Q4LinearOperands& operands, __nv_bfloat16* out, cudaStream_t stream,
-                 int scale_shift) {
+                 int scale_mode) {
     const dim3 block(kWideWarps * 32);
     const dim3 grid((operands.rows + kWideRows - 1) / kWideRows);
-    const auto run = [&]<int kScaleShift>() {
+    const auto run = [&]<int kScaleMode>() {
         for (int done = 0; done < operands.tokens; done += kWideTokens) {
             const int tile = std::min(kWideTokens, operands.tokens - done);
-            q4g32_wide_kernel<kScaleShift><<<grid, block, 0, stream>>>(
+            q4g32_wide_kernel<kScaleMode><<<grid, block, 0, stream>>>(
                 operands.x + static_cast<long long>(done) * operands.k, operands.codes,
                 operands.scales, out + static_cast<long long>(done) * operands.rows, operands.rows,
                 operands.k, tile);
         }
     };
-    switch (scale_shift) {
+    switch (scale_mode) {
     case 0: run.template operator()<0>(); break;
     case 2: run.template operator()<2>(); break;
     case 3: run.template operator()<3>(); break;
-    default: throw std::invalid_argument("q4 wide GEMV: unsupported scale group size");
+    case kQ4ScaleS6: run.template operator()<kQ4ScaleS6>(); break;
+    default: throw std::invalid_argument("q4 wide GEMV: unsupported scale mode");
     }
 }
 

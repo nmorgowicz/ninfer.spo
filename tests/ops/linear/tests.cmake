@@ -21,6 +21,19 @@ add_test(NAME ninfer_linear_q4_coarse_a8_exact_test COMMAND ninfer_linear_q4_coa
 set_tests_properties(ninfer_linear_q4_coarse_a8_exact_test PROPERTIES
   ENVIRONMENT "NINFER_Q4_EXACT=1" SKIP_RETURN_CODE 77)
 
+ninfer_add_op_test(ninfer_linear_q4_s6_a16_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_s6_a16.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
+ninfer_add_op_test(ninfer_linear_q4_s6_a8_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_s6_a8.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
+# The same binary with NINFER_Q4_EXACT: the exact route on the trunk shapes, deterministic.
+add_test(NAME ninfer_linear_q4_s6_a8_exact_test COMMAND ninfer_linear_q4_s6_a8_test)
+set_tests_properties(ninfer_linear_q4_s6_a8_exact_test PROPERTIES
+  ENVIRONMENT "NINFER_Q4_EXACT=1" SKIP_RETURN_CODE 77)
+
 ninfer_add_op_test(ninfer_linear_q4_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_a16.cpp"
   LIBRARIES ninfer_linear_test_support)

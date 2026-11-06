@@ -318,7 +318,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--native-groups",
         action="store_true",
         help="Store logical groups above 32 in the real q4_g128_fp16/q4_g256_fp16 format (smaller file) "
-        "instead of repeated g32 scales. Works with A16 (q4_g32_a16) and W4A8 (q4_g32). Group 64 "
+        "instead of repeated g32 scales. Together with --scale-bits 6 (group 32) it stores the real two-level "
+        "q4_g32_s6_fp16 format. Works with A16 (q4_g32_a16) and W4A8 (q4_g32). Group 64 "
         "has no Gemma kernels and is refused",
     )
     build.add_argument(
@@ -345,10 +346,12 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument(
         "--scale-bits",
         type=int,
-        help="EXPERIMENTAL, quality screening only: emulate two-level scales (one integer multiplier of this many "
-        "bits per 32 weights, one binary16 super scale per 256) on ordinary q4_g32 words. Needs --scale-search "
-        "mse|weighted and --group-size 32. The file does not shrink; no kernel reads this layout. The receipt's "
-        "projected_real_weight_bytes counts the saving a real format would give",
+        help="Two-level scales: one integer multiplier of this many bits per 32 weights and one binary16 super "
+        "scale per 256. Needs --scale-search mse|weighted and --group-size 32. --scale-bits 6 with "
+        "--native-groups stores the real q4_g32_s6_fp16 format (K padded to 128 must be a multiple of 256; "
+        "needs binaries that include q4_g32_s6_fp16). Any other value, or 6 without --native-groups, is EXPERIMENTAL "
+        "quality screening on ordinary q4_g32 words: the file does not shrink, no kernel reads that layout, and "
+        "the receipt's projected_real_weight_bytes counts the saving a real format would give",
     )
     build.add_argument(
         "--dry-run", action="store_true", help="Read-only shape/recipe preflight; writes nothing"

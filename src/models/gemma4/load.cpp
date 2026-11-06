@@ -77,7 +77,7 @@ ops::SingleProjectionWeight projection(const artifact::MaterializedArtifact& art
     const QType format = result.weight.qtype;
     if (format != QType::BF16 && format != QType::NVFP4 && format != QType::FP8_E4M3FN_ROW_BF16 &&
         format != QType::Q4_G32_FP16 && format != QType::Q4_G128_FP16 &&
-        format != QType::Q4_G256_FP16) {
+        format != QType::Q4_G256_FP16 && format != QType::Q4_G32_S6_FP16) {
         throw std::invalid_argument("gemma4 load: " + blocks.front().name +
                                     " has an unsupported format");
     }

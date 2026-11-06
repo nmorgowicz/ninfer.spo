@@ -2,7 +2,7 @@
 
 #include "core/tensor.h"
 #include "core/weight.h"
-#include "ops/common/q4_scale_shift.h"
+#include "ops/common/q4_scale_mode.h"
 
 #include <cuda_bf16.h>
 
@@ -20,8 +20,8 @@ struct Q4LinearOperands {
     std::int32_t tokens;
     std::int32_t padded_k;
     const __nv_bfloat16* row_scales = nullptr;
-    // log2(G / 32) of the scale group (0 for q4_g32, 2 for q4_g128, 3 for q4_g256).
-    std::int32_t scale_shift = 0;
+    // Scale mode of the weight (q4_scale_mode.h): log2(G / 32) for q4_g32/g128/g256, kQ4ScaleS6.
+    std::int32_t scale_mode = 0;
 };
 
 inline Q4LinearOperands q4_linear_operands(const Tensor& x, const Weight& weight) {
@@ -33,7 +33,7 @@ inline Q4LinearOperands q4_linear_operands(const Tensor& x, const Weight& weight
             x.ne[1],
             weight.padded_shape[1],
             static_cast<const __nv_bfloat16*>(weight.row_scales),
-            q4_scale_shift(weight.qtype) > 0 ? q4_scale_shift(weight.qtype) : 0};
+            q4_scale_mode(weight.qtype) > 0 ? q4_scale_mode(weight.qtype) : 0};
 }
 
 // Private template domain. Public shape admission remains in q4_dispatch.
@@ -46,7 +46,8 @@ inline void validate_q4_operands(const Q4LinearOperands& operands) {
         throw std::invalid_argument(
             "Q4 templates require positive N/T and K/padded K aligned to 128");
     }
-    if (!aligned(operands.x, 16) || !aligned(operands.codes, 16) || !aligned(operands.scales, 4)) {
+    if (!aligned(operands.x, 16) || !aligned(operands.codes, 16) ||
+        !aligned(operands.scales, operands.scale_mode == kQ4ScaleS6 ? kQ4S6BlockBytes : 4)) {
         throw std::invalid_argument("Q4 templates require aligned activation and weight planes");
     }
 }

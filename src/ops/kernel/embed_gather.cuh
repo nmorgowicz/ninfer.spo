@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/math.h"
+#include "ops/common/q4_scale_mode.h"
 
 // ninfer::ops - embedding kernels. Dense copies BF16 rows; quantized variants decode only the
 // selected rows into contiguous BF16 output columns.
@@ -158,19 +159,21 @@ __global__ void embed_gather_q8_kernel(const std::int32_t* ids, const std::uint8
     }
 }
 
-// One thread per (token, group of 32 output columns): 16 code bytes, one binary16 scale, 32 BF16
-// outputs. kScaleShift is log2(G / 32) of the table's scale group: the code plane is K/2 bytes per
-// row for every G, only the scale index coarsens (one scale per 32 << kScaleShift columns).
-// Even lanes are the low nibble, odd lanes the high nibble, both two's complement. The BF16
-// factor applies as in embed_gather_fp8_kernel.
-template <int kScaleShift>
+// One thread per (token, group of 32 output columns): 16 code bytes, one group scale, 32 BF16
+// outputs. kScaleMode (q4_scale_mode.h): the code plane is K/2 bytes per row for every format, only
+// the scale plane differs. Modes 0, 2, 3: one binary16 scale per 32 << kScaleMode columns.
+// kQ4ScaleS6: one 8-byte block per 256 columns (K / 32 bytes per row), the group scale decoded from
+// it by the shared helper. Even lanes are the low nibble, odd lanes the high nibble, both two's
+// complement. The BF16 factor applies as in embed_gather_fp8_kernel.
+template <int kScaleMode>
 __global__ void embed_gather_q4_kernel(const std::int32_t* ids, const std::uint8_t* codes,
                                        const std::uint8_t* scales, float factor,
                                        __nv_bfloat16* out, std::int32_t d, std::int32_t T,
                                        std::int32_t padded_d) {
     constexpr std::int32_t kGroup = 32;
     const std::int32_t kg         = padded_d / kGroup;
-    const std::int32_t kscale     = kg >> kScaleShift;
+    constexpr int kScaleUnitShift = kScaleMode == detail::kQ4ScaleS6 ? 3 : kScaleMode;
+    const std::int32_t kscale     = kg >> kScaleUnitShift;
     const std::int32_t live       = (d + kGroup - 1) / kGroup;
     const std::int64_t n          = static_cast<std::int64_t>(live) * T;
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
@@ -180,12 +183,18 @@ __global__ void embed_gather_q4_kernel(const std::int32_t* ids, const std::uint8
         const std::int32_t g = static_cast<std::int32_t>(i - static_cast<std::int64_t>(t) * live);
         const std::int64_t group_index = static_cast<std::int64_t>(ids[t]) * kg + g;
         const std::int64_t scale_index =
-            static_cast<std::int64_t>(ids[t]) * kscale + (g >> kScaleShift);
-        const std::uint16_t scale_bits =
-            static_cast<std::uint16_t>(scales[scale_index * 2]) |
-            static_cast<std::uint16_t>(static_cast<std::uint16_t>(scales[scale_index * 2 + 1])
-                                       << 8);
-        const float scale = __half2float(__ushort_as_half(scale_bits));
+            static_cast<std::int64_t>(ids[t]) * kscale + (g >> kScaleUnitShift);
+        float scale;
+        if constexpr (kScaleMode == detail::kQ4ScaleS6) {
+            scale = detail::q4_s6_scale(
+                detail::q4_s6_block_word(scales + scale_index * detail::kQ4S6BlockBytes), g & 7);
+        } else {
+            const std::uint16_t scale_bits =
+                static_cast<std::uint16_t>(scales[scale_index * 2]) |
+                static_cast<std::uint16_t>(static_cast<std::uint16_t>(scales[scale_index * 2 + 1])
+                                           << 8);
+            scale = __half2float(__ushort_as_half(scale_bits));
+        }
         const std::uint8_t* code = codes + group_index * (kGroup / 2);
         __nv_bfloat16* column    = out + static_cast<std::int64_t>(t) * d + g * kGroup;
         const std::int32_t lanes = min(kGroup, d - g * kGroup);

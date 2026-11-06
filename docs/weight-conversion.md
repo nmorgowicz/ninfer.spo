@@ -187,6 +187,7 @@ The converter currently writes these formats:
 | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax` | Supply a custom method/source if needed |
 | `q4_g32_fp16` | `q4_g32_qat` | Recovers the scale already stored in a QAT matrix. `grouped_absmax` is also legal and requantizes |
 | `q4_g128_fp16`, `q4_g256_fp16` | `grouped_absmax_emulated`, `grouped_mse_search` (parameter `group_size` equal to the format's group; `weighted` optional) | Native coarse groups; the same methods with `group_size` 64/128/256 into `q4_g32_fp16` emulate them with repeated scales, for quality measurement only |
+| `q4_g32_s6_fp16` | `grouped_mse_search` with parameters `group_size` 32 and `scale_bits` 6 (`weighted` optional) | Gemma two-level scale plane (one binary16 super scale and eight 6-bit multipliers per 256 columns, 4.25 bits per weight); the search result is the same as `scale_bits` 6 into `q4_g32_fp16`, which only emulates it. K padded to 128 must be a multiple of 256. `grouped_absmax` into it is refused |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
 | `nvfp4` | Supply a custom quantizer | `import_encoded` |
 

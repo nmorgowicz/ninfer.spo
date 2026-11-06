@@ -12,7 +12,7 @@ The storage registry contains exactly these identities:
 | Identity | Kind | Compatible numeric formats | Logical shape | Object alignment |
 |---|---|---|---|---:|
 | `contiguous_le_v1` | tensor layout | `bf16`, `fp32`, `int32` | rank `0..16` | 256 bytes |
-| `row_split_k128_v1` | tensor layout | `q4_g64_fp16`, `q4_g32_fp16`, `q4_g128_fp16`, `q4_g256_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]`; `q4_g256_fp16` also requires `K` padded to 128 to be a multiple of 256 | 256 bytes |
+| `row_split_k128_v1` | tensor layout | `q4_g64_fp16`, `q4_g32_fp16`, `q4_g128_fp16`, `q4_g256_fp16`, `q4_g32_s6_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]`; `q4_g256_fp16` and `q4_g32_s6_fp16` also require `K` padded to 128 to be a multiple of 256 | 256 bytes |
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
@@ -89,6 +89,7 @@ group size `G`:
 | `q4_g32_fp16` | 4 | 32 | 16 | 0 |
 | `q4_g128_fp16` | 4 | 128 | 64 | 0 |
 | `q4_g256_fp16` | 4 | 256 | 128 | 0 |
+| `q4_g32_s6_fp16` | 4 | 32 | 16 | 0 |
 | `q5_g64_fp16` | 5 | 64 | 32 | 8 |
 | `q6_g64_fp16` | 6 | 64 | 32 | 16 |
 | `q8_g32_fp16` | 8 | 32 | 32 | 0 |
@@ -104,6 +105,10 @@ physical_group_cnt = N * groups_per_row
 
 `K_pad` is physical geometry and is not added to the JSON `shape`. Because both registered group
 sizes divide 128, `groups_per_row` is integral.
+
+`q4_g32_s6_fp16` stores its scales per 256 columns, so `K_pad` must also be a multiple of 256; the
+layout refuses other shapes (for example `K = 5504`: `K_pad = 5504 = 21.5 * 256`). The Gemma 4 31B
+widths 5376 (21 * 256) and 21504 (84 * 256) satisfy it.
 
 For the final partially logical group, lanes whose column is at least `K` have signed code zero. Its
 scale remains the scale of the logical group defined by the numeric-format contract. Any complete
@@ -189,6 +194,22 @@ scale_index(row, group) = row * groups_per_row + group
 For a logical group, the word is exactly the binary16 multiplier defined by its numeric format. The
 padding rule in Section 3.1 defines the scale words for wholly physical groups.
 
+`q4_g32_s6_fp16` replaces the one-word-per-group scale plane by one 8-byte block per row and per
+256 padded columns (`K_pad / 256` blocks per row, `K_pad / 32` bytes per row):
+
+```text
+block(row, b)  at scale-plane byte (row * (K_pad / 256) + b) * 8
+bytes 0..1     S, binary16 super scale, little-endian
+bytes 2..7     48-bit little-endian field, eight 6-bit multipliers m_0..m_7 (m_j at bits 6j..6j+5)
+```
+
+Block `b` covers groups `8b .. 8b + 7` of the row; group `8b + j` has scale
+`binary16_rne(binary32(S) * m_j)` (see tensor-formats.md Section 6.4, which also has a golden
+vector). The padding rule of Section 3.1 still holds: a wholly physical group has multiplier 0, so
+its decoded scale is `0x0000`. The scale plane starts 256-byte aligned, so every block is
+8-byte aligned; a row is `K_pad / 32` bytes, which is not necessarily a multiple of 16 (`K = 5376`
+gives 168-byte rows).
+
 ### 3.6 Plane offsets and encoded size
 
 Let:
@@ -204,6 +225,9 @@ scale_offset = high_offset + align_up(high_bytes, 256)
 
 payload_bytes = scale_offset + scale_bytes
 ```
+
+For `q4_g32_s6_fp16`, `scale_bytes = N * K_pad / 32` (the g32 value divided by two); the base and
+high planes and every offset formula are unchanged.
 
 The byte ranges are:
 

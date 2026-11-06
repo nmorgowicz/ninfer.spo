@@ -167,9 +167,9 @@ void linear_a8_ready(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
 // Whether linear_a8_ready accepts this weight at this token count.
 [[nodiscard]] bool linear_takes_a8_ready(const Weight& w, std::int32_t tokens, LinearPolicy policy);
 
-// For a Q4_G32_FP16 weight the fused A8 prefill serves, derive its row multipliers once into
-// `storage` and point w.row_scales at them; every other weight is left unchanged. `storage` must
-// outlive `w`. Finishes before return.
+// For a Q4_G32/G128/G256_FP16 or Q4_G32_S6_FP16 weight the fused A8 prefill serves, derive its row
+// multipliers once into `storage` and point w.row_scales at them; every other weight is left
+// unchanged. `storage` must outlive `w`. Finishes before return.
 void linear_prepare_a8_rows(Weight& w, DeviceBuffer& storage, cudaStream_t stream);
 
 } // namespace ninfer::ops

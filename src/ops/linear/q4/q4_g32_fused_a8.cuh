@@ -9,6 +9,7 @@
 // run the unchanged FP8 MMA stage and epilogue on it.
 
 #include "ops/common/mbarrier.cuh"
+#include "ops/common/q4_scale_mode.h"
 #include "ops/linear/fp8/fp8_a8_mma_common.cuh"
 #include "ops/linear/fp8/fp8_a8_tma_mma.cuh"
 
@@ -20,31 +21,44 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
 // Row multiplier of the bake contract: bf16_ru(8 * max|scale| / 448), 1 for an all-zero row.
 // One warp per row, eight scales per load (the trunk rows hold a multiple of eight groups).
+// kS6: `groups` counts the row's 8-byte S6 blocks; the scales are the decoded fp16 group scales, so
+// the multiplier equals the one a g32 weight carrying the decoded scales gets.
+template <bool kS6>
 __global__ void q4_row_multiplier_kernel(const std::uint8_t* __restrict__ scales,
                                          __nv_bfloat16* __restrict__ row_scales, int rows, int groups) {
     const int row  = static_cast<int>(blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5));
     const int lane = static_cast<int>(threadIdx.x & 31);
     if (row >= rows) { return; }
-    const auto* scale_row = reinterpret_cast<const __half*>(scales) + static_cast<long long>(row) * groups;
     float largest = 0.0f;
-    if (groups % 8 == 0) {
-        const auto* vectors = reinterpret_cast<const uint4*>(scale_row);
-        for (int v = lane; v < groups / 8; v += 32) {
-            const uint4 packed = __ldg(vectors + v);
-            const unsigned words[4] = {packed.x, packed.y, packed.z, packed.w};
+    if constexpr (kS6) {
+        const auto* blocks = reinterpret_cast<const unsigned long long*>(scales) + static_cast<long long>(row) * groups;
+        for (int b = lane; b < groups; b += 32) {
+            const unsigned long long word = __ldg(blocks + b);
 #pragma unroll
-            for (const unsigned word : words) {
-                const float2 pair = __half22float2(*reinterpret_cast<const __half2*>(&word));
-                largest           = fmaxf(largest, fmaxf(fabsf(pair.x), fabsf(pair.y)));
-            }
+            for (int j = 0; j < kQ4S6GroupsPerBlock; ++j) { largest = fmaxf(largest, fabsf(q4_s6_scale(word, j))); }
         }
     } else {
-        for (int g = lane; g < groups; g += 32) { largest = fmaxf(largest, fabsf(__half2float(scale_row[g]))); }
+        const auto* scale_row = reinterpret_cast<const __half*>(scales) + static_cast<long long>(row) * groups;
+        if (groups % 8 == 0) {
+            const auto* vectors = reinterpret_cast<const uint4*>(scale_row);
+            for (int v = lane; v < groups / 8; v += 32) {
+                const uint4 packed = __ldg(vectors + v);
+                const unsigned words[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+                for (const unsigned word : words) {
+                    const float2 pair = __half22float2(*reinterpret_cast<const __half2*>(&word));
+                    largest           = fmaxf(largest, fmaxf(fabsf(pair.x), fabsf(pair.y)));
+                }
+            }
+        } else {
+            for (int g = lane; g < groups; g += 32) { largest = fmaxf(largest, fabsf(__half2float(scale_row[g]))); }
+        }
     }
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -57,10 +71,19 @@ __global__ void q4_row_multiplier_kernel(const std::uint8_t* __restrict__ scales
 }
 
 inline void launch_q4_row_multipliers(const std::uint8_t* scales, __nv_bfloat16* row_scales, int rows, int k,
-                                      int scale_shift, cudaStream_t stream) {
+                                      int scale_mode, cudaStream_t stream) {
     constexpr int kWarps = 8;
-    q4_row_multiplier_kernel<<<(rows + kWarps - 1) / kWarps, kWarps * 32, 0, stream>>>(
-        scales, row_scales, rows, k >> (5 + scale_shift));
+    if (!q4_scale_mode_valid(scale_mode)) { throw std::invalid_argument("q4 row multipliers: invalid scale mode"); }
+    if (scale_mode == kQ4ScaleS6) {
+        if (k % kQ4S6BlockColumns != 0) {
+            throw std::invalid_argument("q4 row multipliers: an S6 row needs K divisible by 256");
+        }
+        q4_row_multiplier_kernel<true><<<(rows + kWarps - 1) / kWarps, kWarps * 32, 0, stream>>>(
+            scales, row_scales, rows, k / kQ4S6BlockColumns);
+    } else {
+        q4_row_multiplier_kernel<false><<<(rows + kWarps - 1) / kWarps, kWarps * 32, 0, stream>>>(
+            scales, row_scales, rows, k >> (5 + scale_mode));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -145,7 +168,7 @@ struct Q4FusedLayout {
 };
 
 template <class Schedule, int LoadStages, int RoundStages, int ConverterWarps, bool FullTokens, bool SplitK,
-          int ScaleShift>
+          int ScaleMode>
 __global__ void __launch_bounds__(Q4FusedLayout<Schedule, LoadStages, RoundStages, ConverterWarps>::kThreads, 1)
     q4_fused_a8_kernel(const __grid_constant__ Fp8TmaDescriptors descriptors, Fp8A8Operands operands,
                        const std::uint8_t* __restrict__ group_scales, LinearBf16Output output, int token_offset,
@@ -220,46 +243,65 @@ __global__ void __launch_bounds__(Q4FusedLayout<Schedule, LoadStages, RoundStage
         const int lane      = converter & 31;
         const int group     = converter % Layout::kGroupsPerRow;
         const int groups    = k >> 5;
-        const unsigned short* scale_base;
-        if constexpr (ScaleShift == 0) {
+        const unsigned short* scale_base = nullptr;
+        if constexpr (ScaleMode == 0) {
             scale_base = reinterpret_cast<const unsigned short*>(group_scales) + static_cast<long long>(row_begin) * groups +
                          group;
-        } else {
+        } else if constexpr (ScaleMode != kQ4ScaleS6) {
             scale_base = reinterpret_cast<const unsigned short*>(group_scales) +
-                         static_cast<long long>(row_begin) * (groups >> ScaleShift);
+                         static_cast<long long>(row_begin) * (groups >> ScaleMode);
         }
         int row[Layout::kItems];
         float inverse[Layout::kItems];
-        unsigned short next[Layout::kItems];
-        const int scale_groups = groups >> ScaleShift;
+        // g32 and coarse modes prefetch the binary16 scale bits; S6 prefetches the raw 8-byte block
+        // (decoding it right after its load would wait for the load) and decodes at use.
+        std::conditional_t<ScaleMode == kQ4ScaleS6, unsigned long long, unsigned short> next[Layout::kItems];
+        const int scale_groups = groups >> (ScaleMode == kQ4ScaleS6 ? 0 : ScaleMode);
         // The g32 loads are the original expressions; a coarse scale index is the 32-group index
         // shifted down. A tile holds four 32-groups, so a coarse scale covers one tile (g128) or two
         // consecutive tiles (g256).
         const auto coarse_scale = [&](int r, int tile) -> unsigned short {
-            return __ldg(scale_base + static_cast<long long>(r) * scale_groups + ((tile * 4 + group) >> ScaleShift));
+            if constexpr (ScaleMode == kQ4ScaleS6) {
+                return 0;
+            } else {
+                return __ldg(scale_base + static_cast<long long>(r) * scale_groups +
+                             ((tile * 4 + group) >> ScaleMode));
+            }
+        };
+        // S6: the 8-byte block (8 groups = two tiles) of row r holds this tile's group `group` in
+        // field (tile & 1) * 4 + group.
+        const auto s6_block = [&](int r, int tile) -> unsigned long long {
+            const auto* blocks = reinterpret_cast<const unsigned long long*>(group_scales);
+            return __ldg(blocks + static_cast<long long>(row_begin + r) * (k >> 8) + (tile >> 1));
         };
         (void)scale_groups;
         (void)coarse_scale;
+        (void)s6_block;
 #pragma unroll
         for (int item = 0; item < Layout::kItems; ++item) {
             row[item]     = (item * Layout::kConverterThreads + converter) / Layout::kGroupsPerRow;
             inverse[item] = __frcp_rn(__bfloat162float(operands.scales[row_begin + row[item]]));
-            if constexpr (ScaleShift == 0) {
+            if constexpr (ScaleMode == 0) {
                 next[item] =
                     tiles_k > 0 ? __ldg(scale_base + static_cast<long long>(row[item]) * groups + k_begin * 4) : 0;
+            } else if constexpr (ScaleMode == kQ4ScaleS6) {
+                next[item] = tiles_k > 0 ? s6_block(row[item], k_begin) : 0;
             } else {
                 next[item] = tiles_k > 0 ? coarse_scale(row[item], k_begin) : 0;
             }
         }
         for (int kt = 0; kt < tiles_k; ++kt) {
             const int stage = kt % L, slot = kt % R;
-            unsigned short current[Layout::kItems];
+            std::conditional_t<ScaleMode == kQ4ScaleS6, unsigned long long, unsigned short> current[Layout::kItems];
 #pragma unroll
             for (int item = 0; item < Layout::kItems; ++item) {
                 current[item] = next[item];
                 if (kt + 1 < tiles_k) {
-                    if constexpr (ScaleShift == 0) {
+                    if constexpr (ScaleMode == 0) {
                         next[item] = __ldg(scale_base + static_cast<long long>(row[item]) * groups + (k_begin + kt + 1) * 4);
+                    } else if constexpr (ScaleMode == kQ4ScaleS6) {
+                        // A block serves two consecutive tiles: only an even tile starts a new one.
+                        next[item] = ((k_begin + kt + 1) & 1) ? current[item] : s6_block(row[item], k_begin + kt + 1);
                     } else {
                         next[item] = coarse_scale(row[item], k_begin + kt + 1);
                     }
@@ -273,7 +315,13 @@ __global__ void __launch_bounds__(Q4FusedLayout<Schedule, LoadStages, RoundStage
             for (int item = 0; item < Layout::kItems; ++item) {
                 const int r       = row[item];
                 const uint4 packed = *reinterpret_cast<const uint4*>(codes + r * (BK / 2) + group * 16);
-                const float mult   = __fmul_rn(__half2float(__ushort_as_half(current[item])), inverse[item]);
+                unsigned short scale_bits;
+                if constexpr (ScaleMode == kQ4ScaleS6) {
+                    scale_bits = q4_s6_scale_bits(current[item], ((k_begin + kt) & 1) * 4 + group);
+                } else {
+                    scale_bits = current[item];
+                }
+                const float mult = __fmul_rn(__half2float(__ushort_as_half(scale_bits)), inverse[item]);
                 uint4 first, second;
                 q4_round_group(packed, mult, first, second);
                 const int swizzle = r & 7;
@@ -330,14 +378,15 @@ __global__ void __launch_bounds__(Q4FusedLayout<Schedule, LoadStages, RoundStage
 }
 
 // activations/activation_scales: the A8 codes of x. row_scales: the bake multipliers, written by
-// launch_q4_row_multipliers first. group_scales: the weight's scale plane, one binary16 scale per
-// 32 << ScaleShift columns. partials: Schedule::kPartialBytes when the schedule splits K.
-template <class Schedule, int LoadStages, int RoundStages, int ConverterWarps, int ScaleShift>
+// launch_q4_row_multipliers first. group_scales: the weight's scale plane in scale mode ScaleMode
+// (q4_scale_mode.h): one binary16 scale per 32 << ScaleMode columns, or S6 blocks of 8 groups.
+// partials: Schedule::kPartialBytes when the schedule splits K.
+template <class Schedule, int LoadStages, int RoundStages, int ConverterWarps, int ScaleMode>
 void launch_q4_fused_a8(const std::uint8_t* activations, const float* activation_scales, const std::uint8_t* codes,
                         const std::uint8_t* group_scales, const __nv_bfloat16* row_scales, __nv_bfloat16* out,
                         float* partials, int rows, int k, int tokens, cudaStream_t stream) {
     using Layout = Q4FusedLayout<Schedule, LoadStages, RoundStages, ConverterWarps>;
-    if (rows % Layout::BR != 0 || k % Layout::BK != 0 || k % (32 << ScaleShift) != 0) {
+    if (rows % Layout::BR != 0 || k % Layout::BK != 0 || k % q4_scale_span(ScaleMode) != 0) {
         throw std::invalid_argument("q4 fused A8 requires complete row and K tiles and K divisible by the scale group");
     }
     Fp8A8Operands operands{activations, activation_scales, codes, row_scales, rows, k, tokens};
@@ -349,7 +398,7 @@ void launch_q4_fused_a8(const std::uint8_t* activations, const float* activation
         const auto plan  = fp8_tma_split_k_plan<Schedule>(blocks, k);
         const auto launch = [&]<bool Full, bool Split>() {
             constexpr auto kernel =
-                q4_fused_a8_kernel<Schedule, LoadStages, RoundStages, ConverterWarps, Full, Split, ScaleShift>;
+                q4_fused_a8_kernel<Schedule, LoadStages, RoundStages, ConverterWarps, Full, Split, ScaleMode>;
             static const cudaError_t status =
                 cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Layout::kSharedBytes);
             CUDA_CHECK(status);

@@ -228,3 +228,136 @@ def test_g256_refuses_k_whose_padded_width_is_not_a_multiple_of_256(k):
     with pytest.raises(ValueError, match="multiple of its group size"):
         row_split_geometry("q4_g256_fp16", (4, k))
     assert row_split_geometry("q4_g128_fp16", (4, k)).groups_per_row == -(-k // 128)
+
+
+# --- q4_g32_s6_fp16: two-level scale plane -----------------------------------------------------------
+
+GOLDEN_BLOCK = bytes([0x55, 0x35, 0x40, 0x20, 0x0C, 0xBF, 0xFF, 0x45])  # S = 0x3555, m = 0,1,2,3,63,62,31,17
+GOLDEN_SCALE_BITS = (0x0000, 0x3555, 0x3955, 0x3C00, 0x4D40, 0x4D2A, 0x492A, 0x45AA)
+
+
+def _golden_plane(rows: int = 1) -> torch.Tensor:
+    return torch.frombuffer(bytearray(GOLDEN_BLOCK * rows), dtype=torch.uint8).reshape(rows, 8)
+
+
+def test_s6_golden_block_decodes_to_the_pinned_binary16_scales():
+    from tools.artifact.codecs.scale_s6 import decode_s6_scales, pack_s6_scales
+
+    decoded = decode_s6_scales(_golden_plane())
+    assert decoded.dtype == torch.float16
+    assert decoded.view(torch.int16).reshape(-1).tolist() == [
+        _signed_word(word, 16) for word in GOLDEN_SCALE_BITS
+    ]
+    # j = 3: 3 * S = 0.99975 rounds to exactly 1.0 in binary16 (the single rounding of the rule).
+    assert float(decoded[0, 3]) == 1.0
+    # The bit fields are as specified: S = W & 0xffff, m_j = (W >> (16 + 6 j)) & 63.
+    word = int.from_bytes(GOLDEN_BLOCK, "little")
+    assert word & 0xFFFF == 0x3555
+    assert [(word >> (16 + 6 * j)) & 63 for j in range(8)] == [0, 1, 2, 3, 63, 62, 31, 17]
+    # Packing the decoded words recovers a block that decodes to the same words.
+    repacked = pack_s6_scales(decoded)
+    assert torch.equal(decode_s6_scales(repacked).view(torch.int16), decoded.view(torch.int16))
+
+
+def test_s6_row_split_wire_positions_and_round_trip():
+    from tools.artifact.codecs.scale_s6 import decode_s6_scales
+
+    rows, k = 2, 256
+    codes = torch.zeros((rows, 8, 32), dtype=torch.int8)
+    codes[0, 0, :6] = torch.tensor((-8, -7, -1, 0, 1, 7), dtype=torch.int8)
+    other = bytes([0x00, 0x3C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00])  # S = 1.0, m_0 = 1, the rest 0
+    plane = torch.cat((_golden_plane(), torch.frombuffer(bytearray(other), dtype=torch.uint8).reshape(1, 8)))
+    payload = encode_row_split(codes, plane, "q4_g32_s6_fp16", (rows, k))
+    # Code plane 2 * 128 bytes; no high plane; the scale plane starts 256-aligned and is K/32 bytes per row.
+    expected = bytearray(256 + 2 * 8)
+    expected[:3] = b"\x98\x0f\x71"
+    expected[256:264] = GOLDEN_BLOCK
+    expected[264:272] = other
+    assert payload == bytes(expected)
+    scales, decoded_codes = decode_row_split_codes(payload, "q4_g32_s6_fp16", (rows, k))
+    assert torch.equal(decoded_codes, codes)
+    assert scales.dtype == torch.float16 and tuple(scales.shape) == (rows, 8)
+    assert torch.equal(scales, decode_s6_scales(plane))
+    assert scales[1].view(torch.int16).tolist() == [0x3C00] + [0] * 7
+
+
+def test_s6_dequantize_split_gather_and_assemble_agree_with_the_decoded_scales():
+    from tools.artifact.codecs.row_split import (
+        assemble_row_planes,
+        dequantize_row_split,
+        gather_row_planes,
+        split_row_planes,
+    )
+    from tools.artifact.layouts import row_split_geometry
+
+    rows, k = 5, 512
+    generator = torch.Generator().manual_seed(3)
+    codes = torch.randint(-8, 8, (rows, 16, 32), generator=generator, dtype=torch.int8)
+    plane = torch.randint(0, 256, (rows, 16), generator=generator, dtype=torch.uint8)
+    plane[:, 1::8] = plane[:, 1::8] & 0x3B  # keep every super scale finite and small
+    shape = (rows, k)
+    payload = encode_row_split(codes, plane, "q4_g32_s6_fp16", shape)
+    geometry = row_split_geometry("q4_g32_s6_fp16", shape)
+    assert geometry.scale_row_bytes == 16 and len(payload) == geometry.payload_bytes
+
+    scales, _ = decode_row_split_codes(payload, "q4_g32_s6_fp16", shape)
+    reference = (codes.float() * scales.float().unsqueeze(-1)).reshape(rows, k)
+    for dtype in (torch.float32, torch.bfloat16):
+        got = dequantize_row_split(payload, "q4_g32_s6_fp16", shape, dtype=dtype)
+        assert torch.equal(got, reference.to(dtype))
+
+    planes = split_row_planes(payload, geometry, 1, 3)
+    assert bytes(planes.scale) == payload[geometry.scale_offset + 16 : geometry.scale_offset + 64]
+    gathered = gather_row_planes(payload, geometry, [4, 0, 2])
+    for index, row in enumerate((4, 0, 2)):
+        assert bytes(gathered.scale[index * 16 : (index + 1) * 16]) == bytes(plane[row].numpy())
+    whole = split_row_planes(payload, geometry)
+    assert assemble_row_planes(whole, "q4_g32_s6_fp16", k) == payload
+    on_tensor = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+    assert torch.equal(
+        dequantize_row_split(on_tensor, "q4_g32_s6_fp16", shape, dtype=torch.float32),
+        reference,
+    )
+
+
+def test_s6_encode_takes_the_uint8_plane_not_group_words():
+    codes = torch.zeros((1, 8, 32), dtype=torch.int8)
+    with pytest.raises(TypeError, match="uint8"):
+        encode_row_split(codes, torch.zeros((1, 8), dtype=torch.float16), "q4_g32_s6_fp16", (1, 256))
+    with pytest.raises(TypeError, match="float16"):
+        encode_row_split(codes, torch.zeros((1, 8), dtype=torch.uint8), "q4_g32_fp16", (1, 256))
+
+
+def test_s6_geometry_and_encoded_size_for_the_gemma_shapes():
+    from tools.artifact.layouts import encoded_size, row_split_geometry
+
+    for n, k in ((21504, 5376), (5376, 21504), (16384, 5376), (8192, 5376)):
+        s6 = row_split_geometry("q4_g32_s6_fp16", (n, k))
+        g32 = row_split_geometry("q4_g32_fp16", (n, k))
+        assert (s6.groups_per_row, s6.scale_row_bytes, s6.scale_bytes) == (k // 32, k // 32, n * k // 32)
+        assert s6.base_bytes == g32.base_bytes and s6.high_bytes == 0
+        assert s6.scale_offset == g32.scale_offset and s6.scale_offset % 256 == 0
+        assert s6.payload_bytes == s6.scale_offset + n * (k // 32)
+        assert g32.payload_bytes - s6.payload_bytes == n * (k // 32)
+        assert encoded_size("row_split_k128_v1", "q4_g32_s6_fp16", (n, k)) == s6.payload_bytes
+    assert row_split_geometry("q4_g32_s6_fp16", (21504, 5376)).scale_row_bytes == 168  # not a multiple of 16
+    assert row_split_geometry("q4_g32_s6_fp16", (4, 256)).payload_bytes == 4 * 128 + 4 * 8
+
+
+@pytest.mark.parametrize("k", [100, 128, 384, 640, 5376 + 128])
+def test_s6_refuses_k_whose_padded_width_is_not_a_multiple_of_256(k):
+    from tools.artifact.layouts import encoded_size, row_split_geometry
+
+    with pytest.raises(ValueError, match="multiple of 256"):
+        row_split_geometry("q4_g32_s6_fp16", (4, k))
+    with pytest.raises(ValueError, match="multiple of 256"):
+        encoded_size("row_split_k128_v1", "q4_g32_s6_fp16", (4, k))
+    assert row_split_geometry("q4_g32_fp16", (4, k)).groups_per_row == -(-k // 128) * 4
+
+
+def test_existing_quant_formats_keep_their_scale_row_bytes():
+    from tools.artifact.layouts import row_split_geometry
+
+    for name, k in (("q4_g32_fp16", 5376), ("q4_g64_fp16", 5376), ("q4_g128_fp16", 5376), ("q4_g256_fp16", 5376 + 128 * 2)):
+        geometry = row_split_geometry(name, (3, k))
+        assert geometry.scale_row_bytes == geometry.groups_per_row * 2

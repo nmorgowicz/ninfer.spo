@@ -120,6 +120,44 @@ inline std::uint16_t load_u16_le(const std::vector<std::uint8_t>& payload, std::
            static_cast<std::uint16_t>(static_cast<std::uint16_t>(payload[off + 1]) << 8);
 }
 
+inline void store_u64_le(std::vector<std::uint8_t>& payload, std::size_t off, std::uint64_t v) {
+    for (int i = 0; i < 8; ++i) {
+        payload[off + static_cast<std::size_t>(i)] = static_cast<std::uint8_t>((v >> (8 * i)) & 0xffu);
+    }
+}
+
+inline std::uint64_t load_u64_le(const std::vector<std::uint8_t>& payload, std::size_t off) {
+    std::uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) {
+        v |= static_cast<std::uint64_t>(payload[off + static_cast<std::size_t>(i)]) << (8 * i);
+    }
+    return v;
+}
+
+// q4_g32_s6_fp16 scale block, written from the byte contract and nothing else: per row and per 256
+// columns one 8-byte little-endian word, S = binary16 in bits 0..15, eight 6-bit multipliers m_j
+// (j = 0..7, the eight 32-groups) at bits 16 + 6j. The group scale is the binary16 round to
+// nearest even of S * m_j (the fp64 product of an 11-bit and a 6-bit integer is exact). This
+// decode is the oracle's; it must not call the production helpers in q4_scale_mode.h.
+inline constexpr std::int32_t kS6BlockColumns = 256;
+inline constexpr std::size_t kS6BlockBytes    = 8;
+
+inline std::uint64_t s6_pack_block(std::uint16_t super, const std::uint8_t (&multipliers)[8]) {
+    std::uint64_t word = super;
+    for (int j = 0; j < 8; ++j) {
+        word |= static_cast<std::uint64_t>(multipliers[j] & 63u) << (16 + 6 * j);
+    }
+    return word;
+}
+
+inline std::uint16_t s6_group_scale_bits(std::uint64_t word, int j) {
+    const double super      = static_cast<double>(f16_to_f32(static_cast<std::uint16_t>(word & 0xffffu)));
+    const double multiplier = static_cast<double>((word >> (16 + 6 * j)) & 63u);
+    return f32_to_f16(static_cast<float>(super * multiplier));
+}
+
+inline float s6_group_scale(std::uint64_t word, int j) { return f16_to_f32(s6_group_scale_bits(word, j)); }
+
 inline double decode_e2m1(std::uint8_t word) {
     constexpr double magnitudes[]{0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
     const double magnitude = magnitudes[word & 0x07U];
@@ -154,6 +192,7 @@ inline QuantSpec quant_spec(QType qtype) {
     case QType::Q4_G64_FP16:
         return {4, 64, 7, -8};
     case QType::Q4_G32_FP16:
+    case QType::Q4_G32_S6_FP16:
         return {4, 32, 7, -8};
     case QType::Q4_G128_FP16:
         return {4, 128, 7, -8};
@@ -276,8 +315,10 @@ struct PackedWeight {
                 static_cast<std::size_t>(groups_per_row) * detail::nibble_bytes_per_group(spec);
             const std::size_t high_row =
                 static_cast<std::size_t>(groups_per_row) * detail::high_bytes_per_group(spec);
-            const std::size_t scale_row =
-                static_cast<std::size_t>(groups_per_row) * sizeof(std::uint16_t);
+            const std::size_t scale_row = w.qtype == QType::Q4_G32_S6_FP16
+                                              ? static_cast<std::size_t>(groups_per_row)
+                                              : static_cast<std::size_t>(groups_per_row) *
+                                                    sizeof(std::uint16_t);
             w.qdata = static_cast<const std::uint8_t*>(w.qdata) +
                       static_cast<std::size_t>(row_begin) * code_row;
             w.qhigh  = high_row == 0 ? nullptr
@@ -322,6 +363,130 @@ struct PatternedWeightOptions {
     float weight_scale_divisor           = 0.0F;
     float input_scale_divisor            = 0.0F;
 };
+
+// q4_g32_s6_fp16 with deterministic random content: hashed 4-bit codes (the code plane of
+// q4_g32_fp16), and per 256-column block a random finite normal binary16 super scale S and eight
+// random 6-bit multipliers. S has a biased exponent in 4..6 (so S * 63 stays a moderate scale and
+// the scales of a row stay within a few octaves, as a quantizer's do); multiplier 0 and 63 occur
+// in 1 in 8 blocks each beside the uniform draws. K padded to 128 must be a multiple of 256.
+// `materialize_dequant` also fills `dequant` (N x K floats) from the fixture's own decode; the
+// large registered shapes leave it empty and use logical_weight_fp64.
+inline PackedWeight make_q4_g32_s6_weight(std::int32_t n, std::int32_t k, std::uint32_t seed,
+                                          bool materialize_dequant = false) {
+    if (n <= 0 || k <= 0) {
+        throw std::invalid_argument("quantized-weight fixture: shape must be positive");
+    }
+    const std::int32_t padded_k = detail::align_up(k, 128);
+    if (padded_k % detail::kS6BlockColumns != 0) {
+        throw std::invalid_argument(
+            "quantized-weight fixture: q4_g32_s6 requires K padded to 128 to be a multiple of 256");
+    }
+    const std::int32_t kg             = padded_k / 32;
+    const std::int32_t blocks_per_row = padded_k / detail::kS6BlockColumns;
+    const std::int32_t logical_groups = (k + 31) / 32;
+    const std::uint64_t groups        = static_cast<std::uint64_t>(n) * kg;
+
+    PackedWeight packed;
+    packed.code_plane_bytes   = groups * 16;
+    packed.high_plane_offset  = detail::align_up_size(static_cast<std::size_t>(packed.code_plane_bytes), 256);
+    packed.high_plane_bytes   = 0;
+    packed.scale_plane_offset = packed.high_plane_offset;
+    packed.scale_plane_bytes  = static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(blocks_per_row) *
+                               detail::kS6BlockBytes;
+    packed.payload.assign(static_cast<std::size_t>(packed.scale_plane_offset + packed.scale_plane_bytes), 0);
+
+    std::uint8_t code_patterns[256][16]{};
+    for (std::size_t pattern = 0; pattern < 256; ++pattern) {
+        std::uint64_t state = detail::mix64(static_cast<std::uint64_t>(seed) << 32 | pattern);
+        for (std::size_t byte = 0; byte < 16; ++byte) {
+            state                        = detail::mix64(state + byte);
+            code_patterns[pattern][byte] = static_cast<std::uint8_t>(state >> 56);
+        }
+    }
+    for (std::uint64_t group_index = 0; group_index < groups; ++group_index) {
+        const std::uint64_t group = group_index % static_cast<std::uint64_t>(kg);
+        if (group >= static_cast<std::uint64_t>(logical_groups)) { continue; }
+        const std::uint64_t mixed = detail::mix64(group_index ^ (static_cast<std::uint64_t>(seed) << 17));
+        std::memcpy(packed.payload.data() + group_index * 16, code_patterns[mixed & 0xffU], 16);
+    }
+    // Columns of the last logical group at and beyond K carry code 0.
+    if (k % 32 != 0) {
+        for (std::int32_t row = 0; row < n; ++row) {
+            std::uint8_t* last = packed.payload.data() +
+                                 (static_cast<std::size_t>(row) * kg + (logical_groups - 1)) * 16;
+            for (std::int32_t lane = k % 32; lane < 32; ++lane) {
+                last[lane / 2] &= static_cast<std::uint8_t>((lane & 1) != 0 ? 0x0f : 0xf0);
+            }
+        }
+    }
+
+    for (std::int32_t row = 0; row < n; ++row) {
+        for (std::int32_t block = 0; block < blocks_per_row; ++block) {
+            const std::uint64_t index = static_cast<std::uint64_t>(row) * blocks_per_row + block;
+            const std::uint64_t h     = detail::mix64(index ^ (static_cast<std::uint64_t>(seed) << 20) ^
+                                                  0x51ed270b3c7aULL);
+            const std::uint64_t h2    = detail::mix64(h ^ 0xa5a5a5a5ULL);
+            // The scales a quantizer produces stay within a few octaves of one another per row;
+            // the decode extremes (smallest normal S, largest S) are covered by the decode tests.
+            const std::uint32_t biased_exponent = 4U + static_cast<std::uint32_t>((h >> 8) % 3U);
+            const std::uint16_t super =
+                static_cast<std::uint16_t>((biased_exponent << 10) | ((h >> 16) & 0x3ffU));
+            std::uint8_t multipliers[8];
+            for (int j = 0; j < 8; ++j) {
+                multipliers[j] = static_cast<std::uint8_t>((h2 >> (6 * j)) & 63U);
+            }
+            if (((h >> 40) & 7U) == 0) { multipliers[(h >> 43) & 7U] = 0; }
+            if (((h >> 46) & 7U) == 0) { multipliers[(h >> 49) & 7U] = 63; }
+            detail::store_u64_le(packed.payload,
+                                 static_cast<std::size_t>(packed.scale_plane_offset + index * detail::kS6BlockBytes),
+                                 detail::s6_pack_block(super, multipliers));
+        }
+    }
+
+    if (materialize_dequant) {
+        packed.dequant.assign(static_cast<std::size_t>(n) * k, 0.0f);
+        for (std::int32_t row = 0; row < n; ++row) {
+            for (std::int32_t column = 0; column < k; ++column) {
+                const std::int32_t group = column / 32;
+                const std::int32_t lane  = column % 32;
+                const std::uint64_t word = detail::load_u64_le(
+                    packed.payload,
+                    static_cast<std::size_t>(packed.scale_plane_offset) +
+                        (static_cast<std::size_t>(row) * blocks_per_row + group / 8) * detail::kS6BlockBytes);
+                const std::uint8_t byte =
+                    packed.payload[(static_cast<std::size_t>(row) * kg + group) * 16 + lane / 2];
+                const int nibble = (lane & 1) != 0 ? (byte >> 4) : (byte & 0x0f);
+                const int code   = nibble >= 8 ? nibble - 16 : nibble;
+                packed.dequant[static_cast<std::size_t>(row) * k + column] =
+                    static_cast<float>(code) * detail::s6_group_scale(word, group & 7);
+            }
+        }
+    }
+
+    packed.weight.qtype            = QType::Q4_G32_S6_FP16;
+    packed.weight.layout           = QuantLayout::RowSplit;
+    packed.weight.scale_dtype      = DType::U8;
+    packed.weight.payload          = packed.payload.data();
+    packed.weight.payload_bytes    = packed.payload.size();
+    packed.weight.high_plane_bytes = 0;
+    packed.weight.qdata            = packed.payload.data();
+    packed.weight.qhigh            = nullptr;
+    packed.weight.scales           = packed.payload.data() + packed.scale_plane_offset;
+    packed.weight.group_size       = 32;
+    packed.weight.group            = 32;
+    packed.weight.ndim             = 2;
+    packed.weight.shape[0]         = n;
+    packed.weight.shape[1]         = k;
+    packed.weight.shape[2]         = 1;
+    packed.weight.shape[3]         = 1;
+    packed.weight.padded_shape[0]  = n;
+    packed.weight.padded_shape[1]  = padded_k;
+    packed.weight.padded_shape[2]  = 1;
+    packed.weight.padded_shape[3]  = 1;
+    packed.weight.n                = n;
+    packed.weight.k                = k;
+    return packed;
+}
 
 // Builds a deterministic full-shape payload without allocating a source or dequantized matrix.
 // Large registered-shape conformance tests can then verify deterministic FP64 row samples.
@@ -496,6 +661,11 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
     if (options.weight_scale_divisor != 0.0F || options.input_scale_divisor != 0.0F) {
         throw std::invalid_argument(
             "quantized-weight fixture: divisors are defined only for NVFP4");
+    }
+    if (qtype == QType::Q4_G32_S6_FP16) {
+        // Codes and scales of a two-level weight are always hashed random (the row-split patterns
+        // describe the single-level scale words).
+        return make_q4_g32_s6_weight(n, k, seed);
     }
     const detail::QuantSpec spec      = detail::quant_spec(qtype);
     if (spec.group_size > 64 && k % spec.group_size != 0) {
@@ -696,6 +866,53 @@ inline PackedWeight emulate_q4_g32_from_coarse(const PackedWeight& coarse) {
     return out;
 }
 
+// The q4_g32_fp16 tensor that decodes to exactly the same weights as a q4_g32_s6_fp16 one: the code
+// plane is shared byte for byte and every 32-group scale word is the binary16 round to nearest
+// even of S * m_j, decoded by the fixture's independent helper. Outputs of the g32 kernels on the
+// result must equal the S6 kernels' on `s6` bit for bit.
+inline PackedWeight emulate_q4_g32_from_s6(const PackedWeight& s6) {
+    const Weight& sw = s6.weight;
+    if (sw.qtype != QType::Q4_G32_S6_FP16 || s6.high_plane_bytes != 0) {
+        throw std::invalid_argument("quantized-weight fixture: expected a q4_g32_s6 weight");
+    }
+    const std::size_t rows           = static_cast<std::size_t>(sw.n);
+    const std::size_t g32_per_row    = static_cast<std::size_t>(sw.padded_shape[1] / 32);
+    const std::size_t blocks_per_row = static_cast<std::size_t>(sw.padded_shape[1] / detail::kS6BlockColumns);
+    PackedWeight out;
+    out.code_plane_bytes   = s6.code_plane_bytes;
+    out.high_plane_offset  = s6.high_plane_offset;
+    out.high_plane_bytes   = 0;
+    out.scale_plane_offset = s6.scale_plane_offset;
+    out.scale_plane_bytes  = rows * g32_per_row * 2;
+    out.payload.assign(static_cast<std::size_t>(out.scale_plane_offset + out.scale_plane_bytes), 0);
+    std::copy(s6.payload.begin(),
+              s6.payload.begin() + static_cast<std::ptrdiff_t>(s6.scale_plane_offset), out.payload.begin());
+    for (std::size_t row = 0; row < rows; ++row) {
+        for (std::size_t block = 0; block < blocks_per_row; ++block) {
+            const std::uint64_t word = detail::load_u64_le(
+                s6.payload, static_cast<std::size_t>(s6.scale_plane_offset) +
+                                (row * blocks_per_row + block) * detail::kS6BlockBytes);
+            for (int j = 0; j < 8; ++j) {
+                detail::store_u16_le(out.payload,
+                                     static_cast<std::size_t>(out.scale_plane_offset) +
+                                         (row * g32_per_row + block * 8 + static_cast<std::size_t>(j)) * 2,
+                                     detail::s6_group_scale_bits(word, j));
+            }
+        }
+    }
+    out.dequant              = s6.dequant;
+    out.weight               = sw;
+    out.weight.qtype         = QType::Q4_G32_FP16;
+    out.weight.scale_dtype   = DType::FP16;
+    out.weight.group_size    = 32;
+    out.weight.group         = 32;
+    out.weight.payload       = out.payload.data();
+    out.weight.payload_bytes = out.payload.size();
+    out.weight.qdata         = out.payload.data();
+    out.weight.scales        = out.payload.data() + out.scale_plane_offset;
+    return out;
+}
+
 // Independent logical decode for numerical oracles. The packed representation is materialized as
 // its specified logical FP32 weight before the complete Op oracle receives it.
 inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
@@ -771,8 +988,17 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
     const std::uint8_t* high         = high_bytes == 0 ? nullptr
                                                        : packed.payload.data() + packed.high_plane_offset +
                                                      group_index * high_bytes;
-    const std::uint16_t stored_scale = detail::load_u16_le(
-        packed.payload, packed.scale_plane_offset + group_index * sizeof(std::uint16_t));
+    const std::uint16_t stored_scale =
+        weight.qtype == QType::Q4_G32_S6_FP16
+            ? detail::s6_group_scale_bits(
+                  detail::load_u64_le(packed.payload,
+                                      packed.scale_plane_offset +
+                                          (static_cast<std::size_t>(row) * (padded_k / detail::kS6BlockColumns) +
+                                           static_cast<std::size_t>(group / 8)) *
+                                              detail::kS6BlockBytes),
+                  group & 7)
+            : detail::load_u16_le(packed.payload,
+                                  packed.scale_plane_offset + group_index * sizeof(std::uint16_t));
     const int signed_code                = detail::unpack_lowbit_code(nibble, high, spec, lane);
     const double exact_stored_fp16_scale = static_cast<double>(detail::f16_to_f32(stored_scale));
     return static_cast<double>(signed_code) * exact_stored_fp16_scale;
@@ -814,6 +1040,9 @@ inline std::vector<float> materialize_rows_fp32(const PackedWeight& packed,
 inline std::vector<float> decode_row_split_lowbit(const std::vector<std::uint8_t>& payload,
                                                   std::int32_t n, std::int32_t k,
                                                   std::int32_t padded_k, QType qtype) {
+    if (qtype == QType::Q4_G32_S6_FP16) {
+        throw std::invalid_argument("row-split test decoder: q4_g32_s6 has no single-level scales");
+    }
     const detail::QuantSpec spec = detail::quant_spec(qtype);
     const int nib                = detail::nibble_bytes_per_group(spec);
     const int high_bpr           = detail::high_bytes_per_group(spec);
@@ -855,6 +1084,9 @@ inline PackedWeight pack_row_split_lowbit(const std::vector<float>& source, std:
     }
 
     const detail::QuantSpec spec = detail::quant_spec(qtype);
+    if (qtype == QType::Q4_G32_S6_FP16) {
+        throw std::invalid_argument("row-split test packer: use make_q4_g32_s6_weight for q4_g32_s6");
+    }
     const std::int32_t padded_k  = detail::align_up(k, 128);
     const std::int32_t kg        = padded_k / spec.group_size;
     if (spec.group_size > 64 && k % spec.group_size != 0) {

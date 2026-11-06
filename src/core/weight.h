@@ -11,6 +11,7 @@ enum class QType : std::uint16_t {
     Q4_G32_FP16         = 10,
     Q4_G128_FP16        = 11,
     Q4_G256_FP16        = 12,
+    Q4_G32_S6_FP16      = 13,
     Q5_G64_FP16         = 1,
     Q6_G64_FP16         = 2,
     Q8_G32_FP16         = 3,
@@ -52,8 +53,8 @@ struct Weight {
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
-    // Q4_G32_FP16 only: BF16 row multipliers of the fused A8 prefill route, derived from the
-    // scales at load (ops::linear_prepare_a8_rows). Null makes the route derive them per call.
+    // Q4_G32_FP16/G128/G256/S6 only: BF16 row multipliers of the fused A8 prefill route, derived from
+    // the scales at load (ops::linear_prepare_a8_rows). Null makes the route derive them per call.
     const void* row_scales = nullptr;
 };
 

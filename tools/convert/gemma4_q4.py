@@ -245,13 +245,23 @@ class Q4Options:
         if self.mtp_weights not in (None, "bf16") and not self.quantized:
             raise ValueError("--mtp-weights fp8|q4 applies only to the q4_g32 and q4_g32_a16 weights")
         if self.scale_bits is not None:
-            if not self.quantized or self.scale_search == "absmax" or regions or self.group_size != 32 or self.native_groups:
+            if not self.quantized or self.scale_search == "absmax" or regions or self.group_size != 32:
                 raise ValueError(
-                    "--scale-bits (emulated two-level scales) needs a q4 weight with --scale-search mse|weighted, "
-                    "--group-size 32, no --region-group and no --native-groups"
+                    "--scale-bits (two-level scales) needs a q4 weight with --scale-search mse|weighted, "
+                    "--group-size 32 and no --region-group"
                 )
             if not 4 <= self.scale_bits <= 8:
                 raise ValueError("--scale-bits must be 4..8")
+            if self.native_groups and self.scale_bits != 6:
+                raise ValueError(
+                    "--native-groups with --scale-bits stores the real two-level format, which exists only for "
+                    "--scale-bits 6; other values are emulated screening and take no --native-groups"
+                )
+
+    @property
+    def native_scale6(self) -> bool:
+        """True when the artifact stores the real two-level `q4_g32_s6_fp16` format."""
+        return self.scale_bits == 6 and self.native_groups
 
     @property
     def quantized(self) -> bool:
@@ -279,7 +289,8 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
 
     Every text-layer projection starts on the FP8 base; for the q4 weights each one is reassigned to
     its logical group's format and method. Emulated groups keep g32 storage (`q4_g32_fp16`) with the
-    coarse scale repeated; `native_groups` stores `q4_g128_fp16`/`q4_g256_fp16`. `q4_g32` additionally
+    coarse scale repeated; `native_groups` stores `q4_g128_fp16`/`q4_g256_fp16`, and together with
+    `scale_bits` 6 the real two-level `q4_g32_s6_fp16`. `q4_g32` additionally
     applies the W4A8 override. Weighted search registers per-column importance from the imatrix.
     """
     from tools.artifact.layouts import encoded_size
@@ -322,6 +333,8 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
             if options.native_groups and groups[name] == 64:
                 raise ValueError("--native-groups supports logical groups 32, 128 and 256 (no Gemma g64 kernels)")
             target = f"q4_g{groups[name]}_fp16" if options.native_groups else "q4_g32_fp16"
+            if options.native_scale6:
+                target = "q4_g32_s6_fp16"
             if options.scale_search != "absmax":
                 parameters = {"group_size": groups[name], "weighted": options.scale_search == "weighted"}
                 if options.scale_bits is not None:
@@ -369,7 +382,11 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
         name += "_native_groups" if options.native_groups else "_virtual_groups"
     if options.scale_search != "absmax":
         name = name.replace("absmax", options.scale_search + "_search")
-    if options.scale_bits is not None:
+    if options.native_scale6:
+        name += "_native_scale6"
+        scale_search["scale_bits"] = 6
+        scale_search["scale_storage"] = "q4_g32_s6_fp16 (real two-level format: one binary16 super scale and eight 6-bit multipliers per 256 columns)"
+    elif options.scale_bits is not None:
         name += f"_emulated_scale{options.scale_bits}"
         scale_search["scale_bits"] = options.scale_bits
     if mtp_weights != "bf16":
@@ -397,7 +414,10 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
         "tensors_by_group": {str(size): count for size, count in sorted(histogram.items())},
         "projected_real_weight_bytes": round(payload - saved),
         "projection_note": (
-            "weight_bytes is the real native size"
+            "weight_bytes is the real size: the artifact stores the real two-level q4_g32_s6_fp16 format "
+            "(one binary16 super scale and eight 6-bit multipliers per 256 columns)"
+            if options.native_scale6
+            else "weight_bytes is the real native size"
             if options.native_groups
             else "scale-plane bytes only; the artifact itself is physically g32"
         ),

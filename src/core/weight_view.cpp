@@ -131,6 +131,10 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
             out.group_size = 256;
             code_per_group = 128;
             break;
+        case QType::Q4_G32_S6_FP16:
+            out.group_size = 32;
+            code_per_group = 16;
+            break;
         case QType::Q5_G64_FP16:
             out.group_size = 64;
             high_per_group = 8;
@@ -148,11 +152,15 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         if ((format == QType::Q4_G128_FP16 || format == QType::Q4_G256_FP16) && k % out.group_size != 0) {
             throw std::invalid_argument("coarse-group q4 weight requires K divisible by its group size");
         }
+        if (format == QType::Q4_G32_S6_FP16 && aligned(k, 128) % 256 != 0) {
+            throw std::invalid_argument("q4_g32_s6 weight requires K padded to 128 to be a multiple of 256");
+        }
         out.padded_columns      = aligned(k, 128);
         const auto groups       = out.padded_columns / out.group_size;
         out.code_bytes_per_row  = mul(groups, code_per_group);
         out.high_bytes_per_row  = mul(groups, high_per_group);
-        out.scale_bytes_per_row = mul(groups, 2);
+        // Two-level scales: one 8-byte block per 256 columns, K / 32 bytes per row.
+        out.scale_bytes_per_row = format == QType::Q4_G32_S6_FP16 ? groups : mul(groups, 2);
         out.code_bytes          = mul(n, out.code_bytes_per_row);
         out.high_offset         = aligned(out.code_bytes, 256);
         out.high_bytes          = mul(n, out.high_bytes_per_row);
@@ -227,6 +235,10 @@ std::uint64_t weight_scale_offset(const WeightGeometry& geometry, std::uint64_t 
         const auto inner = row % 128;
         return geometry.scale_offset + (row / 128 * (geometry.shape[1] / 64) + group / 4) * 512 +
                inner % 32 * 16 + inner / 32 * 4 + group % 4;
+    }
+    if (geometry.format == QType::Q4_G32_S6_FP16) {
+        // Two-level scales: the 8-byte block that holds the group's multiplier.
+        return geometry.scale_offset + row * geometry.scale_bytes_per_row + group / 8 * 8;
     }
     return geometry.scale_offset + row * geometry.scale_bytes_per_row + group * 2;
 }
@@ -309,10 +321,18 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     out.weight_scale_divisor = region.parent->weight_scale_divisor;
     out.input_scale_divisor  = input_divisor;
     if (g.layout == QuantLayout::RowSplit) {
-        out.scale_dtype = DType::FP16;
-        out.scale_ne[0] = dimension(g.padded_columns / g.group_size);
-        out.scale_ne[1] = out.n;
-        out.scale_nb[0] = 2;
+        if (g.format == QType::Q4_G32_S6_FP16) {
+            // Byte plane of 8-byte blocks, K / 32 bytes per row.
+            out.scale_dtype = DType::U8;
+            out.scale_ne[0] = dimension(g.scale_bytes_per_row);
+            out.scale_ne[1] = out.n;
+            out.scale_nb[0] = 1;
+        } else {
+            out.scale_dtype = DType::FP16;
+            out.scale_ne[0] = dimension(g.padded_columns / g.group_size);
+            out.scale_ne[1] = out.n;
+            out.scale_nb[0] = 2;
+        }
         out.scale_nb[1] = static_cast<std::int64_t>(g.scale_bytes_per_row);
         out.scale_nb[2] = out.scale_nb[3] = out.scale_nb[1] * out.n;
     } else if (g.layout == QuantLayout::RowScale) {

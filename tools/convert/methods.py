@@ -32,6 +32,7 @@ from .quantization.groupwise import (
     quantize_q4_scale_search,
     quantize_q4_virtual_groups,
     to_native_groups,
+    to_native_scale6,
 )
 from .quantization.importance import importance_for
 from .quantization.nvfp4 import nvfp4_divisor, quantize_nvfp4_rows
@@ -213,6 +214,8 @@ def grouped_absmax(request: PrepareRequest) -> PreparedMethod:
         or len(request.target.shape) != 2
     ):
         raise ValueError("grouped_absmax requires a grouped-integer matrix target")
+    if request.target.format == Q4_G32_S6_NAME:
+        raise ValueError(f"{Q4_G32_S6_NAME} is produced by grouped_mse_search with scale_bits 6, not grouped_absmax")
     _preflight(request)
     n, k = request.target.shape
 
@@ -249,6 +252,9 @@ def q4_g32_qat(request: PrepareRequest) -> PreparedMethod:
             output.write_codes(begin, encoded.codes, encoded.scales)
 
     return request.job(produce=produce)
+
+
+Q4_G32_S6_NAME = "q4_g32_s6_fp16"
 
 
 def _q4_native_target(request: PrepareRequest, method: str, group_size: int) -> bool:
@@ -308,6 +314,10 @@ def grouped_mse_search(request: PrepareRequest) -> PreparedMethod:
     column's error by the imatrix importance registered for the parent's logical inputs. The
     unweighted arm sets every weight to 1 and changes nothing else. Quality-only like
     ``grouped_absmax_emulated`` when ``group_size`` > 32.
+
+    ``scale_bits`` (4..8, group 32) emulates two-level scales on ordinary q4_g32 words. With
+    ``scale_bits`` 6 and the target ``q4_g32_s6_fp16`` the same words are stored in the real
+    two-level format (one 8-byte block per 256 columns, decoded bit-identically).
     """
     if len(request.target.shape) != 2:
         raise ValueError("grouped_mse_search requires a rank-2 q4 matrix")
@@ -318,15 +328,20 @@ def grouped_mse_search(request: PrepareRequest) -> PreparedMethod:
         raise ValueError(
             f"grouped_mse_search requires parameters.group_size in {VIRTUAL_GROUP_SIZES}"
         )
-    native = _q4_native_target(request, "grouped_mse_search", group_size)
+    scale6 = request.target.format == Q4_G32_S6_NAME
+    if scale6 and (group_size != 32 or scale_bits != 6):
+        raise ValueError(
+            f"grouped_mse_search into {Q4_G32_S6_NAME} requires parameters.group_size 32 and scale_bits 6"
+        )
+    native = False if scale6 else _q4_native_target(request, "grouped_mse_search", group_size)
     if type(weighted) is not bool:
         raise ValueError("grouped_mse_search parameters.weighted must be a boolean")
     if scale_bits is not None and (
         type(scale_bits) is not int or not 4 <= scale_bits <= 8 or group_size != 32 or native
     ):
         raise ValueError(
-            "grouped_mse_search parameters.scale_bits is an emulated two-level scale (integer 4..8) "
-            "and needs group_size 32 stored as ordinary q4_g32 words"
+            "grouped_mse_search parameters.scale_bits is a two-level scale (integer 4..8) emulated on "
+            "ordinary q4_g32 words (scale_bits 6 may target q4_g32_s6_fp16) and needs group_size 32"
         )
     _preflight(request, allowed=("group_size", "weighted", "scale_bits"))
     n, k = request.target.shape
@@ -349,6 +364,8 @@ def grouped_mse_search(request: PrepareRequest) -> PreparedMethod:
             )
             if native:
                 encoded = to_native_groups(encoded, group_size)
+            elif scale6:
+                encoded = to_native_scale6(encoded, k)
             output.write_codes(begin, encoded.codes, encoded.scales)
 
     return request.job(produce=produce)

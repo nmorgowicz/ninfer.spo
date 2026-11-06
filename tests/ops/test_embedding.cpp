@@ -564,17 +564,42 @@ struct Q4Row {
     std::vector<std::uint8_t> scales;
 };
 
-// q4 fp16-scale RowSplit (g32 / g128 / g256): d/2 nibble bytes per row for every group size, then
-// the binary16 scale plane (d / G scales per row) at the next 256-byte boundary.
+// q4_g32_s6_fp16 scale block (the byte contract): per row and per 256 columns one 8-byte little-endian
+// word, binary16 super scale S in bits 0..15 and eight 6-bit multipliers m_j at bits 16 + 6j. The
+// group scale is binary16(S * m_j) rounded to nearest even. Written from the contract with this
+// file's own binary16 helpers.
+std::uint64_t load_u64_le(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+    std::uint64_t word = 0;
+    for (std::size_t i = 0; i < 8; ++i) word |= static_cast<std::uint64_t>(bytes[offset + i]) << (8 * i);
+    return word;
+}
+
+void store_u64_le(std::vector<std::uint8_t>& bytes, std::size_t offset, std::uint64_t word) {
+    for (std::size_t i = 0; i < 8; ++i) bytes[offset + i] = static_cast<std::uint8_t>(word >> (8 * i));
+}
+
+double s6_group_scale(std::uint64_t word, int j) {
+    const double super      = static_cast<double>(f16_to_f32(static_cast<std::uint16_t>(word & 0xffffu)));
+    const double multiplier = static_cast<double>((word >> (16 + 6 * j)) & 63u);
+    return static_cast<double>(f16_to_f32(f32_to_f16(static_cast<float>(super * multiplier))));
+}
+
+// q4 fp16 RowSplit (g32 / g128 / g256 / g32_s6): d/2 nibble bytes per row for every format, then the
+// scale plane at the next 256-byte boundary: binary16 scales (d / G per row) for the single-level
+// formats, one 8-byte block per 256 columns (d / 32 bytes per row) for q4_g32_s6.
 class Q4Table {
 public:
     Q4Table(std::int32_t vocab, std::int32_t d, QType qtype = QType::Q4_G32_FP16)
         : qtype_(qtype),
-          group_size_(qtype == QType::Q4_G32_FP16 ? 32 : qtype == QType::Q4_G128_FP16 ? 128 : 256),
-          vocab_(vocab), d_(d), groups_(d / 32), scale_groups_(d / group_size_),
+          group_size_(qtype == QType::Q4_G128_FP16 ? 128 : qtype == QType::Q4_G256_FP16 ? 256 : 32),
+          vocab_(vocab), d_(d), groups_(d / 32),
+          scale_row_bytes_(qtype == QType::Q4_G32_S6_FP16 ? static_cast<std::size_t>(d / 32)
+                                                          : static_cast<std::size_t>(d / group_size_) * 2),
           code_plane_bytes_(static_cast<std::size_t>(vocab) * groups_ * 16),
           scale_offset_(align_up(code_plane_bytes_, 256)),
-          payload_(scale_offset_ + static_cast<std::size_t>(vocab) * scale_groups_ * 2) {
+          payload_(scale_offset_ + static_cast<std::size_t>(vocab) * scale_row_bytes_) {
+        if (qtype == QType::Q4_G32_S6_FP16 && d % 256 != 0)
+            throw std::invalid_argument("Q4 S6 test table: d must be a multiple of 256");
         auto rows = dflash2_fixture_ids();
         rows.push_back(vocab - 1);
         for (const std::int32_t row : rows) {
@@ -587,7 +612,7 @@ public:
         Weight result{};
         result.qtype            = qtype_;
         result.layout           = QuantLayout::RowSplit;
-        result.scale_dtype      = DType::FP16;
+        result.scale_dtype      = qtype_ == QType::Q4_G32_S6_FP16 ? DType::U8 : DType::FP16;
         result.payload          = base;
         result.payload_bytes    = payload_.bytes();
         result.qdata            = base;
@@ -614,8 +639,12 @@ public:
             for (std::int32_t d = 0; d < d_; ++d) {
                 const int nibble = (row->codes[static_cast<std::size_t>(d / 2)] >> ((d & 1) * 4)) & 0xf;
                 const int code   = nibble >= 8 ? nibble - 16 : nibble;
-                const double scale = static_cast<double>(f16_to_f32(
-                    load_u16_le(row->scales, static_cast<std::size_t>(d / group_size_) * 2)));
+                const double scale =
+                    qtype_ == QType::Q4_G32_S6_FP16
+                        ? s6_group_scale(load_u64_le(row->scales, static_cast<std::size_t>(d / 256) * 8),
+                                         (d / 32) & 7)
+                        : static_cast<double>(f16_to_f32(
+                              load_u16_le(row->scales, static_cast<std::size_t>(d / group_size_) * 2)));
                 result[t * static_cast<std::size_t>(d_) + d] = static_cast<double>(code) * scale;
             }
         }
@@ -631,7 +660,7 @@ public:
             failures += verify_exact(label, got, row.codes);
             got.resize(row.scales.size());
             payload_.copy_to_host(got.data(), got.size(),
-                                  scale_offset_ + static_cast<std::size_t>(row.id) * scale_groups_ * 2);
+                                  scale_offset_ + static_cast<std::size_t>(row.id) * scale_row_bytes_);
             failures += verify_exact(label, got, row.scales);
         }
         return failures;
@@ -646,14 +675,30 @@ private:
 
     void add_row(std::int32_t id) {
         Q4Row row{id, std::vector<std::uint8_t>(static_cast<std::size_t>(groups_) * 16),
-                  std::vector<std::uint8_t>(static_cast<std::size_t>(scale_groups_) * 2)};
-        for (std::int32_t group = 0; group < scale_groups_; ++group) {
-            const std::uint16_t scale =
-                id == 0 && group == 0 ? std::uint16_t{0}
-                : id == 1 && group == 1
-                    ? std::uint16_t{1}
-                    : f32_to_f16(0.0031f + 0.00047f * static_cast<float>((id + group * 7) % 17));
-            store_u16_le(row.scales, static_cast<std::size_t>(group) * 2, scale);
+                  std::vector<std::uint8_t>(scale_row_bytes_)};
+        if (qtype_ == QType::Q4_G32_S6_FP16) {
+            // Edge rows: row 0 block 0 has multipliers 0 and 63, row 1 block 0 the smallest normal S.
+            for (std::int32_t block = 0; block < d_ / 256; ++block) {
+                std::uint16_t super =
+                    f32_to_f16(0.0031f + 0.00047f * static_cast<float>((id + block * 7) % 17));
+                std::uint64_t word = 0;
+                for (int j = 0; j < 8; ++j) {
+                    std::uint64_t multiplier = static_cast<std::uint64_t>((id * 5 + block * 3 + j * 11) % 64);
+                    if (id == 0 && block == 0) multiplier = j == 0 ? 0 : j == 1 ? 63 : static_cast<std::uint64_t>(j * 9 % 64);
+                    word |= multiplier << (16 + 6 * j);
+                }
+                if (id == 1 && block == 0) super = 0x0400;
+                store_u64_le(row.scales, static_cast<std::size_t>(block) * 8, word | super);
+            }
+        } else {
+            for (std::int32_t group = 0; group < d_ / group_size_; ++group) {
+                const std::uint16_t scale =
+                    id == 0 && group == 0 ? std::uint16_t{0}
+                    : id == 1 && group == 1
+                        ? std::uint16_t{1}
+                        : f32_to_f16(0.0031f + 0.00047f * static_cast<float>((id + group * 7) % 17));
+                store_u16_le(row.scales, static_cast<std::size_t>(group) * 2, scale);
+            }
         }
         for (std::int32_t group = 0; group < groups_; ++group) {
             for (std::int32_t lane = 0; lane < 32; ++lane) {
@@ -668,7 +713,7 @@ private:
         payload_.copy_from_host(row.codes.data(), row.codes.size(),
                                 static_cast<std::size_t>(id) * groups_ * 16);
         payload_.copy_from_host(row.scales.data(), row.scales.size(),
-                                scale_offset_ + static_cast<std::size_t>(id) * scale_groups_ * 2);
+                                scale_offset_ + static_cast<std::size_t>(id) * scale_row_bytes_);
         rows_.push_back(std::move(row));
     }
 
@@ -677,7 +722,7 @@ private:
     std::int32_t vocab_;
     std::int32_t d_;
     std::int32_t groups_;
-    std::int32_t scale_groups_;
+    std::size_t scale_row_bytes_;
     std::size_t code_plane_bytes_;
     std::size_t scale_offset_;
     GuardedDeviceBuffer payload_;
@@ -874,7 +919,7 @@ int test_q4(QType qtype, const char* name) {
         } catch (const std::invalid_argument&) {}
     }
     // The group size recorded on the weight must match its qtype.
-    if (qtype != QType::Q4_G32_FP16) {
+    if (qtype != QType::Q4_G32_FP16 && qtype != QType::Q4_G32_S6_FP16) {
         GuardedDeviceBuffer device_ids(sizeof(std::int32_t));
         GuardedDeviceBuffer output(static_cast<std::size_t>(5376) * 2);
         Tensor input(device_ids.data(), DType::I32, {1});
@@ -888,6 +933,50 @@ int test_q4(QType qtype, const char* name) {
             ++failures;
         } catch (const std::invalid_argument&) {}
     }
+    if (qtype == QType::Q4_G32_S6_FP16) {
+        GuardedDeviceBuffer device_ids(sizeof(std::int32_t));
+        GuardedDeviceBuffer output(static_cast<std::size_t>(5376) * 2);
+        Tensor input(device_ids.data(), DType::I32, {1});
+        Tensor result(output.data(), DType::BF16, {5376, 1});
+        // A coarse group size on a two-level weight is refused.
+        Weight coarse_group = gemma.weight();
+        coarse_group.group_size = 128;
+        coarse_group.group      = 128;
+        try {
+            ops::embedding(input, coarse_group, result, nullptr);
+            std::cerr << "embedding accepted an S6 table with a g128 group size\n";
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+        // D whose padded value is not a multiple of 256 (K = 384 pads to 384) is refused, whatever
+        // payload it brings.
+        constexpr std::int32_t kBadRows = 64, kBadD = 384;
+        GuardedDeviceBuffer bad_payload(static_cast<std::size_t>(1) << 15);
+        auto* base = static_cast<std::uint8_t*>(bad_payload.data());
+        Weight bad{};
+        bad.qtype           = QType::Q4_G32_S6_FP16;
+        bad.layout          = QuantLayout::RowSplit;
+        bad.scale_dtype     = DType::U8;
+        bad.payload         = base;
+        bad.payload_bytes   = bad_payload.bytes();
+        bad.qdata           = base;
+        bad.scales          = base + align_up(static_cast<std::size_t>(kBadRows) * kBadD / 2, 256);
+        bad.group_size      = 32;
+        bad.group           = 32;
+        bad.ndim            = 2;
+        bad.shape[0]        = kBadRows;
+        bad.shape[1]        = kBadD;
+        bad.padded_shape[0] = kBadRows;
+        bad.padded_shape[1] = kBadD;
+        bad.n               = kBadRows;
+        bad.k               = kBadD;
+        GuardedDeviceBuffer bad_output(static_cast<std::size_t>(kBadD) * 2);
+        Tensor bad_result(bad_output.data(), DType::BF16, {kBadD, 1});
+        try {
+            ops::embedding(input, bad, bad_result, nullptr);
+            std::cerr << "embedding accepted an S6 table whose padded D is not a multiple of 256\n";
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    }
     return failures;
 }
 
@@ -895,6 +984,7 @@ int test_q4_all() {
     int failures = test_q4(QType::Q4_G32_FP16, "Q4_G32");
     failures += test_q4(QType::Q4_G128_FP16, "Q4_G128");
     failures += test_q4(QType::Q4_G256_FP16, "Q4_G256");
+    failures += test_q4(QType::Q4_G32_S6_FP16, "Q4_G32_S6");
     return failures;
 }
 

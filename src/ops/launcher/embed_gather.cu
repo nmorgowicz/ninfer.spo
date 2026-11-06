@@ -159,8 +159,8 @@ void embed_gather_q4_launch(const Tensor& ids, const Weight& table, float factor
     const std::int32_t d = out.ne[0];
     const std::int32_t T = ids.ne[0];
     const std::int64_t n = div_up(static_cast<std::int64_t>(d), std::int64_t{32}) * T;
-    const auto launch    = [&]<int kScaleShift>() {
-        embed_gather_q4_kernel<kScaleShift><<<grid_for(n), kBlock, 0, stream>>>(
+    const auto launch    = [&]<int kScaleMode>() {
+        embed_gather_q4_kernel<kScaleMode><<<grid_for(n), kBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(ids.data),
             static_cast<const std::uint8_t*>(table.qdata),
             static_cast<const std::uint8_t*>(table.scales), bf16_factor(factor),
@@ -170,6 +170,7 @@ void embed_gather_q4_launch(const Tensor& ids, const Weight& table, float factor
     case QType::Q4_G32_FP16: launch.template operator()<0>(); break;
     case QType::Q4_G128_FP16: launch.template operator()<2>(); break;
     case QType::Q4_G256_FP16: launch.template operator()<3>(); break;
+    case QType::Q4_G32_S6_FP16: launch.template operator()<kQ4ScaleS6>(); break;
     default: throw std::invalid_argument("embed_gather: not a q4 fp16 table");
     }
     CUDA_CHECK(cudaGetLastError());

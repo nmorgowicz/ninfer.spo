@@ -1,6 +1,7 @@
 #include "ops/linear/q4/q4_g32_tc.cuh"
 
 #include "core/device.h"
+#include "ops/common/q4_scale_mode.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
@@ -34,13 +35,16 @@ __device__ __forceinline__ unsigned q4_byte_to_bf16x2(unsigned packed) {
 // is applied in FP32 after that group's two m16n8k16 steps, then the warps reduce their K
 // partials.
 //
-// kScaleShift is log2(G / 32): 0 for q4_g32 (one scale per 32 K, 16-byte staged), 2 for g128 and
-// 3 for g256 (one scale per 128 / 256 K). A coarse scale row is K >> (4 + shift) bytes, so its
+// kScaleMode (q4_scale_mode.h): 0 for q4_g32 (one scale per 32 K, 16-byte staged), 2 for g128 and
+// 3 for g256 (one scale per 128 / 256 K). A coarse scale row is K >> (4 + mode) bytes, so its
 // stride is not 16-byte aligned (84 B at K = 5376 / g128, 42 B at g256), and a 256-K stage owns
 // only 1 or 2 scales of a row. The stage therefore copies the one aligned 4-byte word that holds
 // them (cp.async zero-filled past the plane end) and the MMA loop picks the halfword by the
-// scale's element parity. The per-32-K MMA / FP32 scale structure is the same for every shift.
-template <int kRowBlocks, int kWarps, int kStages, int kScaleShift>
+// scale's element parity. kQ4ScaleS6 (q4_g32_s6) stages the stage's 1 or 2 whole 8-byte blocks
+// per row (a row is K / 32 bytes: 8-byte aligned, not 16-byte aligned) with one 8-byte cp.async
+// each, zero-filled past K, and the MMA loop decodes the warp's two group scales from the staged
+// block. The per-32-K MMA / FP32 scale structure is the same for every mode.
+template <int kRowBlocks, int kWarps, int kStages, int kScaleMode>
 __global__ void __launch_bounds__(kWarps * 32, 2)
     q4g32_tc8_kernel(const __nv_bfloat16* __restrict__ x,
                                  const std::uint8_t* __restrict__ codes,
@@ -55,15 +59,17 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
     constexpr int kBytesPerRow    = kGroupsPerStage * 16;
     constexpr int kCodeBytes      = kRows * kBytesPerRow;
     constexpr int kActBytes = kWarps * kTileTokens * kTileK * static_cast<int>(sizeof(__nv_bfloat16));
-    constexpr int kScaleStageElems = kGroupsPerStage >> kScaleShift; // coarse scales a stage spans
-    constexpr int kScaleRowBytes   = kScaleShift == 0 ? kGroupsPerStage * 2 : 4;
+    constexpr bool kS6             = kScaleMode == kQ4ScaleS6;
+    constexpr int kScaleStageElems = kGroupsPerStage >> (kS6 ? 0 : kScaleMode); // coarse scales a stage spans
+    constexpr int kScaleRowBytes   = kScaleMode == 0 ? kGroupsPerStage * 2 : (kS6 ? kGroupsPerStage : 4);
     constexpr int kScaleBytes    = kRows * kScaleRowBytes;
     constexpr int kStageBytes    = kCodeBytes + kActBytes + kScaleBytes;
     constexpr int kSharedBytes = kStages * kStageBytes;
     static_assert(kRows % kWarps == 0);
     static_assert(kGroupsPerStage == 8 || kGroupsPerStage == 16);
-    static_assert(kScaleShift == 0 || (kGroupsPerStage % (1 << kScaleShift) == 0 && kScaleStageElems <= 2),
+    static_assert(kScaleMode == 0 || kS6 || (kGroupsPerStage % (1 << kScaleMode) == 0 && kScaleStageElems <= 2),
                   "a coarse stage must fit its scales in one aligned 4-byte word");
+    static_assert(!kS6 || kGroupsPerStage % kQ4S6GroupsPerBlock == 0, "an S6 stage covers whole blocks");
     extern __shared__ __align__(16) unsigned char smem[];
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -71,7 +77,8 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
     const int lid  = lane & 3;
     const int row0 = static_cast<int>(blockIdx.x) * kRows;
     const int n_groups = k >> 5;
-    const int n_scales = k >> (5 + kScaleShift);
+    // Scale units per row: coarse scales, or 8-byte blocks for kQ4ScaleS6.
+    const int n_scales = k >> (5 + (kS6 ? 3 : kScaleMode));
     const int b_row      = lane & 7;
     const int b_k_offset = ((lane >> 3) & 1) << 3;
 
@@ -96,7 +103,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
                 codes + (static_cast<long long>(row0 + row) * n_groups + group0 + group) * 16);
         }
         auto* scale_smem = stage_bytes(stage) + kCodeBytes + kActBytes;
-        if constexpr (kScaleShift == 0) {
+        if constexpr (kScaleMode == 0) {
             // The stage's group scales of one row are contiguous: 16 or 32 bytes, 16-byte aligned
             // because every trunk K is a multiple of 256.
             for (int item = lane; item < kRowsPerWarp * (kScaleRowBytes / 16); item += 32) {
@@ -106,6 +113,21 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
                 cp_async<16, Cache::cg>(
                     scale_smem + row * kScaleRowBytes + chunk * 16,
                     scales + (static_cast<long long>(row0 + row) * n_groups + group0) * 2 + chunk * 16);
+            }
+        } else if constexpr (kS6) {
+            // The stage's whole blocks of one row are consecutive 8-byte words of the plane, row
+            // stride n_groups bytes. A block at or past K is zero-filled instead of read.
+            constexpr int kBlocks = kGroupsPerStage / kQ4S6GroupsPerBlock;
+            const int block0      = group0 / kQ4S6GroupsPerBlock;
+            for (int item = lane; item < kRowsPerWarp * kBlocks; item += 32) {
+                const int local_row = item / kBlocks;
+                const int block     = item - local_row * kBlocks;
+                const int row       = warp * kRowsPerWarp + local_row;
+                const bool live     = block0 + block < n_scales;
+                const long long byte =
+                    live ? (static_cast<long long>(row0 + row) * n_scales + block0 + block) * kQ4S6BlockBytes : 0;
+                cp_async_zfill<8, Cache::ca>(scale_smem + row * kScaleRowBytes + block * kQ4S6BlockBytes,
+                                             scales + byte, live ? kQ4S6BlockBytes : 0);
             }
         } else {
             // One aligned 4-byte word per row holds the stage's 1 or 2 coarse scales. The word
@@ -157,7 +179,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
         const auto* scale_smem   = stage_scales(stage);
         float scale_top[kRowBlocks][2];
         float scale_bot[kRowBlocks][2];
-        if constexpr (kScaleShift == 0) {
+        if constexpr (kScaleMode == 0) {
 #pragma unroll
             for (int rb = 0; rb < kRowBlocks; ++rb) {
                 const int top = rb * 16 + gid;
@@ -168,11 +190,28 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
                     scale_bot[rb][which] = __half2float(scale_smem[(top + 8) * kGroupsPerStage + g]);
                 }
             }
+        } else if constexpr (kS6) {
+            // This warp's groups 2w and 2w + 1 of the stage share block (2w) >> 3 of each row, fields
+            // (2w) & 7 and ((2w) & 7) + 1. Rows of the stage are kBlocks 8-byte words apart.
+            constexpr int kBlocks = kGroupsPerStage / kQ4S6GroupsPerBlock;
+            const auto* blocks    = reinterpret_cast<const unsigned long long*>(scale_smem);
+            const int block_slot  = (warp * 2) / kQ4S6GroupsPerBlock;
+            const int field       = (warp * 2) % kQ4S6GroupsPerBlock;
+#pragma unroll
+            for (int rb = 0; rb < kRowBlocks; ++rb) {
+                const int top                 = rb * 16 + gid;
+                const unsigned long long top_block = blocks[top * kBlocks + block_slot];
+                const unsigned long long bot_block = blocks[(top + 8) * kBlocks + block_slot];
+                scale_top[rb][0] = q4_s6_scale(top_block, field);
+                scale_top[rb][1] = q4_s6_scale(top_block, field + 1);
+                scale_bot[rb][0] = q4_s6_scale(bot_block, field);
+                scale_bot[rb][1] = q4_s6_scale(bot_block, field + 1);
+            }
         } else {
             // Both 32-K groups of this warp sit in one coarse group. The stage word of a row holds
             // scale elements 2w and 2w + 1 of the plane, element e = row * n_scales + scale index.
             const auto* scale_words = reinterpret_cast<const unsigned*>(scale_smem);
-            const unsigned first    = static_cast<unsigned>(group * kScaleStageElems + ((warp * 2) >> kScaleShift));
+            const unsigned first    = static_cast<unsigned>(group * kScaleStageElems + ((warp * 2) >> kScaleMode));
             const auto scale_of     = [&](int local_row) {
                 const unsigned element = static_cast<unsigned>(row0 + local_row) * static_cast<unsigned>(n_scales) + first;
                 const unsigned bits    = (scale_words[local_row] >> ((element & 1u) * 16u)) & 0xffffu;
@@ -267,33 +306,36 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
 } // namespace
 
 void q4_g32_tc8(const Q4LinearOperands& operands, __nv_bfloat16* out, cudaStream_t stream,
-                int scale_shift) {
-    auto launch_staged = [&](auto row_blocks, auto warps, auto stages, auto shift) {
+                int scale_mode) {
+    auto launch_staged = [&](auto row_blocks, auto warps, auto stages, auto mode) {
         constexpr int kRowBlocks  = decltype(row_blocks)::value;
         constexpr int kWarps      = decltype(warps)::value;
         constexpr int kStages     = decltype(stages)::value;
-        constexpr int kScaleShift = decltype(shift)::value;
+        constexpr int kScaleMode  = decltype(mode)::value;
         constexpr int kRows       = 16 * kRowBlocks;
         constexpr int kGroupK     = kWarps * 64;
-        constexpr int kScaleRow   = kScaleShift == 0 ? (kGroupK / 32) * 2 : 4;
+        constexpr int kScaleRow   = kScaleMode == 0 ? (kGroupK / 32) * 2 : (kScaleMode == kQ4ScaleS6 ? kGroupK / 32 : 4);
         constexpr int kShared = kStages * (kRows * ((kGroupK / 32) * 16 + kScaleRow) + kWarps * 8 * 64 * 2);
         static const cudaError_t attribute =
-            cudaFuncSetAttribute(q4g32_tc8_kernel<kRowBlocks, kWarps, kStages, kScaleShift>,
+            cudaFuncSetAttribute(q4g32_tc8_kernel<kRowBlocks, kWarps, kStages, kScaleMode>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
         CUDA_CHECK(attribute);
         const dim3 block(kWarps * 32);
         const dim3 grid(operands.rows / kRows);
-        q4g32_tc8_kernel<kRowBlocks, kWarps, kStages, kScaleShift><<<grid, block, kShared, stream>>>(
+        q4g32_tc8_kernel<kRowBlocks, kWarps, kStages, kScaleMode><<<grid, block, kShared, stream>>>(
             operands.x, operands.codes, operands.scales, out, operands.rows, operands.k, operands.tokens);
     };
     // Three stages measured best on the cold-L2 sweep of 2, 3, 4 and 6 at T=7.
     auto launch = [&](auto row_blocks, auto warps) {
         constexpr auto stages = std::integral_constant<int, 3>{};
-        switch (scale_shift) {
+        switch (scale_mode) {
         case 0: launch_staged(row_blocks, warps, stages, std::integral_constant<int, 0>{}); break;
         case 2: launch_staged(row_blocks, warps, stages, std::integral_constant<int, 2>{}); break;
         case 3: launch_staged(row_blocks, warps, stages, std::integral_constant<int, 3>{}); break;
-        default: throw std::invalid_argument("q4 tensor-core GEMV: unsupported scale group size");
+        case kQ4ScaleS6:
+            launch_staged(row_blocks, warps, stages, std::integral_constant<int, kQ4ScaleS6>{});
+            break;
+        default: throw std::invalid_argument("q4 tensor-core GEMV: unsupported scale mode");
         }
     };
     // 16384 rows wants 32 per CTA. Wider outputs keep 64 so one activation tile

@@ -15,6 +15,7 @@ constexpr std::array kFormats = {
     std::pair{QType::Q4_G32_FP16, std::string_view{"q4_g32_fp16"}},
     std::pair{QType::Q4_G128_FP16, std::string_view{"q4_g128_fp16"}},
     std::pair{QType::Q4_G256_FP16, std::string_view{"q4_g256_fp16"}},
+    std::pair{QType::Q4_G32_S6_FP16, std::string_view{"q4_g32_s6_fp16"}},
     std::pair{QType::Q5_G64_FP16, std::string_view{"q5_g64_fp16"}},
     std::pair{QType::Q6_G64_FP16, std::string_view{"q6_g64_fp16"}},
     std::pair{QType::Q8_G32_FP16, std::string_view{"q8_g32_fp16"}},

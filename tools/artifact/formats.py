@@ -19,13 +19,19 @@ class DirectFormat:
 
 @dataclass(frozen=True, slots=True)
 class QuantFormat:
-    """Signed grouped codes with one binary16 multiplier per group."""
+    """Signed grouped codes with one binary16 multiplier per group.
+
+    ``two_level_scale`` selects the S6 scale plane: per row and per 256 columns one 8-byte block holding
+    a binary16 super scale and eight 6-bit multipliers (see ``codecs/scale_s6.py``). The group scale is
+    ``fp16(float(S) * m)``; the code planes are those of the ordinary group-32 format.
+    """
 
     name: str
     bits: int
     group_size: int
     qmin: int
     qmax: int
+    two_level_scale: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +60,7 @@ Q4_G64_FP16 = QuantFormat("q4_g64_fp16", 4, 64, -8, 7)
 Q4_G32_FP16 = QuantFormat("q4_g32_fp16", 4, 32, -8, 7)
 Q4_G128_FP16 = QuantFormat("q4_g128_fp16", 4, 128, -8, 7)
 Q4_G256_FP16 = QuantFormat("q4_g256_fp16", 4, 256, -8, 7)
+Q4_G32_S6_FP16 = QuantFormat("q4_g32_s6_fp16", 4, 32, -8, 7, two_level_scale=True)
 Q5_G64_FP16 = QuantFormat("q5_g64_fp16", 5, 64, -16, 15)
 Q6_G64_FP16 = QuantFormat("q6_g64_fp16", 6, 64, -32, 31)
 Q8_G32_FP16 = QuantFormat("q8_g32_fp16", 8, 32, -127, 127)
@@ -70,6 +77,7 @@ QUANT_FORMATS = MappingProxyType(
             Q4_G32_FP16,
             Q4_G128_FP16,
             Q4_G256_FP16,
+            Q4_G32_S6_FP16,
             Q5_G64_FP16,
             Q6_G64_FP16,
             Q8_G32_FP16,
@@ -159,6 +167,7 @@ __all__ = [
     "Q4_G32_FP16",
     "Q4_G128_FP16",
     "Q4_G256_FP16",
+    "Q4_G32_S6_FP16",
     "Q5_G64_FP16",
     "Q6_G64_FP16",
     "Q8_G32_FP16",
