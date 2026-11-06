@@ -222,7 +222,7 @@ class Q4Options:
     scale_search: str = "absmax"
     native_groups: bool = False
     imatrix: Path | None = None
-    mtp_weights: str = "bf16"
+    mtp_weights: str | None = None
     scale_bits: int | None = None
 
     def __post_init__(self):
@@ -240,9 +240,9 @@ class Q4Options:
             raise ValueError(
                 "--group-size/--region-group/--native-groups apply only to the q4_g32 and q4_g32_a16 weights"
             )
-        if self.mtp_weights not in MTP_WEIGHTS:
+        if self.mtp_weights is not None and self.mtp_weights not in MTP_WEIGHTS:
             raise ValueError(f"--mtp-weights must be one of {MTP_WEIGHTS}, got {self.mtp_weights!r}")
-        if self.mtp_weights != "bf16" and not self.quantized:
+        if self.mtp_weights not in (None, "bf16") and not self.quantized:
             raise ValueError("--mtp-weights fp8|q4 applies only to the q4_g32 and q4_g32_a16 weights")
         if self.scale_bits is not None:
             if not self.quantized or self.scale_search == "absmax" or regions or self.group_size != 32 or self.native_groups:
@@ -343,15 +343,18 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
                     method="grouped_absmax_emulated",
                     parameters={"group_size": groups[name]},
                 )
-    if options.mtp_weights != "bf16":
-        if "mtp" not in model.components:
-            raise ValueError("--mtp-weights fp8|q4 needs the mtp component; pass --mtp-assistant")
+    mtp_weights = options.mtp_weights or ("fp8" if options.quantized else "bf16")
+    if "mtp" not in model.components:
+        if options.mtp_weights is not None:
+            raise ValueError("--mtp-weights needs the mtp component; pass --mtp-assistant")
+        mtp_weights = "bf16"
+    if mtp_weights != "bf16":
         # The assistant's layer projections are BF16 in the FP8 base. They keep A16Only (the assistant has no
         # A8 permission); the outer projections and the FP8 head are left alone.
         for name, parameter in model.parameters.items():
             if not name.startswith("mtp/layers/") or not parameter.projection:
                 continue
-            if options.mtp_weights == "fp8":
+            if mtp_weights == "fp8":
                 recipe.assign(name, format=FP8, method=fp8_row_maxabs)
             else:
                 recipe.assign(name, format="q4_g32_fp16", layout="auto", method="grouped_absmax")
@@ -369,8 +372,8 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
     if options.scale_bits is not None:
         name += f"_emulated_scale{options.scale_bits}"
         scale_search["scale_bits"] = options.scale_bits
-    if options.mtp_weights != "bf16":
-        name += "_mtp_" + options.mtp_weights
+    if mtp_weights != "bf16":
+        name += "_mtp_" + mtp_weights
     prepared = recipe.prepare(device=device, rows_per_chunk=rows_per_chunk)
     payload = sum(encoded_size(job.spec.layout, job.spec.format, job.spec.shape) for job in prepared.weights)
     # Emulated groups keep g32 storage; a real coarse format would drop (G-32)/G of the scale bytes.

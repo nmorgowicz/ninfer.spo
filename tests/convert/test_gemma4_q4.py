@@ -518,12 +518,25 @@ def test_mtp_weights_change_only_the_assistant_layer_projections(mode, layer_for
 
 
 def test_mtp_weights_leave_the_text_recipe_identical():
-    model, plain = mtp_build()
+    model, plain = mtp_build(mtp_weights="bf16")
     _, fp8 = mtp_build(mtp_weights="fp8")
     for name in projections(model):
         a, b = selection(plain, name), selection(fp8, name)
         assert (a.format, a.method, a.parameters) == (b.format, b.method, b.parameters)
     assert plain.payload > fp8.payload
+
+
+def test_fp8_is_the_default_when_the_assistant_is_present_and_nothing_changes_without_it():
+    model, default = mtp_build()
+    layer = "mtp/layers/0/mlp/gate"
+    assert selection(default, layer).format == "fp8_e4m3fn_row_bf16"
+    assert default.name.endswith("_mtp_fp8")
+    # No assistant: the default is silently inert (the recipe name and payload are the plain ones).
+    _, _, no_mtp = build(Q4Options(weights="q4_g32"))
+    assert "_mtp_" not in no_mtp.name
+    # The reference recipe never touches the assistant by default.
+    model, reference = mtp_model()[0], build_recipe(mtp_model()[0], None, Q4Options(weights="fp8_row"), device="cpu", rows_per_chunk=512)
+    assert "_mtp_" not in reference.name and selection(reference, layer).format == "bf16"
 
 
 def test_mtp_weights_need_the_assistant_and_a_q4_recipe():

@@ -102,8 +102,8 @@ def check_convert_arguments(args: argparse.Namespace) -> tuple[Q4Options, Path]:
         raise ValueError("Output must be outside the source checkpoint")
     if args.no_mtp == (args.mtp_assistant is not None):
         raise ValueError(f"Pass --mtp-assistant <dir> ({ASSISTANT_HINT}) or explicitly --no-mtp")
-    if args.no_mtp and args.mtp_weights != "bf16":
-        raise ValueError("--mtp-weights fp8|q4 needs the MTP assistant; it cannot be combined with --no-mtp")
+    if args.no_mtp and args.mtp_weights is not None:
+        raise ValueError("--mtp-weights needs the MTP assistant; it cannot be combined with --no-mtp")
     options = options_from(args)
     if args.mtp_assistant is not None:
         check_assistant(args.mtp_assistant)
@@ -336,11 +336,11 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument(
         "--mtp-weights",
         choices=MTP_WEIGHTS,
-        default="bf16",
-        help="Storage of the MTP assistant's layer projections (query, output, gate, up, down): bf16 (default, "
-        "unchanged), fp8 (FP8 per-row) or q4 (q4_g32, absmax). They always run on 16-bit activations; the "
-        "assistant's FP8 head and outer projections are unchanged. Draft quality, not target output, is at risk: "
-        "measure MTP acceptance before shipping",
+        default=None,
+        help="Storage of the MTP assistant's layer projections (query, output, gate, up, down): fp8 (FP8 per-row; "
+        "the default for the q4 weights), bf16 (the old layout, 184 MB larger) or q4 (q4_g32; 81 MB smaller than "
+        "fp8 but about 1 point lower draft acceptance). They run on 16-bit activations; the assistant's FP8 head and "
+        "outer projections are unchanged. Draft quality, not target output, is at risk",
     )
     build.add_argument(
         "--scale-bits",

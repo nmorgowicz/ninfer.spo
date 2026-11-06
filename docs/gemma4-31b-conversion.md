@@ -166,7 +166,7 @@ What the options mean:
 | `--group-size 32\|64\|128\|256` | Weights per scale. With `--native-groups` 128/256 are stored in real `q4_g128_fp16`/`q4_g256_fp16`; without it the scales are repeated so the file stays 4.5 bits per weight (only useful for measuring). 64 has no Gemma kernel. |
 | `--region-group REGION=G` | Per-region group size, for example `mlp_gate_up=256`. First match wins. Regions: `mlp_gate_up`, `mlp_down`, `attn_qkv`, `attn_out`, `global_layers`, `first4_layers`, `last4_layers`. |
 | `--text-only` | Leave out the vision tower. |
-| `--mtp-weights bf16\|fp8\|q4` | How the MTP assistant's layer projections are stored (default `bf16`, unchanged). See the MTP note below. |
+| `--mtp-weights fp8\|bf16\|q4` | How the MTP assistant's layer projections are stored (default `fp8` for the q4 weights). See the MTP note below. |
 | `--scale-bits 4..8` | **Experimental, measurement only.** Emulates two-level scales (a small integer multiplier per 32 weights plus one FP16 scale per 256) on ordinary g32 words, so the file does not shrink and no kernel reads that layout yet. On the author's model 8- and 6-bit multipliers scored the same KL as FP16 scales (0.150) and 5-bit about 0.003 worse, so a real format would save about 0.7 to 1.1 GB at g32 quality. Needs `--scale-search mse\|weighted` and `--group-size 32`. |
 
 `--region-group` is for experimenters. With uncalibrated scales, making a region coarse cost least in `mlp_gate_up`
@@ -177,13 +177,13 @@ as in section 6; every row in section 2 is a uniform group size.
 
 **MTP assistant storage.** The assistant's output head is always FP8 and its two outer projections stay BF16 (loaded
 as FP8). `--mtp-weights` changes only the 20 layer projections (query, output, gate, up, down in 4 layers), which
-are BF16 by default. On the calibrated g256 file, eight fixed greedy prompts, three rounds each, FP8 KV, 131,072
+default to FP8 and were BF16 before. On the calibrated g256 file, eight fixed greedy prompts, three rounds each, FP8 KV, 131,072
 context:
 
 | `--mtp-weights` | File | Draft acceptance | tok/s | Greedy text vs bf16 |
 |---|---|---|---|---|
-| `bf16` (default) | 16.99 GB | 30.0% | 165.1 | reference |
-| `fp8` | 16.80 GB (-0.18 GB) | 30.0% | 164.6 | 8 of 8 identical |
+| `bf16` (old layout) | 16.99 GB | 30.0% | 165.1 | reference |
+| **`fp8` (default)** | 16.80 GB (-0.18 GB) | 30.0% | 164.6 | 8 of 8 identical |
 | `q4` | 16.72 GB (-0.27 GB) | 28.8% | 163.6 | 8 of 8 identical |
 
 `fp8` is free on this test: identical acceptance and output, and the file is 184 MB smaller. `q4` saves another 81 MB
