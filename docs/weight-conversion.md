@@ -184,6 +184,7 @@ The converter currently writes these formats:
 | `bf16`, `fp32`, `int32` | `cast_direct` | Direct words through the source reader |
 | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax` | Supply a custom method/source if needed |
 | `q4_g32_fp16` | `q4_g32_qat` | Recovers the scale already stored in a QAT matrix. `grouped_absmax` is also legal and requantizes |
+| `q4_g128_fp16`, `q4_g256_fp16` | `grouped_absmax_emulated`, `grouped_mse_search` (parameter `group_size` equal to the format's group; `weighted` optional) | Native coarse groups; the same methods with `group_size` 64/128/256 into `q4_g32_fp16` emulate them with repeated scales, for quality measurement only |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
 | `nvfp4` | Supply a custom quantizer | `import_encoded` |
 
