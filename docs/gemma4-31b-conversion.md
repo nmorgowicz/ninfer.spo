@@ -7,48 +7,77 @@ option costs and gives, so you can choose before spending an afternoon on it, th
 Everything here runs from this repository. Nothing needs a second checkout except two external steps that are
 marked: collecting calibration statistics (llama.cpp) and, optionally, the quality check's reference artifact.
 
-## 1. What you get
+## 1. Which execution route: use W4A8
+
+A 4-bit file can be run two ways, and the recipe decides which:
+
+- **W4A8** (`--weights q4_g32`, the default): weights are 4-bit, and prefill (reading the prompt) rounds
+  activations to FP8 so it can use the FP8 tensor cores. Decode (one token at a time) uses 16-bit activations
+  either way. This is what you serve.
+- **A16** (`--weights q4_g32_a16`): the same 4-bit weights with no FP8 permission anywhere. It exists to measure
+  what the weights alone cost, and as a fallback if W4A8 misbehaves.
+
+Use W4A8. On the same 4-bit weights it costs 0.002 to 0.007 KL more than A16 (resolved at g32, +0.007; not
+resolved at g128 or g256, whose intervals include zero) and prefills about seven times faster: the quality-scoring run (context 512, 128-token chunks) went at
+440 to 490 tokens/s with W4A8 against 62 to 71 tokens/s with A16. That gap is why a 100,000-token prompt
+is practical at all. Every quality number below is therefore W4A8, measured with `NINFER_Q4_EXACT=1`
+(section 6). The A16 column is there only to show the A8 cost.
+
+## 2. What you get
 
 All figures were measured on one model: ReadyArt's Wicked-Stuff-31B-Final with a small neuron edit (a
-fine-tune of Gemma 4 31B), text only, on an RTX 5090. Quality is the mean KL divergence from a near-lossless
-reference (`fp8_row`, an FP8 row-scaled artifact that is within 0.034 nats of BF16 on every domain) over 13,728
-English positions at context 512, with the chat prefix the fork's perplexity tool uses. Lower is better. PPL is
-perplexity on the same positions, and the reference itself scores 11.277. W4A8 is the serving route (prefill
-uses FP8 activations); the A16 rows are weight-only.
+fine-tune of Gemma 4 31B), text only, on an RTX 5090, with FP8 global KV. The instrument is the mean KL
+divergence from a near-lossless reference (`fp8_row`, an FP8 row-scaled artifact within 0.034 nats of BF16 on
+every domain) over 13,728 English positions at context 512, with the chat prefix the fork's perplexity tool
+uses. Lower is better. The reference scores PPL 11.277 on the same positions. Every row was scored on the
+identical windows, so differences between rows are paired.
 
-| Recipe | Command flags (besides `--model/--out`) | File, text only / with MTP | KL | ΔNLL | PPL |
-|---|---|---|---|---|---|
-| Reference, never ship | `--weights fp8_row` | 30.7 GB / n.a. | 0 | 0 | 11.277 |
-| g32 absmax (the old default) | `--weights q4_g32` | 17.9 GB / 18.6 GB | 0.265 | +0.149 | 13.087 |
-| **g32 calibrated** | `--weights q4_g32 --scale-search weighted --imatrix F` | 17.9 GB / 18.6 GB | **0.157** | **+0.061** | **11.982** |
-| g128 calibrated (A16 numbers) | `... --group-size 128 --native-groups` | 16.5 GB / about 17.2 GB | 0.229 | +0.105 | 12.527 |
-| **g256 calibrated** | `... --group-size 256 --native-groups` | **16.3 GB / 17.0 GB** | 0.238 | +0.052 | 11.881 |
+| Recipe | Flags (besides `--model/--out`) | File, text only / with MTP | KL (W4A8) | KL (A16) | ΔNLL (W4A8) | PPL (W4A8) |
+|---|---|---|---|---|---|---|
+| Reference, never ship | `--weights fp8_row` | 30.7 GB / n.a. | 0 | 0 | 0 | 11.277 |
+| g32 absmax (the old default) | `--weights q4_g32` | 17.9 GB / 18.6 GB | 0.265 | 0.258 | +0.149 | 13.087 |
+| **g32 calibrated** | `--scale-search weighted --imatrix F` | 17.9 GB / 18.6 GB | **0.157** | 0.150 | +0.061 | 11.982 |
+| g128 calibrated | `... --group-size 128 --native-groups` | 16.5 GB / about 17.2 GB | 0.233 | 0.229 | +0.106 | 12.542 |
+| **g256 calibrated** | `... --group-size 256 --native-groups` | **16.3 GB / 17.0 GB** | 0.238 | 0.236 | +0.052 | 11.881 |
+
+Paired differences on the same windows, with 95% bootstrap intervals (W4A8):
+
+| Comparison | ΔKL | ΔΔNLL |
+|---|---|---|
+| calibrated g32 vs absmax g32 | -0.108 (-0.129, -0.090) | -0.088 (-0.113, -0.064) |
+| calibrated g128 vs calibrated g32 | +0.076 (+0.059, +0.093) | +0.046 (+0.020, +0.072) |
+| calibrated g256 vs calibrated g32 | +0.081 (+0.066, +0.095) | -0.008 (-0.035, +0.017) |
+| calibrated g256 vs calibrated g128 | +0.005 (-0.009, +0.016) | -0.054 (-0.075, -0.036) |
 
 Notes on reading it:
 
 - **Calibration is the big lever.** It cuts KL by about 40% at the same file size and needs no new kernels.
-  Coarser groups trade quality for size: g256 is 1.6 GB (9%) smaller than g32 and costs about 0.08 KL against
-  calibrated g32, which is still better than uncalibrated g32.
+- **g128 is not worth choosing.** g256 is smaller and indistinguishable from g128 on KL (the interval spans
+  zero). Pick g32 or g256.
+- **KL and ΔNLL measure different things, and here they disagree.** KL compares the whole next-token
+  distribution with the reference at every position. ΔNLL (and PPL, which is just its exponential) looks only at
+  the probability given to the token that actually came next. Quantization noise can flatten an over-confident
+  prediction, which raises the true token's probability while moving the distribution further away. That is
+  what the g256 row shows: its ΔNLL equals calibrated g32 (no resolved difference) and beats g128 (resolved),
+  while its KL is 0.08 higher than g32. We select on KL because it cannot be improved by that effect; read
+  ΔNLL and PPL as a sanity check, not as a ranking, and never compare PPL across different instruments.
 - **Statistics must come from the model you are converting.** On this model, statistics collected on the
-  converted model itself beat the published base-model and published fine-tune files by 0.016–0.017 KL at g32.
+  converted model itself beat the published base-model and published fine-tune files by 0.016 to 0.017 KL at g32.
   Do not reuse another model's imatrix for a deliverable.
-- **ΔNLL and KL disagree sometimes.** KL is the full-distribution measure and is what we select on; ΔNLL
-  looks only at the one correct token and is noisier (g256 has the lowest ΔNLL and the higher KL).
 - **Decode speed.** On the g256 file with MTP and FP8 KV, five fixed 400-token greedy prompts averaged 155 tok/s
   against 138 tok/s for the uncalibrated g32 file, and MTP draft acceptance was equal within noise (22% on
   sampled roleplay). That is a smoke test, not a benchmark.
-- **Scope.** One fine-tune, English text, one corpus. A different model can move every number. Section 5 shows
+- **Scope.** One fine-tune, English text, one corpus. A different model can move every number. Section 6 shows
   how to reproduce the table for yours; do that before publishing your own numbers.
 
 ### Which one should I pick?
 
-- You want the best quality at roughly today's size: **g32 calibrated**.
-- You want the smallest file that is still better than the uncalibrated g32 default: **g256 calibrated**.
-- g128 is a middle step with no measured W4A8 result yet (kernels are tested; the whole-model W4A8 number is
-  missing). Prefer g256 or g32 unless you measure it.
+- You want the best quality at roughly the old size: **g32 calibrated**.
+- You want a 9% smaller file (1.6 GB) that is still clearly better than the uncalibrated g32 default (KL 0.238
+  against 0.265, ΔNLL +0.052 against +0.149): **g256 calibrated**.
 - Skip calibration only if you cannot run llama.cpp; it costs 0.1 KL.
 
-## 2. Requirements
+## 3. Requirements
 
 - Windows with an NVIDIA RTX 5090 (the fork builds for sm_120a only), a build of this fork that includes
   `q4_g128_fp16`/`q4_g256_fp16` (fork commit `4cff979` or later), and the built `ninfer-spo-serve`,
@@ -64,7 +93,7 @@ Notes on reading it:
 Timings on an RTX 5090: conversion 5–7 minutes (15 with MTP and hashing), Q8_0 GGUF 7 minutes, statistics
 collection 12 minutes, one quality measurement 4 minutes (A16) or about 30 seconds (W4A8).
 
-## 3. Convert without calibration (fastest)
+## 4. Convert without calibration (fastest)
 
 ```bash
 python -m tools.convert.gemma4_q4 convert \
@@ -83,7 +112,7 @@ have no uncommitted tracked changes (the receipt records the revision).
 Every conversion writes `<out>.build.json`: source hashes, recipe name, group layout, calibration file hash,
 revision and the verified file size. Keep it with the artifact.
 
-## 4. Convert with calibration (recommended)
+## 5. Convert with calibration (recommended)
 
 Collect statistics once per model, then reuse the file for every group size.
 
@@ -131,9 +160,9 @@ What the options mean:
 | `--region-group REGION=G` | Per-region group size, for example `mlp_gate_up=256`. First match wins. Regions: `mlp_gate_up`, `mlp_down`, `attn_qkv`, `attn_out`, `global_layers`, `first4_layers`, `last4_layers`. |
 | `--text-only` | Leave out the vision tower. |
 
-## 5. Check the quality of your own conversion
+## 6. Check the quality of your own conversion
 
-The numbers in section 1 come from the exact paired full-vocabulary KL in `ninfer-spo-perplexity` (see
+The numbers in section 2 come from the exact paired full-vocabulary KL in `ninfer-spo-perplexity` (see
 [perplexity.md](perplexity.md#exact-paired-full-vocabulary-kl)). To reproduce them for your model:
 
 ```bash
@@ -166,7 +195,7 @@ Two warnings:
 - GGUF numbers (for example an IQ4_XS of the same weights, +0.038 ΔNLL from BF16 on a different scorer) are not
   comparable with the KL column here.
 
-## 6. Run it
+## 7. Run it
 
 ```bash
 ninfer-spo-serve models/my-31b-q4_g256-cal.ninfer --port 8001 --model-id 131k --max-context 131072 \
@@ -177,7 +206,7 @@ ninfer-spo-serve models/my-31b-q4_g256-cal.ninfer --port 8001 --model-id 131k --
 run with; `bf16` is the conservative default. Check the startup log for the actual KV capacity: the model list
 can overstate an auto-sized pool. See [serving.md](serving.md).
 
-## 7. When something goes wrong
+## 8. When something goes wrong
 
 | Symptom | Cause |
 |---|---|
@@ -188,7 +217,7 @@ can overstate an auto-sized pool. See [serving.md](serving.md).
 | W4A8 KL changes between runs | Set `NINFER_Q4_EXACT=1` for evaluation. |
 | 26B-A4B (MoE) | Not supported by this route. |
 
-## 8. How this relates to the rest of the repository
+## 9. How this relates to the rest of the repository
 
 - [weight-conversion.md](weight-conversion.md) describes the general recipe converter (`python -m tools.convert`)
   and the other Gemma 4 recipes (FP8, NVFP4). This guide covers the group-wise 4-bit family only.
