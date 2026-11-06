@@ -82,6 +82,7 @@ def options_from(args: argparse.Namespace) -> Q4Options:
         imatrix=args.imatrix,
         mtp_weights=args.mtp_weights,
         scale_bits=args.scale_bits,
+        gptq_source=args.gptq_source,
     )
 
 
@@ -352,6 +353,15 @@ def build_parser() -> argparse.ArgumentParser:
         "needs binaries that include q4_g32_s6_fp16). Any other value, or 6 without --native-groups, is EXPERIMENTAL "
         "quality screening on ordinary q4_g32 words: the file does not shrink, no kernel reads that layout, and "
         "the receipt's projected_real_weight_bytes counts the saving a real format would give",
+    )
+    build.add_argument(
+        "--gptq-source",
+        type=Path,
+        help="Directory of an external compressed-tensors pack-quantized INT4 checkpoint (LLM Compressor GPTQ, "
+        "symmetric, static contiguous groups, no activation order, text projections only). Its codes and "
+        "binary16-exact scales are copied into q4_g32_fp16 without re-rounding; a layout the fork cannot store "
+        "exactly is refused. Mutually exclusive with --scale-search/--imatrix/--group-size/--region-group/"
+        "--native-groups/--scale-bits",
     )
     build.add_argument(
         "--dry-run", action="store_true", help="Read-only shape/recipe preflight; writes nothing"

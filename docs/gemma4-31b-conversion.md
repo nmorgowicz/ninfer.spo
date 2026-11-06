@@ -179,6 +179,7 @@ What the options mean:
 | `--text-only` | Leave out the vision tower. |
 | `--mtp-weights fp8\|bf16\|q4` | How the MTP assistant's layer projections are stored (default `fp8` for the q4 weights). See the MTP note below. |
 | `--scale-bits 4..8` | Two-level scales: a small integer multiplier per 32 weights plus one FP16 super scale per 256. **`--scale-bits 6` with `--native-groups` stores the real `q4_g32_s6_fp16` format**: the same 4-bit codes as g32, but each row's scale plane is one byte per 32 weights instead of two (4.25 instead of 4.5 bits per weight), and it works with both `--weights q4_g32` and `q4_g32_a16`. The receipt's `weight_bytes` is then the real size. Any other value, or 6 without `--native-groups`, is **experimental, measurement only**: the scales are emulated on ordinary g32 words, so the file does not shrink and no kernel reads that layout. On the author's model, in that emulation, 8- and 6-bit multipliers scored the same KL as FP16 scales (0.150) and 5-bit about 0.003 worse. Needs `--scale-search mse\|weighted`, `--group-size 32` and no `--region-group`; the real format also needs every projection input width, padded to 128, to be a multiple of 256. |
+| `--gptq-source DIR` | Copy the 4-bit codes and scales of an external LLM Compressor GPTQ checkpoint (compressed-tensors `pack-quantized`, symmetric INT4, static contiguous groups, no activation order) into `q4_g32_fp16` without re-rounding; see "External GPTQ import" below. Mutually exclusive with `--scale-search`, `--imatrix`, `--group-size`, `--region-group`, `--native-groups` and `--scale-bits`. Experimental. |
 
 `--region-group` is for experimenters. With uncalibrated scales, making a region coarse cost least in `mlp_gate_up`
 and the first four layers, and most in `mlp_down`, the last four layers, the global-attention layers and
@@ -208,6 +209,35 @@ bit, and a byte-identical `kl_positions.f32`, as the `--scale-bits 6` emulation:
 -0.0034 with a standard error of 0.0028 over the 47 windows, is not resolved). On the same serving flags (131,072
 context, FP8 KV, prefill chunk 128, no speculation) the native file decodes at 70.6 tok/s against 68.2 for the g32
 file (+3.4%) and prefills a 3,000-token prompt at 3,049 tok/s against 3,046 (medians of six runs).
+
+**External GPTQ import (`--gptq-source`, experimental).** One spike on the same model and instrument as section 2.
+The checkpoint came from LLM Compressor 0.13.0 (compressed-tensors 0.18.0, transformers 5.14.1, torch 2.13.0+cu130):
+`GPTQModifier` with 4-bit symmetric int weights, `strategy group`, `group_size 32`, `actorder None`,
+`block_size 128`, `dampening_frac 0.01`, sequential targets `Gemma4TextDecoderLayer`, and the 400 chat-prefixed
+512-token chunks used for the imatrix as calibration data (no 13-token sequence of the evaluation corpus occurs in them).
+transformers 5.14.1 cannot read the checkpoint's `per_layer_config`, so GPTQ ran on a text-only `Gemma4ForCausalLM`
+tree whose config carries `global_head_dim`/`num_global_key_value_heads` (what `normalize_config` produces). The run took
+54 minutes on one RTX 5090 (10.3 GiB GPU, 39 GiB RAM with 32 GiB of weights kept on the CPU and the rest offloaded to disk).
+The importer copies codes and scales word for word: every one of the 915,210,240 BF16 scales converts to binary16
+unchanged (it refuses the checkpoint otherwise), `weight_zero_point` and `weight_g_idx` are refused, and the converter's
+global-layer permutations are applied to the encoded words (q/k rows, o columns). A 32-group of the Hugging Face column
+order maps onto a whole 32-group of the converter's order because the rotated blocks `[0,64)` and `[256,320)` of a
+512-wide head are multiples of 32; the importer refuses any permutation that would split a group. All 240 weight objects
+of the written artifact decode to exactly the checkpoint's values.
+
+| Scales chosen by the GPTQ run (`--weights q4_g32_a16` / `q4_g32`) | KL (A16) | KL (W4A8) | ΔNLL (A16) | PPL (A16) |
+|---|---|---|---|---|
+| calibrated RTN, weighted search (section 2) | 0.1504 | 0.1569 | +0.061 | 11.986 |
+| GPTQ, `memoryless_minmax` observer (the default, absmax/7.5) | 0.1697 | 0.1740 | +0.058 | 11.953 |
+| GPTQ, `memoryless_mse` observer | 0.1591 | not run | +0.042 | 11.760 |
+| **GPTQ, `imatrix_mse` observer** (importance-weighted scale search) | **0.0805** | **0.0845** | +0.025 | 11.566 |
+
+Paired on the same 47 windows, GPTQ with `imatrix_mse` against calibrated RTN: ΔKL -0.0698 (-0.0845, -0.0570) A16 and
+-0.0724 (-0.0871, -0.0598) W4A8, better on 46 of 47 windows and in every domain (long-form 0.077 against 0.154, reference
+0.104 against 0.187, code 0.063 against 0.114, A16). With the default observer GPTQ is worse than calibrated RTN by +0.019
+(+0.009, +0.032): error compensation alone does not beat a good scale search. The file is the ordinary g32 file (17.9 GB
+of weights); the imported scales are FP16 per group of 32, so the S6 and g128/g256 storage formats are not reachable by
+exact import. One fine-tune and one calibration set; reproduce it with section 6 before relying on it.
 
 **MTP assistant storage.** The assistant's output head is always FP8 and its two outer projections stay BF16 (loaded
 as FP8). `--mtp-weights` changes only the 20 layer projections (query, output, gate, up, down in 4 layers), which

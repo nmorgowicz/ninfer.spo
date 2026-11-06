@@ -224,6 +224,7 @@ class Q4Options:
     imatrix: Path | None = None
     mtp_weights: str | None = None
     scale_bits: int | None = None
+    gptq_source: Path | None = None
 
     def __post_init__(self):
         if self.weights not in Q4_WEIGHTS:
@@ -256,6 +257,21 @@ class Q4Options:
                 raise ValueError(
                     "--native-groups with --scale-bits stores the real two-level format, which exists only for "
                     "--scale-bits 6; other values are emulated screening and take no --native-groups"
+                )
+        if self.gptq_source is not None:
+            if not self.quantized:
+                raise ValueError("--gptq-source applies only to the q4_g32 and q4_g32_a16 weights")
+            if (
+                self.scale_search != "absmax"
+                or self.imatrix
+                or regions
+                or self.group_size != 32
+                or self.native_groups
+                or self.scale_bits is not None
+            ):
+                raise ValueError(
+                    "--gptq-source is mutually exclusive with --scale-search/--imatrix/--group-size/"
+                    "--region-group/--native-groups/--scale-bits (the source decides codes and scales)"
                 )
 
     @property
@@ -328,7 +344,26 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
                 "sha256": sha256_file(options.imatrix),
                 "role": "sensitivity unless collected from the target model",
             }
+        imported, imported_group = {}, None
+        if options.gptq_source is not None:
+            from .gemma4_gptq import gptq_projection_sources
+
+            imported, imported_group = gptq_projection_sources(model, options.gptq_source)
+            if set(imported) != set(projections):
+                raise ValueError("the GPTQ source does not cover exactly the model's text-layer projections")
+            scale_search = {
+                "method": "external_gptq_import",
+                "gptq_source": str(options.gptq_source.resolve()),
+                "group_size": imported_group,
+                "note": "codes and binary16 scales copied exactly from the external checkpoint; nothing re-rounded",
+            }
         for name in projections:
+            if name in imported:
+                groups[name] = imported_group
+                recipe.assign(
+                    name, format="q4_g32_fp16", layout="auto", method="import_encoded", source=imported[name]
+                )
+                continue
             groups[name] = q4_group_for(name, layer_types, regions, options.group_size)
             if options.native_groups and groups[name] == 64:
                 raise ValueError("--native-groups supports logical groups 32, 128 and 256 (no Gemma g64 kernels)")
@@ -378,6 +413,8 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
         "q4_g32_a16": "q4_g32_absmax_fp8_vocab_a16",
         "fp8_row": "fp8_row_maxabs_a16_reference",
     }[options.weights]
+    if options.gptq_source is not None:
+        name = name.replace("absmax", "gptq_import")
     if any(size != 32 for size in groups.values()):
         name += "_native_groups" if options.native_groups else "_virtual_groups"
     if options.scale_search != "absmax":
