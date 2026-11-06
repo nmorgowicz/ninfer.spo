@@ -17,6 +17,7 @@ import sys
 
 from .gemma4_q4 import (
     ASSISTANT_HINT,
+    MTP_WEIGHTS,
     ASSISTANT_REPO,
     Q4_REGIONS,
     Q4_WEIGHTS,
@@ -79,6 +80,7 @@ def options_from(args: argparse.Namespace) -> Q4Options:
         scale_search=args.scale_search,
         native_groups=args.native_groups,
         imatrix=args.imatrix,
+        mtp_weights=args.mtp_weights,
     )
 
 
@@ -99,6 +101,8 @@ def check_convert_arguments(args: argparse.Namespace) -> tuple[Q4Options, Path]:
         raise ValueError("Output must be outside the source checkpoint")
     if args.no_mtp == (args.mtp_assistant is not None):
         raise ValueError(f"Pass --mtp-assistant <dir> ({ASSISTANT_HINT}) or explicitly --no-mtp")
+    if args.no_mtp and args.mtp_weights != "bf16":
+        raise ValueError("--mtp-weights fp8|q4 needs the MTP assistant; it cannot be combined with --no-mtp")
     options = options_from(args)
     if args.mtp_assistant is not None:
         check_assistant(args.mtp_assistant)
@@ -328,6 +332,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Local {ASSISTANT_REPO} directory embedded as the mtp component (required unless --no-mtp)",
     )
     build.add_argument("--no-mtp", action="store_true", help="Explicitly build without the MTP assistant")
+    build.add_argument(
+        "--mtp-weights",
+        choices=MTP_WEIGHTS,
+        default="bf16",
+        help="Storage of the MTP assistant's layer projections (query, output, gate, up, down): bf16 (default, "
+        "unchanged), fp8 (FP8 per-row) or q4 (q4_g32, absmax). They always run on 16-bit activations; the "
+        "assistant's FP8 head and outer projections are unchanged. Draft quality, not target output, is at risk: "
+        "measure MTP acceptance before shipping",
+    )
     build.add_argument(
         "--dry-run", action="store_true", help="Read-only shape/recipe preflight; writes nothing"
     )
