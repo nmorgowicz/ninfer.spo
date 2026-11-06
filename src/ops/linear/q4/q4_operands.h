@@ -2,6 +2,7 @@
 
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ops/common/q4_scale_shift.h"
 
 #include <cuda_bf16.h>
 
@@ -19,6 +20,8 @@ struct Q4LinearOperands {
     std::int32_t tokens;
     std::int32_t padded_k;
     const __nv_bfloat16* row_scales = nullptr;
+    // log2(G / 32) of the scale group (0 for q4_g32, 2 for q4_g128, 3 for q4_g256).
+    std::int32_t scale_shift = 0;
 };
 
 inline Q4LinearOperands q4_linear_operands(const Tensor& x, const Weight& weight) {
@@ -29,7 +32,8 @@ inline Q4LinearOperands q4_linear_operands(const Tensor& x, const Weight& weight
             weight.k,
             x.ne[1],
             weight.padded_shape[1],
-            static_cast<const __nv_bfloat16*>(weight.row_scales)};
+            static_cast<const __nv_bfloat16*>(weight.row_scales),
+            q4_scale_shift(weight.qtype) > 0 ? q4_scale_shift(weight.qtype) : 0};
 }
 
 // Private template domain. Public shape admission remains in q4_dispatch.

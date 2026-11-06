@@ -57,10 +57,10 @@ __global__ void q4_row_multiplier_kernel(const std::uint8_t* __restrict__ scales
 }
 
 inline void launch_q4_row_multipliers(const std::uint8_t* scales, __nv_bfloat16* row_scales, int rows, int k,
-                                      cudaStream_t stream) {
+                                      int scale_shift, cudaStream_t stream) {
     constexpr int kWarps = 8;
-    q4_row_multiplier_kernel<<<(rows + kWarps - 1) / kWarps, kWarps * 32, 0, stream>>>(scales, row_scales, rows,
-                                                                                     k >> 5);
+    q4_row_multiplier_kernel<<<(rows + kWarps - 1) / kWarps, kWarps * 32, 0, stream>>>(
+        scales, row_scales, rows, k >> (5 + scale_shift));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -144,7 +144,8 @@ struct Q4FusedLayout {
     static_assert(kSharedBytes <= 99 * 1024);
 };
 
-template <class Schedule, int LoadStages, int RoundStages, int ConverterWarps, bool FullTokens, bool SplitK>
+template <class Schedule, int LoadStages, int RoundStages, int ConverterWarps, bool FullTokens, bool SplitK,
+          int ScaleShift>
 __global__ void __launch_bounds__(Q4FusedLayout<Schedule, LoadStages, RoundStages, ConverterWarps>::kThreads, 1)
     q4_fused_a8_kernel(const __grid_constant__ Fp8TmaDescriptors descriptors, Fp8A8Operands operands,
                        const std::uint8_t* __restrict__ group_scales, LinearBf16Output output, int token_offset,
@@ -219,17 +220,36 @@ __global__ void __launch_bounds__(Q4FusedLayout<Schedule, LoadStages, RoundStage
         const int lane      = converter & 31;
         const int group     = converter % Layout::kGroupsPerRow;
         const int groups    = k >> 5;
-        const auto* scale_base =
-            reinterpret_cast<const unsigned short*>(group_scales) + static_cast<long long>(row_begin) * groups + group;
+        const unsigned short* scale_base;
+        if constexpr (ScaleShift == 0) {
+            scale_base = reinterpret_cast<const unsigned short*>(group_scales) + static_cast<long long>(row_begin) * groups +
+                         group;
+        } else {
+            scale_base = reinterpret_cast<const unsigned short*>(group_scales) +
+                         static_cast<long long>(row_begin) * (groups >> ScaleShift);
+        }
         int row[Layout::kItems];
         float inverse[Layout::kItems];
         unsigned short next[Layout::kItems];
+        const int scale_groups = groups >> ScaleShift;
+        // The g32 loads are the original expressions; a coarse scale index is the 32-group index
+        // shifted down. A tile holds four 32-groups, so a coarse scale covers one tile (g128) or two
+        // consecutive tiles (g256).
+        const auto coarse_scale = [&](int r, int tile) -> unsigned short {
+            return __ldg(scale_base + static_cast<long long>(r) * scale_groups + ((tile * 4 + group) >> ScaleShift));
+        };
+        (void)scale_groups;
+        (void)coarse_scale;
 #pragma unroll
         for (int item = 0; item < Layout::kItems; ++item) {
             row[item]     = (item * Layout::kConverterThreads + converter) / Layout::kGroupsPerRow;
             inverse[item] = __frcp_rn(__bfloat162float(operands.scales[row_begin + row[item]]));
-            next[item] =
-                tiles_k > 0 ? __ldg(scale_base + static_cast<long long>(row[item]) * groups + k_begin * 4) : 0;
+            if constexpr (ScaleShift == 0) {
+                next[item] =
+                    tiles_k > 0 ? __ldg(scale_base + static_cast<long long>(row[item]) * groups + k_begin * 4) : 0;
+            } else {
+                next[item] = tiles_k > 0 ? coarse_scale(row[item], k_begin) : 0;
+            }
         }
         for (int kt = 0; kt < tiles_k; ++kt) {
             const int stage = kt % L, slot = kt % R;
@@ -238,7 +258,11 @@ __global__ void __launch_bounds__(Q4FusedLayout<Schedule, LoadStages, RoundStage
             for (int item = 0; item < Layout::kItems; ++item) {
                 current[item] = next[item];
                 if (kt + 1 < tiles_k) {
-                    next[item] = __ldg(scale_base + static_cast<long long>(row[item]) * groups + (k_begin + kt + 1) * 4);
+                    if constexpr (ScaleShift == 0) {
+                        next[item] = __ldg(scale_base + static_cast<long long>(row[item]) * groups + (k_begin + kt + 1) * 4);
+                    } else {
+                        next[item] = coarse_scale(row[item], k_begin + kt + 1);
+                    }
                 }
             }
             cta_mbarrier_wait(loaded + stage, (kt / L) & 1U);
@@ -306,14 +330,15 @@ __global__ void __launch_bounds__(Q4FusedLayout<Schedule, LoadStages, RoundStage
 }
 
 // activations/activation_scales: the A8 codes of x. row_scales: the bake multipliers, written by
-// launch_q4_row_multipliers first. partials: Schedule::kPartialBytes when the schedule splits K.
-template <class Schedule, int LoadStages, int RoundStages, int ConverterWarps>
+// launch_q4_row_multipliers first. group_scales: the weight's scale plane, one binary16 scale per
+// 32 << ScaleShift columns. partials: Schedule::kPartialBytes when the schedule splits K.
+template <class Schedule, int LoadStages, int RoundStages, int ConverterWarps, int ScaleShift>
 void launch_q4_fused_a8(const std::uint8_t* activations, const float* activation_scales, const std::uint8_t* codes,
                         const std::uint8_t* group_scales, const __nv_bfloat16* row_scales, __nv_bfloat16* out,
                         float* partials, int rows, int k, int tokens, cudaStream_t stream) {
     using Layout = Q4FusedLayout<Schedule, LoadStages, RoundStages, ConverterWarps>;
-    if (rows % Layout::BR != 0 || k % Layout::BK != 0) {
-        throw std::invalid_argument("q4 fused A8 requires complete row and K tiles");
+    if (rows % Layout::BR != 0 || k % Layout::BK != 0 || k % (32 << ScaleShift) != 0) {
+        throw std::invalid_argument("q4 fused A8 requires complete row and K tiles and K divisible by the scale group");
     }
     Fp8A8Operands operands{activations, activation_scales, codes, row_scales, rows, k, tokens};
     const Fp8TmaDescriptors descriptors{fp8_tma_map(activations, tokens, k, Layout::BT, Layout::BK),
@@ -324,7 +349,7 @@ void launch_q4_fused_a8(const std::uint8_t* activations, const float* activation
         const auto plan  = fp8_tma_split_k_plan<Schedule>(blocks, k);
         const auto launch = [&]<bool Full, bool Split>() {
             constexpr auto kernel =
-                q4_fused_a8_kernel<Schedule, LoadStages, RoundStages, ConverterWarps, Full, Split>;
+                q4_fused_a8_kernel<Schedule, LoadStages, RoundStages, ConverterWarps, Full, Split, ScaleShift>;
             static const cudaError_t status =
                 cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Layout::kSharedBytes);
             CUDA_CHECK(status);

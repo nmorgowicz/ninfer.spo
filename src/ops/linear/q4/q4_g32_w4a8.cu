@@ -39,6 +39,7 @@ __device__ __forceinline__ unsigned char q4_nibble_e4m3(unsigned nibble) {
         __nv_cvt_float_to_fp8(static_cast<float>(code), __NV_SATFINITE, __NV_E4M3));
 }
 
+template <int kScaleShift>
 __global__ void q4g32_w4a8_kernel(const std::uint8_t* __restrict__ act,
                                   const float* __restrict__ act_scales,
                                   const std::uint8_t* __restrict__ codes,
@@ -86,7 +87,8 @@ __global__ void q4g32_w4a8_kernel(const std::uint8_t* __restrict__ act,
             float scale = 0.0f;
             if (src_row < rows) {
                 const std::uint16_t bits = *reinterpret_cast<const std::uint16_t*>(
-                    weight_scales + (static_cast<long long>(src_row) * groups + group) * 2);
+                    weight_scales +
+                    (static_cast<long long>(src_row) * (groups >> kScaleShift) + (group >> kScaleShift)) * 2);
                 scale = __half2float(__ushort_as_half(bits));
             }
             row_scale[row] = scale;
@@ -200,6 +202,9 @@ __global__ void q4_expand_e4m3_kernel(const std::uint8_t* __restrict__ codes, st
     store_vec(destination + 16, high);
 }
 
+// Per-32 transposed scales [group][row]. `groups` counts 32-column groups; the source holds one
+// scale per 32 << kScaleShift columns, which is expanded to every 32-group it covers.
+template <int kScaleShift>
 __global__ void q4_transpose_scales(const std::uint8_t* __restrict__ src, std::uint8_t* __restrict__ dst, int rows,
                                    int groups) {
     __shared__ __align__(16) std::uint16_t tile[32][33];
@@ -214,7 +219,9 @@ __global__ void q4_transpose_scales(const std::uint8_t* __restrict__ src, std::u
         const int row   = row0 + ty + rep * 8;
         const int group = group0 + tx;
         std::uint16_t value = 0;
-        if (row < rows && group < groups) { value = in[static_cast<long long>(row) * groups + group]; }
+        if (row < rows && group < groups) {
+            value = in[static_cast<long long>(row) * (groups >> kScaleShift) + (group >> kScaleShift)];
+        }
         tile[ty + rep * 8][tx] = value;
     }
     __syncthreads();
@@ -239,14 +246,16 @@ __global__ void q4_fill_bf16_ones(__nv_bfloat16* values, int rows) {
 // test reproduces these bytes; change both together.
 constexpr int kQ4BakeThreads = 256;
 
+template <int kScaleShift>
 __global__ void __launch_bounds__(kQ4BakeThreads)
     q4_bake_e4m3_kernel(const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
                         std::uint8_t* __restrict__ baked, __nv_bfloat16* __restrict__ row_scales, int k) {
     const int row    = static_cast<int>(blockIdx.x);
-    const int groups = k >> 5;
-    const auto* scale_row = reinterpret_cast<const __half*>(scales) + static_cast<long long>(row) * groups;
+    const int groups       = k >> 5;
+    const int scale_groups = groups >> kScaleShift;
+    const auto* scale_row  = reinterpret_cast<const __half*>(scales) + static_cast<long long>(row) * scale_groups;
     float largest = 0.0f;
-    for (int g = static_cast<int>(threadIdx.x); g < groups; g += kQ4BakeThreads) {
+    for (int g = static_cast<int>(threadIdx.x); g < scale_groups; g += kQ4BakeThreads) {
         largest = fmaxf(largest, fabsf(__half2float(scale_row[g])));
     }
 #pragma unroll
@@ -270,7 +279,7 @@ __global__ void __launch_bounds__(kQ4BakeThreads)
     __syncthreads();
     const float inv = inverse;
     for (int g = static_cast<int>(threadIdx.x); g < groups; g += kQ4BakeThreads) {
-        const float mult = __fmul_rn(__half2float(scale_row[g]), inv);
+        const float mult = __fmul_rn(__half2float(scale_row[g >> kScaleShift]), inv);
         const uint4 packed =
             load_vec<uint4>(codes + (static_cast<long long>(row) * groups + g) * 16);
         const unsigned words[4] = {packed.x, packed.y, packed.z, packed.w};
@@ -295,6 +304,17 @@ __global__ void __launch_bounds__(kQ4BakeThreads)
         auto* destination = baked + static_cast<long long>(row) * k + g * 32;
         store_vec(destination, make_uint4(out_words[0], out_words[1], out_words[2], out_words[3]));
         store_vec(destination + 16, make_uint4(out_words[4], out_words[5], out_words[6], out_words[7]));
+    }
+}
+
+// log2(G / 32) of the q4 scale group as a template argument: 0 (g32), 2 (g128), 3 (g256).
+template <class F>
+void with_scale_shift(int scale_shift, F&& f) {
+    switch (scale_shift) {
+    case 0: f.template operator()<0>(); return;
+    case 2: f.template operator()<2>(); return;
+    case 3: f.template operator()<3>(); return;
+    default: throw std::invalid_argument("q4 W4A8: unsupported scale group size");
     }
 }
 
@@ -336,13 +356,15 @@ void q4_fused(const Q4LinearOperands& operands, __nv_bfloat16* out, const std::u
     if (row_scales == nullptr) {
         auto* derived = static_cast<__nv_bfloat16*>(
             workspace.alloc_bytes(static_cast<std::size_t>(operands.rows) * sizeof(__nv_bfloat16), 256).data);
-        launch_q4_row_multipliers(operands.scales, derived, operands.rows, operands.k, stream);
+        launch_q4_row_multipliers(operands.scales, derived, operands.rows, operands.k, operands.scale_shift, stream);
         row_scales = derived;
     }
     const auto launch = [&]<class Schedule>() {
-        launch_q4_fused_a8<Schedule, kQ4FusedLoadStages, kQ4FusedRoundStages, kQ4FusedConverters>(
-            codes, code_scales, operands.codes, operands.scales, row_scales, out, partials, operands.rows,
-            operands.k, operands.tokens, stream);
+        with_scale_shift(operands.scale_shift, [&]<int S>() {
+            launch_q4_fused_a8<Schedule, kQ4FusedLoadStages, kQ4FusedRoundStages, kQ4FusedConverters, S>(
+                codes, code_scales, operands.codes, operands.scales, row_scales, out, partials, operands.rows,
+                operands.k, operands.tokens, stream);
+        });
     };
     if (operands.tokens <= kQ4FusedSmallTokens) {
         launch.template operator()<Q4FusedSmall>();
@@ -590,8 +612,10 @@ Weight q4_bake(const Q4LinearOperands& operands, WorkspaceArena& workspace, cuda
             .data);
     auto* row_scales = static_cast<__nv_bfloat16*>(
         workspace.alloc_bytes(static_cast<std::size_t>(operands.rows) * sizeof(__nv_bfloat16), 256).data);
-    q4_bake_e4m3_kernel<<<operands.rows, kQ4BakeThreads, 0, stream>>>(operands.codes, operands.scales, baked,
-                                                                      row_scales, operands.k);
+    with_scale_shift(operands.scale_shift, [&]<int S>() {
+        q4_bake_e4m3_kernel<S><<<operands.rows, kQ4BakeThreads, 0, stream>>>(operands.codes, operands.scales, baked,
+                                                                            row_scales, operands.k);
+    });
     CUDA_CHECK(cudaGetLastError());
     Weight fp8{};
     fp8.qtype  = QType::FP8_E4M3FN_ROW_BF16;
@@ -607,8 +631,8 @@ Weight q4_bake(const Q4LinearOperands& operands, WorkspaceArena& workspace, cuda
 bool q4_exact_prefill() { return runtime_switches().q4_exact_prefill; }
 
 void q4_g32_row_multipliers(const std::uint8_t* scales, void* row_scales, std::int32_t rows, std::int32_t k,
-                            cudaStream_t stream) {
-    launch_q4_row_multipliers(scales, static_cast<__nv_bfloat16*>(row_scales), rows, k, stream);
+                            std::int32_t scale_shift, cudaStream_t stream) {
+    launch_q4_row_multipliers(scales, static_cast<__nv_bfloat16*>(row_scales), rows, k, scale_shift, stream);
 }
 
 bool q4_g32_takes_ready_codes(std::int32_t rows, std::int32_t k, std::int32_t tokens) {
@@ -728,8 +752,11 @@ void q4_g32_w4a8(const Q4LinearOperands& operands, __nv_bfloat16* out, Workspace
         const dim3 block(kW4A8Warps * 32);
         const dim3 grid((operands.rows + kW4A8Rows - 1) / kW4A8Rows,
                         (operands.tokens + kW4A8Tokens - 1) / kW4A8Tokens);
-        q4g32_w4a8_kernel<<<grid, block, 0, stream>>>(scratch.codes, scratch.scales, operands.codes, operands.scales,
-                                                      out, operands.rows, operands.k, operands.tokens);
+        with_scale_shift(operands.scale_shift, [&]<int S>() {
+            q4g32_w4a8_kernel<S><<<grid, block, 0, stream>>>(scratch.codes, scratch.scales, operands.codes,
+                                                             operands.scales, out, operands.rows, operands.k,
+                                                             operands.tokens);
+        });
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -738,8 +765,11 @@ void q4_g32_w4a8(const Q4LinearOperands& operands, __nv_bfloat16* out, Workspace
                               (static_cast<unsigned>(operands.rows) + 31) / 32);
     q4_expand_e4m3_kernel<<<(groups + 255) / 256, 256, 0, stream>>>(operands.codes, expanded, operands.rows, operands.k);
     CUDA_CHECK(cudaGetLastError());
-    q4_transpose_scales<<<transpose_grid, 256, 0, stream>>>(operands.scales, scale_groups, operands.rows,
-                                                           operands.k >> 5);
+    // The TMA kernel reads one scale per 32 columns: a coarse scale is expanded here.
+    with_scale_shift(operands.scale_shift, [&]<int S>() {
+        q4_transpose_scales<S><<<transpose_grid, 256, 0, stream>>>(operands.scales, scale_groups, operands.rows,
+                                                                  operands.k >> 5);
+    });
     CUDA_CHECK(cudaGetLastError());
     q4_fill_bf16_ones<<<(operands.rows + 255) / 256, 256, 0, stream>>>(ones, operands.rows);
     CUDA_CHECK(cudaGetLastError());

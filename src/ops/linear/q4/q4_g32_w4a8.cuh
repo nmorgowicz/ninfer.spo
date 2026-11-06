@@ -8,9 +8,10 @@
 
 namespace ninfer::ops::detail {
 
-// The Fused, Baked and Exact routes of q4_g32_route (per-token FP8 activations on q4 weights).
-// Fused and Baked use row-scaled E4M3 weights, rounded inside the GEMM or by a bake pass; Exact
-// widens the int4 codes to E4M3 and applies FP32 group scales.
+// The Fused, Baked and Exact routes of q4_g32_route (per-token FP8 activations on q4 weights), for
+// the q4_g32/g128/g256 family (Q4LinearOperands::scale_shift). Fused and Baked use row-scaled E4M3
+// weights, rounded inside the GEMM or by a bake pass; Exact widens the int4 codes to E4M3 and
+// applies FP32 group scales. A coarse weight gives the same bytes and outputs as its g32 emulation.
 void q4_g32_w4a8(const Q4LinearOperands& operands, __nv_bfloat16* out, WorkspaceArena& workspace,
                  cudaStream_t stream);
 
@@ -24,9 +25,9 @@ void q4_g32_w4a8_baked(const Q4LinearOperands& operands, __nv_bfloat16* out, Wor
 std::size_t q4_g32_baked_workspace_bytes(std::int32_t rows, std::int32_t k, std::int32_t tokens);
 
 // BF16 row multipliers of a trunk weight (rows x 2 bytes), written on `stream` from the FP16
-// group scales.
+// group scales. `scale_shift` is log2(G / 32): 0 for q4_g32, 2 for q4_g128, 3 for q4_g256.
 void q4_g32_row_multipliers(const std::uint8_t* scales, void* row_scales, std::int32_t rows, std::int32_t k,
-                            cudaStream_t stream);
+                            std::int32_t scale_shift, cudaStream_t stream);
 
 // The Gemma down projection can take A8 codes the GeGLU already wrote.
 bool q4_g32_takes_ready_codes(std::int32_t rows, std::int32_t k, std::int32_t tokens);

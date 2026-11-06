@@ -155,19 +155,9 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP8_E4M3FN_ROW_BF16:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
-    case QType::Q4_G128_FP16:
-    case QType::Q4_G256_FP16: {
-        // A16 only for now. Reject a planned A8 route here instead of at the first call.
-        const auto route = detail::q4_g32_route(output_rows, input_rows, max_tokens, policy,
-                                                detail::q4_exact_prefill());
-        if (route == detail::Q4Route::Fused || route == detail::Q4Route::Baked ||
-            route == detail::Q4Route::Exact) {
-            throw std::invalid_argument(
-                "linear workspace: q4_g128/q4_g256 weights have no W4A8 route yet; use A16Only");
-        }
-        return 0;
-    }
     case QType::Q4_G32_FP16:
+    case QType::Q4_G128_FP16:
+    case QType::Q4_G256_FP16:
         if (policy == LinearPolicy::A16Only) { return 0; }
         return detail::q4_g32_w4a8_workspace_bytes(output_rows, input_rows, max_tokens);
     }
@@ -199,10 +189,7 @@ void linear_a8_ready(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
                      std::uint8_t* codes, float* scales, WorkspaceArena& workspace,
                      cudaStream_t stream) {
     validate_linear_semantics(x, w, out, policy);
-    if (detail::is_q4_coarse(w.qtype)) {
-        throw std::invalid_argument("linear: q4_g128/q4_g256 weights have no W4A8 ready-codes route");
-    }
-    if (w.qtype == QType::Q4_G32_FP16) {
+    if (detail::is_q4_fp16_family(w.qtype)) {
         if (!allows_a8(policy) || codes == nullptr || scales == nullptr) {
             throw std::invalid_argument("q4_g32 ready: needs the A8 policy, codes, and scales");
         }
@@ -219,17 +206,18 @@ bool linear_takes_a8_ready(const Weight& w, std::int32_t tokens, LinearPolicy po
     if (w.qtype == QType::FP8_E4M3FN_ROW_BF16) {
         return w.n == 5376 && w.k == 21504 && detail::gemma4_fp8::uses_a8(tokens, tokens);
     }
-    if (w.qtype == QType::Q4_G32_FP16) { return detail::q4_g32_takes_ready_codes(w.n, w.k, tokens); }
+    if (detail::is_q4_fp16_family(w.qtype)) { return detail::q4_g32_takes_ready_codes(w.n, w.k, tokens); }
     return false;
 }
 
 void linear_prepare_a8_rows(Weight& w, DeviceBuffer& storage, cudaStream_t stream) {
-    if (w.qtype != QType::Q4_G32_FP16 || w.layout != QuantLayout::RowSplit || w.scales == nullptr ||
+    if (!detail::is_q4_fp16_family(w.qtype) || w.layout != QuantLayout::RowSplit || w.scales == nullptr ||
         w.padded_shape[1] != w.k || !detail::q4_trunk_shape(w.n, w.k)) {
         return;
     }
     DeviceBuffer rows(static_cast<std::size_t>(w.n) * 2);
-    detail::q4_g32_row_multipliers(static_cast<const std::uint8_t*>(w.scales), rows.p, w.n, w.k, stream);
+    detail::q4_g32_row_multipliers(static_cast<const std::uint8_t*>(w.scales), rows.p, w.n, w.k,
+                                   detail::q4_scale_shift(w.qtype), stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     storage      = std::move(rows);
     w.row_scales = storage.p;

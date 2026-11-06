@@ -14,10 +14,6 @@ constexpr bool is_q4_fp16_family(QType qtype) {
            qtype == QType::Q4_G256_FP16;
 }
 
-constexpr bool is_q4_coarse(QType qtype) {
-    return qtype == QType::Q4_G128_FP16 || qtype == QType::Q4_G256_FP16;
-}
-
 // 0 for g32, 2 for g128, 3 for g256; -1 for any other qtype.
 constexpr int q4_scale_shift(QType qtype) {
     switch (qtype) {

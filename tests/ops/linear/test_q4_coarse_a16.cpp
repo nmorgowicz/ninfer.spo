@@ -1,7 +1,7 @@
 // q4_g128_fp16 / q4_g256_fp16 A16 linear: numerics against the FP64 dequantized-weight oracle on the
 // Gemma 4 31B trunk shapes and head, bit-exact equality with the q4_g32 kernels on the same weights
-// expressed as a g32 tensor (converter emulation: scales repeated G / 32 times), the A8 rejection,
-// the geometry contract, and a cold-L2 bandwidth bench (NINFER_Q4_COLD_COARSE=<T>).
+// expressed as a g32 tensor (converter emulation: scales repeated G / 32 times), the geometry
+// contract, and a cold-L2 bandwidth bench (NINFER_Q4_COLD_COARSE=<T>). W4A8 is test_q4_coarse_a8.cpp.
 #include "ops/linear/linear_test_common.h"
 
 #include "core/arena.h"
@@ -188,93 +188,6 @@ bool throws(Call&& call) {
     return false;
 }
 
-// W4A8 is not implemented for the coarse formats: every A8 route must refuse, loudly.
-int a8_is_rejected() {
-    using namespace ninfer;
-    int failures = 0;
-    for (const Format& format : kFormats) {
-        struct Case {
-            std::int32_t n, k, t;
-            const char* route;
-        };
-        for (const Case c : {Case{5376, 8192, 9, "fused (trunk, T=9)"}, Case{5376, 8192, 512, "baked"},
-                             Case{256, 5376, 128, "exact (non-trunk, T=128)"}}) {
-            const auto packed = format.make(c.n, c.k, 5U);
-            DeviceBuffer device_weight(packed.payload.size());
-            device_weight.copy_from_host(packed.payload.data(), device_weight.bytes);
-            const Weight weight = packed.device_weight(device_weight.p);
-            DeviceBuffer activation(static_cast<std::size_t>(c.k) * c.t * 2);
-            DeviceBuffer out(static_cast<std::size_t>(c.n) * c.t * 2);
-            Tensor input(activation.p, DType::BF16, {c.k, c.t});
-            Tensor destination(out.p, DType::BF16, {c.n, c.t});
-            DeviceArena workspace(1U << 20);
-            if (!throws<std::invalid_argument>([&] {
-                    ops::linear(input, weight, destination, ops::LinearPolicy::AllowA8, workspace, nullptr);
-                })) {
-                std::cerr << format.name << " " << c.route << ": A8 call did not throw\n";
-                ++failures;
-            }
-            if (!throws<std::invalid_argument>([&] {
-                    (void)ops::linear_workspace_capacity_bytes(weight.qtype, c.n, c.k,
-                                                               ops::LinearPolicy::AllowA8, c.t, c.t);
-                })) {
-                std::cerr << format.name << " " << c.route << ": A8 workspace query did not throw\n";
-                ++failures;
-            }
-            if (ops::linear_takes_a8_ready(weight, c.t, ops::LinearPolicy::AllowA8)) {
-                std::cerr << format.name << " " << c.route << ": takes ready A8 codes\n";
-                ++failures;
-            }
-            if (!throws<std::invalid_argument>([&] {
-                    std::uint8_t* codes = nullptr;
-                    float* scales       = nullptr;
-                    ops::linear_a8_ready(input, weight, destination, ops::LinearPolicy::AllowA8,
-                                         codes, scales, workspace, nullptr);
-                })) {
-                std::cerr << format.name << " " << c.route << ": ready-codes A8 call did not throw\n";
-                ++failures;
-            }
-            // The same weight under A16Only is fine at the same token count.
-            const std::size_t capacity = ops::linear_workspace_capacity_bytes(
-                weight.qtype, c.n, c.k, ops::LinearPolicy::A16Only, c.t, c.t);
-            if (capacity != 0) {
-                std::cerr << format.name << ": A16 workspace is not empty\n";
-                ++failures;
-            }
-            if (c.t >= 128) { continue; }
-            try {
-                ops::linear(input, weight, destination, nullptr);
-                ninfer::test::cuda_check(cudaDeviceSynchronize(), "A16 call on a coarse weight");
-            } catch (const std::exception& error) {
-                std::cerr << format.name << " " << c.route << ": A16 call threw: " << error.what() << '\n';
-                ++failures;
-            }
-        }
-        // Decode token counts stay on the A16 routes even when A8 is allowed.
-        const auto packed = format.make(5376, 8192, 6U);
-        DeviceBuffer device_weight(packed.payload.size());
-        device_weight.copy_from_host(packed.payload.data(), device_weight.bytes);
-        const Weight weight = packed.device_weight(device_weight.p);
-        for (const std::int32_t t : {1, 4, 8}) {
-            DeviceBuffer activation(static_cast<std::size_t>(8192) * t * 2);
-            DeviceBuffer out(static_cast<std::size_t>(5376) * t * 2);
-            Tensor input(activation.p, DType::BF16, {8192, t});
-            Tensor destination(out.p, DType::BF16, {5376, t});
-            DeviceArena workspace(std::max<std::size_t>(
-                ops::linear_workspace_capacity_bytes(weight.qtype, 5376, 8192, ops::LinearPolicy::AllowA8, t, t),
-                256));
-            try {
-                ops::linear(input, weight, destination, ops::LinearPolicy::AllowA8, workspace, nullptr);
-                ninfer::test::cuda_check(cudaDeviceSynchronize(), "AllowA8 decode on a coarse weight");
-            } catch (const std::exception& error) {
-                std::cerr << format.name << " AllowA8 T=" << t << " threw: " << error.what() << '\n';
-                ++failures;
-            }
-        }
-    }
-    return failures;
-}
-
 // The runtime's geometry (artifact sizes) must match the fixture byte for byte, and K that is not a
 // multiple of G must be refused instead of floored.
 int geometry_contract() {
@@ -383,7 +296,7 @@ int main() {
             std::cerr << "Q4 coarse test: CUDA is required\n";
             return 1;
         }
-        int failures = geometry_contract() + a8_is_rejected();
+        int failures = geometry_contract();
         for (const Format& format : kFormats) { failures += numerics(format); }
         failures += equivalence();
         if (failures != 0) {

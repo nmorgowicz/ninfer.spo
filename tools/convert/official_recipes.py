@@ -350,8 +350,11 @@ def gemma4_nvfp4_a4_mlp(model, recipe, sources):
     _gemma4_a4(model, recipe, sources, "gemma4_nvfp4_a4_mlp", mlp_only=True)
 
 
+Q4_A8_FORMATS = (Q4_G32, "q4_g128_fp16", "q4_g256_fp16")
+
+
 def gemma4_q4_a8(model, recipe, sources):
-    """Override: allow A8 on every q4_g32 text-layer projection.
+    """Override: allow A8 on every q4_g32/g128/g256 text-layer projection.
 
     The embedding and the output head stay A16Only.
     """
@@ -359,7 +362,7 @@ def gemma4_q4_a8(model, recipe, sources):
     for name, parameter in model.parameters.items():
         if not name.startswith("text/layers/") or not parameter.projection:
             continue
-        if not all(s.format == Q4_G32 for s in recipe.selections[name]):
+        if not all(s.format in Q4_A8_FORMATS for s in recipe.selections[name]):
             continue
         for input_name in parameter.inputs:
             recipe.use(name, input_name, activation_policy="AllowA8")

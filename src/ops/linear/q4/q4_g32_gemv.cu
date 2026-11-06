@@ -299,12 +299,6 @@ void q4_g32_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearP
     auto* output = static_cast<__nv_bfloat16*>(out.data);
     const int tokens = operands.tokens;
     const Q4Route route = q4_g32_route(operands.rows, operands.k, tokens, policy, q4_exact_prefill());
-    if (is_q4_coarse(weight.qtype) &&
-        (route == Q4Route::Fused || route == Q4Route::Baked || route == Q4Route::Exact)) {
-        throw std::invalid_argument(
-            "q4_g128/q4_g256 weights have no W4A8 route yet: call with LinearPolicy::A16Only "
-            "(and without NINFER_Q4_EXACT)");
-    }
     switch (route) {
     case Q4Route::Fused:
     case Q4Route::Baked:
