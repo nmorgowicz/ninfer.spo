@@ -3,7 +3,7 @@
 Needs the environment of tools/gptq/requirements.txt (not the converter's own). Run from anywhere:
 
     python tools/gptq/run_gptq.py --tree TEXT_TREE --calib calib.pt --out GPTQ_DIR [--group-size 32] \
-        [--max-cpu-gb 32 --offload-dir DIR]
+        [--max-cpu-gb 32 --offload-dir DIR] [--fused-solve {auto,on,off}]
 
 The quantized projections are written layer by layer, as soon as LLM Compressor has solved them, by calling
 compressed-tensors' own `PackedQuantizationCompressor.compress` (the function its save path uses). `save_pretrained`
@@ -33,14 +33,52 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import fast_solve
+
 OBSERVERS = ("imatrix_mse", "memoryless_mse", "memoryless_minmax")
+
+
+# q/k/v project the same hidden state and gate/up the same pre-MLP state: one Hessian serves all of them.
+LEADERS = {"k_proj": "q_proj", "v_proj": "q_proj", "up_proj": "gate_proj"}
 
 
 class DumpingGPTQ(GPTQModifier):
     """GPTQModifier that persists each layer's packed tensors right after it is solved."""
 
+    def calibrate_module(self, module, args, _output):
+        """LLM Compressor's hook, except that a k/v/up projection that receives the very tensor its leader (q/gate)
+        just accumulated takes over the leader's Hessian instead of recomputing the identical one. A follower that
+        receives a different tensor accumulates its own, so sharing can never change a result."""
+        if DumpingGPTQ.share_hessians:
+            parent, _, leaf = self._module_names[module].rpartition(".")
+            if leaf in LEADERS:
+                leader = DumpingGPTQ.by_name(self).get(f"{parent}.{LEADERS[leaf]}")
+                fresh = module not in self._num_samples or module in DumpingGPTQ.aliased
+                if fresh and leader in self._num_samples and DumpingGPTQ.last_input.get(leader) is args[0]:
+                    self._hessians[module] = self._hessians[leader]
+                    self._num_samples[module] = self._num_samples[leader]
+                    DumpingGPTQ.aliased.add(module)
+                    DumpingGPTQ.shared += 1
+                    return
+                if module in DumpingGPTQ.aliased:
+                    raise RuntimeError(f"{self._module_names[module]} stopped receiving its leader's input; Hessian would be wrong")
+            elif leaf in LEADERS.values():
+                DumpingGPTQ.last_input[module] = args[0]
+        super().calibrate_module(module, args, _output)
+
+    @staticmethod
+    def by_name(modifier) -> dict:
+        if DumpingGPTQ.names is None:
+            DumpingGPTQ.names = {name: module for module, name in modifier._module_names.items()}
+        return DumpingGPTQ.names
+
     def compress_module_list(self, module_list):
+        started = time.time()
+        for module in module_list:
+            DumpingGPTQ.last_input.pop(module, None)
+            DumpingGPTQ.aliased.discard(module)
         super().compress_module_list(module_list)
+        solved = time.time()
         tensors = {}
         for module in module_list:
             name = self._module_names[module]
@@ -61,13 +99,18 @@ class DumpingGPTQ(GPTQModifier):
         DumpingGPTQ.parts += 1
         save_file(tensors, str(DumpingGPTQ.out / file), metadata={"format": "pt"})
         DumpingGPTQ.weight_map.update({key: file for key in tensors})
-        print(f"dumped {len(tensors)} tensors -> {file}", flush=True)
+        print(f"dumped {len(tensors)} tensors -> {file} (solve {solved - started:.1f}s, pack+save {time.time() - solved:.1f}s)", flush=True)
 
 
 DumpingGPTQ.out = Path(".")
 DumpingGPTQ.weight_map = {}
 DumpingGPTQ.scheme = {}
 DumpingGPTQ.parts = 0
+DumpingGPTQ.share_hessians = True
+DumpingGPTQ.last_input = {}
+DumpingGPTQ.aliased = set()
+DumpingGPTQ.shared = 0
+DumpingGPTQ.names = None
 
 
 def sample_resources(peak: dict, log: Path | None, stop: threading.Event) -> None:
@@ -97,6 +140,14 @@ def main(argv: list[str] | None = None) -> int:
                              "(needed for the full 31B on a 64 GiB machine; 32 was used). Default: all weights on the CPU")
     parser.add_argument("--offload-dir", type=Path, help="scratch directory for offloaded weights (with --max-cpu-gb)")
     parser.add_argument("--peak-log", type=Path, help="append a JSON line of resource peaks every 30 s")
+    parser.add_argument("--fused-solve", choices=fast_solve.MODES, default="auto",
+                        help="solve a 128-column block per Triton launch instead of 128 Python steps (bit-identical output, "
+                             "about 10x faster solves). auto: use it when a start-up self-test of the kernel against the "
+                             "eager loop passes on this machine, else warn and use the eager solver; on: fail instead of "
+                             "falling back; off: eager solver")
+    parser.add_argument("--share-hessians", choices=("on", "off"), default="on",
+                        help="let k/v and up take over the Hessian that q and gate just accumulated from the same input "
+                             "tensor (bit-identical; measured 0.8 s of 7.6 s per layer on the calibration pass)")
     args = parser.parse_args(argv)
     if args.out.exists():
         raise FileExistsError(f"{args.out} exists; use a fresh directory")
@@ -127,6 +178,8 @@ def main(argv: list[str] | None = None) -> int:
         actorder=None,
         offload_hessians=False,
     )
+    fast_solve.install(args.fused_solve)
+    DumpingGPTQ.share_hessians = args.share_hessians == "on"
     load = {"device_map": "cpu"}
     if args.max_cpu_gb is not None:
         load = {"device_map": "auto_offload", "max_memory": {"cpu": int(args.max_cpu_gb * 2**30)},
@@ -178,7 +231,8 @@ def main(argv: list[str] | None = None) -> int:
     peak["rss_gib"] = max(peak["rss_gib"], psutil.Process().memory_info().rss / 2**30)
     peak["gpu_torch_peak_gib"] = max(peak["gpu_torch_peak_gib"], torch.cuda.max_memory_allocated() / 2**30)
     print(json.dumps({"calibration_s": round(seconds, 1), "projections": len(DumpingGPTQ.weight_map) // 3,
-                      "observer": args.observer, "group_size": args.group_size, **peak}), flush=True)
+                      "observer": args.observer, "group_size": args.group_size,
+                      "shared_hessians": DumpingGPTQ.shared, **peak}), flush=True)
     return 0
 
 

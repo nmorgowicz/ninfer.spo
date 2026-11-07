@@ -292,12 +292,12 @@ def test_score_steps_follow_section_six_of_the_guide(env):
 def test_estimates_and_table_match_the_decided_presets():
     table = {p.id: (p.file_gb, p.kl, p.wait) for p in build.PRESETS.values()}
     assert table == {
-        "best-small": (16.9, 0.1213, "about 1.5 h"), "best-medium": (18.4, 0.0845, "about 1.5 h"),
+        "best-small": (16.9, 0.1213, "about 30 min"), "best-medium": (18.4, 0.0845, "about 30 min"),
         "fast-medium": (17.5, 0.1543, "about 40 min"), "fast-small": (16.8, 0.2376, "about 40 min"),
         "draft": (18.4, 0.2654, "about 15 min"),
     }
     for preset in build.PRESETS.values():
-        limit = {"gptq": 90, "rtn": 45, "plain": 20}[preset.method]
+        limit = {"gptq": 45, "rtn": 45, "plain": 20}[preset.method]
         assert sum(preset.minutes.values()) < limit
 
 

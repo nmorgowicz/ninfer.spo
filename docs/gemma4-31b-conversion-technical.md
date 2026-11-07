@@ -85,7 +85,7 @@ which was first scored A16.
 - Free disk: the output is 16–19 GB, intermediates are not kept.
 
 Timings on an RTX 5090: conversion 5–7 minutes (15 with MTP and hashing), Q8_0 GGUF 7 minutes, statistics
-collection 12 minutes, GPTQ 54 to 55 minutes, one quality measurement 4 minutes (A16) or about 30 seconds (W4A8).
+collection 12 minutes, GPTQ 17 minutes (55 minutes with the original per-column solver), one quality measurement 4 minutes (A16) or about 30 seconds (W4A8).
 
 ## 4. Results
 
@@ -418,9 +418,13 @@ torch 2.13.0+cu130): `GPTQModifier` with 4-bit symmetric int weights, `strategy 
 None`, `block_size 128`, `dampening_frac 0.01`, sequential targets `Gemma4TextDecoderLayer`, and the 400 chat-prefixed
 512-token chunks used for the imatrix as calibration data. transformers 5.14.1 cannot read the checkpoint's
 `per_layer_config`, so GPTQ ran on a text-only `Gemma4ForCausalLM` tree whose config carries
-`global_head_dim`/`num_global_key_value_heads` (what `normalize_config` produces). The run took 54 minutes on one
+`global_head_dim`/`num_global_key_value_heads` (what `normalize_config` produces). The spike run took 54 minutes on one
 RTX 5090 (10.3 GiB GPU, 39 GiB RAM with 32 GiB of weights kept on the CPU and the rest offloaded to disk). Group sizes
-128 and 256 take 55 minutes each, with no observer or dampening change.
+128 and 256 took 55 minutes each, with no observer or dampening change. `tools/gptq/run_gptq.py` now solves each
+128-column block with one Triton launch (the kernel of LLM Compressor 0.14.0, vendored) instead of 128 Python steps and
+shares the q/k/v and gate/up Hessians; the output is bit-identical (0 of 1,230 tensors differ from the original runs
+at group 32 and 256) and the run takes 17.4 minutes at group 32 and 16.9 at group 256 (measured wall time, same
+machine). See the [GPTQ README](../tools/gptq/README.md#41-where-the-time-goes-and-what-makes-it-fast).
 
 What the importer guarantees. It copies codes and scales word for word: every one of the 915,210,240 BF16 scales
 converts to binary16 unchanged (it refuses the checkpoint otherwise), `weight_zero_point` and `weight_g_idx` are

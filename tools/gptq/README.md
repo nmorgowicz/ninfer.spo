@@ -11,6 +11,7 @@ so use the recommended `imatrix_mse` observer: the default `memoryless_minmax` o
 | `make_calib.py` | Chat-prefixed calibration text (from `gemma4_q4 calibration-text`) -> `[chunks, 512]` token tensor |
 | `make_text_tree.py` | BF16 multimodal checkpoint -> text-only `Gemma4ForCausalLM` tree that transformers 5.14 can load |
 | `run_gptq.py` | GPTQ with LLM Compressor, layer by layer, writes the packed projections as it goes |
+| `fast_solve.py`, `fused_gptq_kernel.py` | The fused block solve `run_gptq.py` installs by default (Triton kernel vendored from LLM Compressor 0.14.0), with its start-up self-test |
 | `check_checkpoint.py` | Verifies the checkpoint is importable (4-bit codes, scales exact in binary16) before you convert |
 
 This is a separate environment from the converter's. The converter itself needs only what
@@ -68,12 +69,72 @@ python tools/gptq/run_gptq.py --tree work/text60 --calib work/calib.pt --out wor
 ```
 
 `--observer` defaults to `imatrix_mse` (importance-weighted scale search from the activations seen at each
-layer). Expect about 54 minutes on an RTX 5090 for 400 chunks: 2,400 s of GPTQ solves (the 21504-wide down projection
-15 s per layer, the others 4 to 7 s), the rest forward passes. Peak torch memory 10.3 GiB; host RSS peaked at 39 GiB
-with the 32 GiB CPU cap. Group sizes 128 and 256 take the same time and memory (`--group-size`, defaults unchanged)
-and needed no observer or dampening change: on the author's model, with `--native-groups` at conversion, group 256
-scores KL 0.1192 (A16) / 0.1213 (W4A8) in a 16.37 GB file and group 128 scores 0.1033 / 0.1081 in 16.59 GB, against
-0.1504 / 0.1569 for calibrated RTN at group 32 (17.92 GB); group 32 GPTQ scores 0.0805 / 0.0845.
+layer). Expect about 17 minutes on an RTX 5090 for 400 chunks (measured: 1,042 s wall for group 32, 1,012 s for group
+256, with the default fused solve below). The same run with the original solver takes 54 to 55 minutes: 2,400 s of
+GPTQ solves (the 21504-wide down projection 15 s per layer, the others 4 to 7 s), the rest forward passes. Peak
+torch memory 10.3 GiB; host RSS peaked at 39 GiB with the 32 GiB CPU cap. Group sizes 32, 128 and 256 take the same
+time and memory (`--group-size`, defaults unchanged) and needed no observer or dampening change: on the author's
+model, with `--native-groups` at conversion, group 256 scores KL 0.1192 (A16) / 0.1213 (W4A8) in a 16.37 GB file and
+group 128 scores 0.1033 / 0.1081 in 16.59 GB, against 0.1504 / 0.1569 for calibrated RTN at group 32 (17.92 GB);
+group 32 GPTQ scores 0.0805 / 0.0845.
+
+### 4.1 Where the time goes, and what makes it fast
+
+LLM Compressor 0.13.0 solves each weight matrix with a Python loop of one step per input column (about 30 tiny CUDA
+launches and 2 to 3 host/device syncs each, 0.70 ms per column whatever the matrix shape; Gemma 4 31B has 3.42 million
+columns): 2,381 of the 3,316 s of the original run, with the GPU 15% busy. The default now replaces that loop by one
+Triton launch per 128-column block (`fast_solve.py`, with the kernel in `fused_gptq_kernel.py`, vendored from
+LLM Compressor 0.14.0, PR #3128, Apache-2.0; the installed 0.13.0 package is not touched). Everything else of the solve
+(damping, Cholesky chain, the error-feedback GEMM between blocks) is unchanged and the output is **bit-identical** to
+the original solver:
+
+| Check (RTX 5090, 31B text tree) | Result |
+|---|---|
+| Original solver, 6 layers, run twice | bit-deterministic: 0 of 123 tensors differ between runs, and 0 differ from layers 0-5 of the earlier full run |
+| Fused solve vs original, 6 layers, group 32 and group 256 | 0 of 123 tensors differ, both groups |
+| Full 60 layers, fused solve + shared Hessians, group 32 | 0 of 1,230 tensors differ from the original full run (`gptq-g32-imatrix-mse`) |
+| Full 60 layers, group 256 | 0 of 1,230 tensors differ from the original full group-256 run |
+
+Full group-32 run (1,042 s wall, 1,024 s inside LLM Compressor), measured split: calibration forward passes with
+Hessian accumulation 473 s, the propagation passes 121 s, solving 117 s (of which the kernel and Cholesky are 69 s;
+it was 2,381 s), packing and writing the checkpoint 127 s, observer search, offload write-back and bookkeeping the
+remaining 186 s (by subtraction, not measured separately). Forward passes and Hessians are now the largest part (58%).
+
+- `--fused-solve {auto,on,off}` (default `auto`). `auto` runs a self-test at start-up (a small random layer, two
+  blocks, solved with the kernel and with the original per-column loop; a bit difference or a Triton compile failure
+  disables the fast path), prints one line saying which solver runs, and otherwise keeps the original solver with a
+  warning; the run is then about 3 times slower but correct. `on` refuses to start without the kernel, `off` is the
+  original solver. Modules the kernel does not cover (anything but symmetric INT4 groups with bf16 scales and a
+  power-of-two block width dividing the columns) fall back per module.
+- Needs Triton: `triton-windows` is pinned in `requirements.txt` (on Linux torch brings Triton). The kernel was
+  compiled for `sm_120a` by triton-windows 3.8.0.post28 on an RTX 5090. It needs ptxas, which that package bundles.
+- `--share-hessians {on,off}` (default `on`). q/k/v read one tensor, and so do gate/up, but LLM Compressor builds a
+  Hessian per projection. With sharing, k, v and up take over the Hessian that q and gate just accumulated from the
+  very same tensor (a follower that ever sees a different tensor accumulates its own). Measured bit-identical: the q/k/v
+  and gate/up Hessians were equal (`torch.equal`) in all 17 follower projections of the 6-layer run before the solve,
+  and the output is bit-identical; it saves about 0.8 s of 7.6 s per layer.
+
+### 4.2 Faster variants that were measured and not adopted
+
+These change the order of floating-point work, so they are not bit-identical; GPTQ amplifies such differences
+(about 10% of the 4-bit codes and a few thousandths of the scales change for any of them), so each one needs the
+quality gate, a full-model paired KL (47 windows, W4A8) against the group-32 baseline of 0.0845. None passed, so none
+is in `run_gptq.py`; the code and logs of the experiments are not part of this repository.
+
+| Variant (group 32, 60 layers unless noted) | Time | Codes differing from the default run | Paired KL against the baseline 0.0845 |
+|---|---|---|---|
+| Default (fused solve + shared Hessians) | 1,042 s wall | 0 (identical to the original solver) | the baseline |
+| `batch_size` 8 | 835 s wall | 10.4% (6 layers) | 0.0906, +0.0060 (95% CI -0.0011..+0.0132); lower in 18 of 47 windows |
+| `batch_size` 8 and bf16 tensor-core Hessian (`addmm` bf16 to float32) | 669 s wall | 9.5% | 0.0919, +0.0074 (95% CI -0.0018..+0.0165); lower in 16 of 47 windows |
+| LLM Compressor `sequential_prefetch=True` (6 layers) | 94 s against 99 s | 14.9% (3.4% of the scales) | not scored: it should only overlap transfers, yet the output changed more than for any other variant, so it was dropped without investigating |
+
+Both scored variants are 7 to 9% worse in the mean with a confidence interval that contains 0 but leans positive;
+that is not the "comfortably contains 0" the route needs, so they are off. The bf16 Hessian alone is 3.4 times faster
+than the float32 one on a 21504-wide Hessian (3.1 against 10.8 ms per call, microbenchmark), with a relative
+difference of 1e-6. If you want the 3 to 6 minutes anyway, test it with a paired KL first.
+
+The remaining time is calibration forward passes with Hessian accumulation (46%), packing and writing (12%) and the
+propagation passes (12%): see the split in section 4.1.
 
 Workarounds the script applies, each learned the hard way:
 

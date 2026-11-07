@@ -72,15 +72,15 @@ class Preset:
 PRESETS: dict[str, Preset] = {
     "best-small": Preset(
         "best-small", "gptq", "GPTQ, group 256", "Best quality per byte: the recommended default for most people.",
-        "small", 16.9, 0.1213, "about 1.5 h", 256, True, None, "q4_g256_fp16", 75, 103, 17,
-        {"calibration-source": 1, "calibration-render": 1, "calibration-tokens": 1, "text-tree": 2, "gptq": 55,
-         "gptq-check": 5, "convert": 15, "receipt-check": 0.5, "finalize": 0.5},
+        "small", 16.9, 0.1213, "about 30 min", 256, True, None, "q4_g256_fp16", 75, 103, 17,
+        {"calibration-source": 1, "calibration-render": 1, "calibration-tokens": 1, "text-tree": 2, "gptq": 18,
+         "gptq-check": 1, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
     ),
     "best-medium": Preset(
         "best-medium", "gptq", "GPTQ, group 32", "Highest quality of the five; about 1.6 GB larger than best-small.",
-        "medium", 18.4, 0.0845, "about 1.5 h", 32, False, None, "q4_g32_fp16", 75, 103, 17,
-        {"calibration-source": 1, "calibration-render": 1, "calibration-tokens": 1, "text-tree": 2, "gptq": 55,
-         "gptq-check": 5, "convert": 15, "receipt-check": 0.5, "finalize": 0.5},
+        "medium", 18.4, 0.0845, "about 30 min", 32, False, None, "q4_g32_fp16", 75, 103, 17,
+        {"calibration-source": 1, "calibration-render": 1, "calibration-tokens": 1, "text-tree": 2, "gptq": 18,
+         "gptq-check": 1, "convert": 6, "receipt-check": 0.5, "finalize": 0.5},
     ),
     "fast-medium": Preset(
         "fast-medium", "rtn", "calibrated RTN, g32 with 6-bit two-level scales",
