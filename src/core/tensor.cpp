@@ -3,6 +3,8 @@
 #include <array>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 
 namespace ninfer {
 namespace {
@@ -45,6 +47,36 @@ std::int64_t shape_numel(const std::array<std::int32_t, 4>& shape) {
         total = checked_mul_i64(total, dim);
     }
     return total;
+}
+
+std::string shape_text(const std::int32_t* dims, std::size_t rank) {
+    std::string out = "[";
+    for (std::size_t i = 0; i < rank; ++i) {
+        if (i != 0) { out += ','; }
+        out += std::to_string(dims[i]);
+    }
+    return out + ']';
+}
+
+std::string shape_text(std::initializer_list<std::int32_t> shape) {
+    return shape_text(shape.begin(), shape.size());
+}
+
+std::string caller_text(const std::source_location& caller) {
+    std::string_view file = caller.file_name();
+    for (const std::string_view root : {"/src/", "\\src\\", "/src\\", "\\src/"}) {
+        const auto at = file.rfind(root);
+        if (at != std::string_view::npos) {
+            file.remove_prefix(at + 1);
+            break;
+        }
+    }
+    return std::string(file) + ':' + std::to_string(caller.line());
+}
+
+[[noreturn]] void shape_error(const char* what, const std::string& detail,
+                              const std::source_location& caller) {
+    throw std::invalid_argument(std::string(what) + ": " + detail + " at " + caller_text(caller));
 }
 
 void set_contiguous_strides(Tensor& tensor) {
@@ -96,23 +128,37 @@ bool Tensor::is_contiguous() const {
     return true;
 }
 
-Tensor Tensor::view(std::initializer_list<std::int32_t> shape) const {
-    if (!is_contiguous()) { throw std::invalid_argument("view requires a contiguous tensor"); }
+Tensor Tensor::view(std::initializer_list<std::int32_t> shape, std::source_location caller) const {
+    if (!is_contiguous()) {
+        shape_error("view requires a contiguous tensor", shape_text(ne, 4), caller);
+    }
 
     const auto normalized = normalize_shape(shape);
     if (shape_numel(normalized) != numel()) {
-        throw std::invalid_argument("view element count mismatch");
+        shape_error("view element count mismatch",
+                    shape_text(ne, 4) + " (" + std::to_string(numel()) + ") to " +
+                        shape_text(shape) + " (" + std::to_string(shape_numel(normalized)) + ")",
+                    caller);
     }
 
     return Tensor(data, dtype, shape);
 }
 
-Tensor Tensor::reshape(std::initializer_list<std::int32_t> shape) const { return view(shape); }
+Tensor Tensor::reshape(std::initializer_list<std::int32_t> shape,
+                       std::source_location caller) const {
+    return view(shape, caller);
+}
 
-Tensor Tensor::slice(int dim, std::int32_t start, std::int32_t len) const {
-    if (dim < 0 || dim >= 4) { throw std::invalid_argument("slice dim out of range"); }
+Tensor Tensor::slice(int dim, std::int32_t start, std::int32_t len,
+                     std::source_location caller) const {
+    if (dim < 0 || dim >= 4) {
+        shape_error("slice dim out of range", "dim " + std::to_string(dim), caller);
+    }
     if (start < 0 || len <= 0 || start > ne[dim] || len > ne[dim] - start) {
-        throw std::invalid_argument("slice range out of bounds");
+        shape_error("slice range out of bounds",
+                    shape_text(ne, 4) + " dim " + std::to_string(dim) + " start " +
+                        std::to_string(start) + " len " + std::to_string(len),
+                    caller);
     }
 
     Tensor out                = *this;

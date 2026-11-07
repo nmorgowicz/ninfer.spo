@@ -609,7 +609,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         }
         rendered.append_template("<|im_start|>assistant\n");
         add_rewrite_execution_boundary();
-        if (keep_thinking) {
+        // An empty think block is not previous reasoning. Writing one makes the
+        // model narrate that there is nothing to reproduce on the next turn.
+        if (keep_thinking && !reasoning.text.empty()) {
             rendered.append_template("<think>\n");
             add_rewrite_execution_boundary();
             rendered.append(reasoning);

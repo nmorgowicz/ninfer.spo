@@ -107,6 +107,8 @@ The endpoint supports:
 - the top-level `reasoning_effort` field;
 - `enable_thinking` and `preserve_thinking`, either at top level or in
   `chat_template_kwargs`;
+- a per-request thinking cap as `thinking_token_budget` or `thinking_budget`, either at top level
+  or in `chat_template_kwargs`;
 - Assistant `reasoning_content` and `reasoning` history aliases;
 - `capture: {"record": true}` when the server was started with `--capture-path`. The record id
   comes back as `capture.record_id` on the completion and on the last streamed chunk. The same
@@ -313,7 +315,10 @@ special tokens cannot be overridden through kwargs.
 `--default-thinking-budget N` sets a positive default thinking-token cap for requests that start
 in thinking mode. Non-thinking requests receive no cap. It may coexist with `--no-thinking`
 because requests can explicitly enable thinking. Anthropic
-`thinking:{"type":"enabled","budget_tokens":N}` overrides this default for that request.
+`thinking:{"type":"enabled","budget_tokens":N}` overrides this default for that request. Chat
+Completions takes `thinking_token_budget` (vLLM's name) or `thinking_budget`, either at top level
+or in `chat_template_kwargs`; the value must be at least 1, all given values must agree, and the
+keys are not passed to the template. A request with thinking disabled ignores the budget.
 
 Add `--default-thinking-budget 512` to the startup command to cap model-origin thinking at 512
 tokens for every thinking-enabled request.
@@ -334,7 +339,10 @@ Conflicting explicit `enable_thinking` and effort values return `conflicting_tem
 
 `preserve_thinking` controls reasoning retention according to the selected template. Request
 options override server defaults set with `--no-thinking` and `--preserve-thinking`. Unspecified
-thinking, effort and preservation options use the template's defaults.
+thinking, effort and preservation options use the template's defaults. Disabled thinking
+(`enable_thinking` false, or `reasoning_effort` `none`) forces preservation off: there is no
+reasoning channel to carry. A history turn with no reasoning text is not wrapped in an empty
+think block.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty

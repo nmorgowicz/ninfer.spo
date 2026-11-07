@@ -739,6 +739,29 @@ void parse_sampling(const Json& body, GenerationRequest& output) {
     }
 }
 
+// vLLM names the per-request thinking cap thinking_token_budget; thinking_budget is the shorter
+// spelling other servers accept. Either may sit at top level or in chat_template_kwargs.
+constexpr const char* kThinkingBudgetKeys[] = {"thinking_token_budget", "thinking_budget"};
+
+std::optional<std::uint32_t> parse_thinking_budget(const Json& body) {
+    std::optional<int> budget;
+    auto take = [&](const Json& object, const char* key) {
+        const std::optional<int> value = optional_int(object, key);
+        if (!value) { return; }
+        if (*value < 1) { bad_request(std::string(key) + " must be at least 1", key); }
+        if (budget && *budget != *value) {
+            bad_request("conflicting thinking budget values", key, "conflicting_template_option");
+        }
+        budget = value;
+    };
+    for (const char* key : kThinkingBudgetKeys) { take(body, key); }
+    if (body.contains("chat_template_kwargs") && body.at("chat_template_kwargs").is_object()) {
+        for (const char* key : kThinkingBudgetKeys) { take(body.at("chat_template_kwargs"), key); }
+    }
+    if (!budget) { return std::nullopt; }
+    return static_cast<std::uint32_t>(*budget);
+}
+
 struct TemplateOptions {
     std::string kwargs_json;
     std::optional<bool> enable_thinking;
@@ -760,7 +783,9 @@ TemplateOptions parse_template_options(const Json& body) {
     if (!kwargs.is_object()) {
         bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
     }
-    output.kwargs_json = kwargs.dump();
+    Json template_kwargs = kwargs;
+    for (const char* key : kThinkingBudgetKeys) { template_kwargs.erase(key); }
+    output.kwargs_json = template_kwargs.dump();
     auto merge         = [&](const char* key, std::optional<bool>& top_level) {
         const std::optional<bool> nested = get_optional_bool(kwargs, key);
         if (top_level && nested && *top_level != *nested) {
@@ -852,6 +877,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     output.generation.enable_thinking           = template_options.enable_thinking;
     output.generation.preserve_thinking         = template_options.preserve_thinking;
     output.generation.chat_template_kwargs_json = template_options.kwargs_json;
+    output.generation.thinking_budget           = parse_thinking_budget(body);
     if (body.contains("response_format") && !body["response_format"].is_null())
         parse_json_output_format(body["response_format"], output.generation, "response_format",
                                  JsonFormatProtocol::Chat);

@@ -27,6 +27,12 @@ __device__ __forceinline__ bool argmax_better(float value, std::int32_t index, f
     return value > best_value || (value == best_value && index < best_index);
 }
 
+// A NaN never compares better, so a column of NaN would leave INT32_MAX as the winning row and
+// the shortlist would index its id map with it. Draft scoring ranks NaN as the lowest value.
+__device__ __forceinline__ float shortlist_rank_value(float value) {
+    return isnan(value) ? -CUDART_INF_F : value;
+}
+
 __device__ __forceinline__ void argmax_warp_reduce(float& value, std::int32_t& index) {
     constexpr unsigned int kMask = 0xffffffffu;
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -137,8 +143,9 @@ __launch_bounds__(kShortlistRerankTile) __global__ void shortlist_tile_candidate
     const int token             = static_cast<int>(blockIdx.y);
     const int row               = tile * kShortlistRerankTile + static_cast<int>(threadIdx.x);
     const std::int64_t base     = static_cast<std::int64_t>(token) * physical_rows;
-    const float original_value  = row < shortlist_rows ? __bfloat162float(logits[base + row])
-                                                       : -CUDART_INF_F;
+    const float original_value =
+        row < shortlist_rows ? shortlist_rank_value(__bfloat162float(logits[base + row]))
+                             : -CUDART_INF_F;
     const std::int32_t original_row = row < shortlist_rows ? row : INT32_MAX;
     float best_value                = original_value;
     std::int32_t best_row           = original_row;
@@ -153,8 +160,10 @@ __launch_bounds__(kShortlistRerankTile) __global__ void shortlist_tile_candidate
     const std::int64_t output_base =
         static_cast<std::int64_t>(token) * candidate_rows + tile * kShortlistCandidatesPerTile;
     if (threadIdx.x == 0) {
+        // A tile with one live row has no second candidate; repeat the first.
+        const std::int32_t second_row  = best_row == INT32_MAX ? first_row : best_row;
         candidate_ids[output_base]     = id_map[first_row];
-        candidate_ids[output_base + 1] = id_map[best_row];
+        candidate_ids[output_base + 1] = id_map[second_row];
     }
 }
 
@@ -203,7 +212,7 @@ __launch_bounds__(kShortlistRerankTile) __global__ void shortlist_exact_select_k
     float best_value        = -CUDART_INF_F;
     std::int32_t best_index = INT32_MAX;
     for (int row = candidate; row < candidate_rows; row += blockDim.x) {
-        const float value          = candidate_scores[base + row];
+        const float value          = shortlist_rank_value(candidate_scores[base + row]);
         const std::int32_t index   = candidate_ids[base + row];
         if (argmax_better(value, index, best_value, best_index)) {
             best_value = value;

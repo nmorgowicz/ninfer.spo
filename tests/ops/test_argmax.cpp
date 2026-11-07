@@ -123,6 +123,74 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t
     return failures;
 }
 
+// A draft column of NaN logits must still yield an id from the shortlist, never an index past it.
+int run_shortlist_nan_case() {
+    constexpr std::int32_t kRows   = 1024;
+    constexpr std::int32_t kHidden = 64;
+    constexpr std::int32_t kTokens = 3;
+    constexpr std::int32_t kCandidates = (kRows / 512) * 2;
+
+    std::vector<std::uint16_t> hidden(static_cast<std::size_t>(kHidden) * kTokens);
+    for (std::size_t i = 0; i < hidden.size(); ++i) {
+        hidden[i] = f32_to_bf16(static_cast<float>(i % 7) * 0.125f - 0.25f);
+    }
+    std::vector<std::uint16_t> head(static_cast<std::size_t>(kRows) * kHidden);
+    for (std::size_t i = 0; i < head.size(); ++i) {
+        head[i] = f32_to_bf16(static_cast<float>((i * 2654435761u) % 97u) / 97.0f - 0.5f);
+    }
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(kRows) * kTokens);
+    for (std::int32_t token = 0; token < kTokens; ++token) {
+        for (std::int32_t row = 0; row < kRows; ++row) {
+            logits[static_cast<std::size_t>(token) * kRows + row] =
+                token == 1 ? std::uint16_t{0x7fc0} : f32_to_bf16(static_cast<float>(row % 31));
+        }
+    }
+    std::vector<std::int32_t> ids(kRows);
+    for (std::int32_t row = 0; row < kRows; ++row) { ids[static_cast<std::size_t>(row)] = row; }
+
+    GuardedDeviceBuffer device_hidden(hidden.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_head(head.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_logits(logits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_candidate_ids(kCandidates * kTokens * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_candidate_scores(kCandidates * kTokens * sizeof(float));
+    GuardedDeviceBuffer device_output(kTokens * sizeof(std::int32_t));
+    device_hidden.copy_from_host(hidden.data(), hidden.size() * sizeof(std::uint16_t));
+    device_head.copy_from_host(head.data(), head.size() * sizeof(std::uint16_t));
+    device_logits.copy_from_host(logits.data(), logits.size() * sizeof(std::uint16_t));
+    device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+    device_output.fill(0xcd);
+
+    Weight exact_head;
+    exact_head.qtype  = QType::BF16;
+    exact_head.layout = QuantLayout::Contiguous;
+    exact_head.qdata  = device_head.data();
+    exact_head.n      = kRows;
+    exact_head.k      = kHidden;
+    Tensor hidden_tensor(device_hidden.data(), DType::BF16, {kHidden, kTokens});
+    Tensor logits_tensor(device_logits.data(), DType::BF16, {kRows, kTokens});
+    Tensor candidate_ids(device_candidate_ids.data(), DType::I32, {kCandidates, kTokens});
+    Tensor candidate_scores(device_candidate_scores.data(), DType::FP32, {kCandidates, kTokens});
+    Tensor output_tensor(device_output.data(), DType::I32, {kTokens});
+    ops::shortlist_exact_argmax(hidden_tensor, logits_tensor, kRows, exact_head,
+                                static_cast<const std::int32_t*>(device_ids.data()), candidate_ids,
+                                candidate_scores, output_tensor, nullptr);
+    cuda_synchronize();
+
+    int failures       = 0;
+    const auto actual  = from_device<std::int32_t>(device_output.data(), kTokens);
+    for (std::int32_t token = 0; token < kTokens; ++token) {
+        const std::int32_t id = actual[static_cast<std::size_t>(token)];
+        if (id < 0 || id >= kRows) {
+            std::cerr << "shortlist NaN column: token " << token << " got id " << id << '\n';
+            ++failures;
+        }
+    }
+    failures += device_ids.verify_guards("shortlist NaN id map");
+    failures += device_output.verify_guards("shortlist NaN output");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -142,6 +210,7 @@ int main() {
     failures += run_case(131072, 131072, 1);
     failures += run_case(131072, 131072, 15);
     failures += run_case(131072, 131072, 120);
+    failures += run_shortlist_nan_case();
     std::cout << (failures ? "FAIL" : "OK") << " argmax\n";
     return failures ? 1 : 0;
 }

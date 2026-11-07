@@ -721,6 +721,28 @@ int test_reasoning_and_extensions() {
     failures += check(parse(body).generation.messages.size() == 1,
                       "null unknown template option is neutral");
 
+    body                          = base_request();
+    body["thinking_token_budget"] = 512;
+    failures += check(parse(body).generation.thinking_budget == 512U,
+                      "top-level vLLM thinking budget did not reach the request");
+    body                         = base_request();
+    body["chat_template_kwargs"] = Json{{"thinking_token_budget", 256}, {"future", 1}};
+    const GenerationRequest kwargs_budget = parse(body).generation;
+    const Json template_kwargs = Json::parse(kwargs_budget.chat_template_kwargs_json);
+    failures += check(kwargs_budget.thinking_budget == 256U &&
+                          !template_kwargs.contains("thinking_token_budget") &&
+                          template_kwargs.at("future") == 1,
+                      "template-kwargs thinking budget was not taken out of the template context");
+    body["thinking_budget"] = 128;
+    failures += check(api_error([&] { (void)parse(body); }).code == "conflicting_template_option",
+                      "conflicting thinking budgets accepted");
+    body                    = base_request();
+    body["thinking_budget"] = 0;
+    failures += check(api_error([&] { (void)parse(body); }).param == "thinking_budget",
+                      "zero thinking budget accepted");
+    failures += check(!parse(base_request()).generation.thinking_budget,
+                      "omitted thinking budget was not left to the server default");
+
     body                        = base_request();
     body["repetition_penalty"]  = 1.0;
     body["mm_processor_kwargs"] = Json{{"max_pixels", nullptr}};

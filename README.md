@@ -10,7 +10,7 @@ Every number below is from one RTX PRO 6000 Blackwell Max-Q (96 GB, 300 W cap, P
 
 ## Qwen3.8 Flash-Next, the Pi server
 
-`scripts/serve.cmd` starts the server from the release build beside this repo. It loads the artifact in `NINFER_MODEL`, listens on `NINFER_PORT` (8003 if unset), and serves 262,144 context, bf16 KV, MTP with `auto` drafts and the proposal head, vision, preserve-thinking, and 16 device state slots. Set `NINFER_MODEL` to `qwen3_8_flash_next_125b_a6b_nvfp4_fp8proj_nvfp4mtp.ninfer`. The Pi wiring is in `docs/pi.md`. The engine is ready in 45 to 60 s, with 70.5 GiB of weights on the GPU and the 47.7 GiB PLE table locked in host RAM. Quick perplexity is 3.554.
+`scripts/serve.cmd` starts the server from the release build beside this repo. It loads the artifact in `NINFER_MODEL`, listens on `NINFER_PORT` (8003 if unset), and serves 262,144 context, int8 KV, three concurrent requests, MTP with `auto` drafts and the proposal head, vision, preserve-thinking, and 16 device state slots. Set `NINFER_MODEL` to `qwen3_8_flash_next_125b_a6b_nvfp4_fp8proj_nvfp4mtp.ninfer`. The Pi wiring is in `docs/pi.md`. The engine is ready in 45 to 60 s, with 70.5 GiB of weights on the GPU and the 47.7 GiB PLE table locked in host RAM. Quick perplexity is 3.554.
 
 Point `NINFER_MODEL` at `qwen3_8_flash_next_125b_a6b_uncensored_nvfp4_fp8ple_fp8proj_nvfp4mtp.ninfer` instead to serve the same recipe with the refusal direction removed; no flag changes.
 
