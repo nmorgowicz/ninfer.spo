@@ -6,10 +6,13 @@ from functools import partial
 import hashlib
 import io
 import json
+import os
+import socket
 from pathlib import Path
 import struct
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -972,3 +975,214 @@ def test_requirements_pins_are_parsed():
     pins = checks.parse_pins(build.FORK_ROOT / "tools" / "gptq" / "requirements.txt", checks.GPTQ_PINS)
     assert pins == {"torch": "2.13.0+cu130", "transformers": "5.14.1", "llmcompressor": "0.13.0",
                     "compressed-tensors": "0.18.0"}
+
+
+# ---------------------------------------------------------------- serve-check
+
+
+FAKE_SERVER_SCRIPT = '''
+"""Fake ninfer-spo-serve for the serve-check tests: the OpenAI endpoints only, no GPU, no model."""
+import argparse
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--host", default="127.0.0.1")
+parser.add_argument("--port", type=int, required=True)
+parser.add_argument("--model-id", required=True)
+parser.add_argument("--model-match", default="exact")
+parser.add_argument("--max-context", type=int)
+parser.add_argument("--kv-dtype")
+parser.add_argument("--break-check", action="append", default=[])
+args, _ = parser.parse_known_args()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/v1/models":
+            data = [] if "models" in args.break_check else [
+                {"id": args.model_id, "max_context": args.max_context, "kv_dtype": args.kv_dtype}]
+            self._send(200, {"object": "list", "data": data})
+        else:
+            self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        try:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        except ValueError:
+            body = {}
+        if self.path != "/v1/chat/completions":
+            self._send(404, {"error": "not found"})
+        elif "chat" in args.break_check:
+            self._send(500, {"error": "broken on purpose"})
+        elif "bearer" in args.break_check and self.headers.get("Authorization"):
+            self._send(401, {"error": "unauthorized"})
+        elif "model" not in body:
+            self._send(200 if "missing" in args.break_check else 400, {"error": "model is required"})
+        elif args.model_match != "any" and body["model"] != args.model_id:
+            self._send(404, {"error": {"message": "model '" + str(body["model"]) + "' not found",
+                                       "code": "model_not_found"}})
+        else:
+            self._send(200, {"object": "chat.completion", "model": body["model"],
+                             "choices": [{"index": 0, "message": {"role": "assistant", "content": "pong"},
+                                          "finish_reason": "stop"}]})
+
+    def log_message(self, *parts):
+        pass
+
+
+print("fake server on {}:{} model {} match {}".format(args.host, args.port, args.model_id, args.model_match),
+      flush=True)
+ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+'''
+
+
+def free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def write_fake_launcher(tmp_path: Path, *, alias: str = "131k", match: str = "any", breaks: tuple = ()) -> Path:
+    """A .cmd shaped like a generated launcher whose server is the fake script under this Python."""
+    script = tmp_path / "fake_server.py"
+    script.write_text(FAKE_SERVER_SCRIPT, encoding="utf-8")
+    match_flags = ["--model-match", "any"] if match == "any" else []
+    break_flags = [word for name in breaks for word in ("--break-check", name)]
+    lines = [
+        "@echo off",
+        "rem fake launcher for the serve-check tests",
+        f'"{sys.executable}" "{script}" ^',
+        "  --host 127.0.0.1 --port {} --model-id {} {} ^".format(free_port(), alias, " ".join(match_flags)),
+        "  --max-context 131072 --kv-dtype fp8 --spec mtp " + " ".join(break_flags),
+        "exit /b %errorlevel%",
+        "",
+    ]
+    cmd = tmp_path / "serve-m.cmd"
+    cmd.write_text("\r\n".join(lines), encoding="utf-8", newline="")
+    return cmd
+
+
+def process_alive(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def test_parse_launcher_reads_a_generated_cmd(tmp_path):
+    cmd = tmp_path / "serve.cmd"
+    cmd.write_text("\r\n".join(launcher.launcher_lines(
+        "C:/bin/ninfer-spo-serve.exe", "D:/ninfer/a.ninfer", alias="131k", mtp=True, vision=False)),
+        encoding="utf-8", newline="")
+    plan = build.parse_launcher(cmd)
+    assert plan.server == Path("C:/bin/ninfer-spo-serve.exe")
+    assert plan.artifact == Path("D:/ninfer/a.ninfer")
+    assert (plan.host, plan.port, plan.alias, plan.model_match, plan.kv_dtype, plan.context) == \
+        ("127.0.0.1", 8080, "131k", "any", "fp8", 131072)
+    assert "--spec" in plan.flags and "mtp" in plan.flags
+
+
+def test_serve_check_help_prints_usage(capsys):
+    with pytest.raises(SystemExit) as stop:
+        cli.main(["serve-check", "--help"])
+    assert stop.value.code == 0
+    text = capsys.readouterr().out
+    assert text.startswith("usage:") and "--launcher" in text and "--out" in text
+
+
+def test_serve_check_passes_every_check_and_writes_a_receipt(tmp_path, capsys):
+    cmd = write_fake_launcher(tmp_path)
+    out = tmp_path / "receipt.json"
+    assert cli.main(["serve-check", "--launcher", str(cmd), "--out", str(out)]) == 0
+    text = capsys.readouterr().out
+    assert text.count("PASS") == 6 and "FAIL" not in text and f"Receipt: {out}" in text
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["schema"] == build.SERVE_CHECK_SCHEMA
+    assert [item["status"] for item in data["checks"]] == ["pass"] * 6
+    assert data["checks"][0]["name"] == "ready" and data["checks"][0]["http_code"] == 200
+    names = {item["name"]: item for item in data["checks"]}
+    assert names["chat with another model name"]["http_code"] == 200
+    assert names["chat without a model field"]["http_code"] == 400
+    assert names["chat with an arbitrary bearer token"]["http_code"] == 200
+    assert data["launcher"].endswith("serve-m.cmd") and data["url"].startswith("http://127.0.0.1:")
+    assert data["artifact"]["path"].endswith("fake_server.py")
+    assert data["artifact"]["size"] == (tmp_path / "fake_server.py").stat().st_size
+    assert data["started"].endswith("Z") and data["finished"] >= data["started"]
+    assert data["engine"] == {"model_id": "131k", "model_match": "any", "context": 131072, "kv_dtype": "fp8",
+                              "kv_line": ""}
+
+
+def test_serve_check_exact_match_wants_404_for_another_model_name(tmp_path):
+    cmd = write_fake_launcher(tmp_path, match="exact")
+    out = tmp_path / "receipt.json"
+    assert cli.main(["serve-check", "--launcher", str(cmd), "--out", str(out)]) == 0
+    checks = {item["name"]: item for item in json.loads(out.read_text(encoding="utf-8"))["checks"]}
+    assert checks["chat with another model name"]["http_code"] == 404
+    assert checks["chat with another model name"]["status"] == "pass"
+
+
+def test_serve_check_failure_exits_nonzero_and_names_the_check(tmp_path, capsys):
+    cmd = write_fake_launcher(tmp_path, breaks=("chat",))
+    out = tmp_path / "receipt.json"
+    assert cli.main(["serve-check", "--launcher", str(cmd), "--out", str(out)]) == 1
+    captured = capsys.readouterr()
+    assert "FAIL chat with the launcher model id" in captured.out
+    assert "-> the server refuses its own --model-id" in captured.out
+    assert "serve-check failed: chat with the launcher model id" in captured.err
+    assert json.loads(out.read_text(encoding="utf-8"))["checks"][2]["status"] == "fail"
+
+
+def test_serve_check_refuses_a_missing_launcher(tmp_path, capsys):
+    assert cli.main(["serve-check", "--launcher", str(tmp_path / "nope.cmd")]) == 1
+    assert "launcher not found" in capsys.readouterr().err
+
+
+def test_serve_check_stops_the_child_process(tmp_path):
+    cmd = write_fake_launcher(tmp_path)
+    out = tmp_path / "receipt.json"
+    assert cli.main(["serve-check", "--launcher", str(cmd), "--out", str(out)]) == 0
+    pid = json.loads(out.read_text(encoding="utf-8"))["pid"]
+    deadline = time.monotonic() + 10
+    while process_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not process_alive(pid), f"child {pid} still runs after serve-check"
+
+
+# ---------------------------------------------------------------- docs stay in sync
+
+
+def test_docs_preset_table_matches_the_presets_and_list_presets():
+    # The llama-local-tooling repository keeps its own rendered copy of this table in its docs; that copy is NOT
+    # this fork's to guard. Only docs/gemma4-31b-conversion.md here is checked against the builder.
+    doc = (build.FORK_ROOT / "docs" / "gemma4-31b-conversion.md").read_text(encoding="utf-8")
+    rows = [line for line in doc.splitlines() if line.startswith("| `")]
+    rows = [line for line in rows if line.strip().strip("|").split("|")[0].strip().strip("`") in build.PRESETS]
+    assert len(rows) == len(build.PRESETS)
+    table = cli.preset_table()  # the data `--list-presets` prints
+    for line, preset in zip(rows, build.PRESETS.values()):
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        assert cells[0] == f"`{preset.id}`", line
+        assert cells[2] == f"{preset.file_gb:g} GB", line
+        assert cells[4] == f"{preset.kl:.4f}", line
+        assert cells[5] == preset.wait, line
+        assert f"{preset.id:<12}" in table and f"{preset.file_gb:g} GB" in table
+        assert f"{preset.kl:<7.4f}" in table and preset.wait in table

@@ -15,6 +15,7 @@ from .gemma4_build import (
     CALIBRATION_REVISION,
     FORK_ROOT,
     PRESETS,
+    SERVE_CHECK_ACTIONS,
     BuildConfig,
     BuildError,
     Builder,
@@ -25,10 +26,12 @@ from .gemma4_build import (
     describe_plan,
     fingerprint_of,
     safe_name,
+    serve_check,
 )
 from .gemma4_build_checks import GPTQ_PINS, Probes, find_llama_imatrix, parse_pins, preflight, versions_text
 
-SUBCOMMANDS = ("setup-gptq", "launcher")
+SUBCOMMANDS = ("setup-gptq", "launcher", "serve-check")
+
 METHODS = {
     "best-small": "GPTQ g256",
     "best-medium": "GPTQ g32",
@@ -54,6 +57,8 @@ test build only.
 other commands:
   python -m tools.convert.gemma4_build setup-gptq --venv DIR     create the pinned GPTQ environment
   python -m tools.convert.gemma4_build launcher --artifact F --out FILE.cmd   write a launcher for an existing file
+  python -m tools.convert.gemma4_build serve-check --launcher F.cmd   start the launcher's server, probe the OpenAI
+                                       endpoints, stop it again and write a serving receipt JSON
 
 Calibration text defaults to the pinned public corpus {CALIBRATION_REPO}@{CALIBRATION_REVISION[:12]}.
 The serve launcher uses the qualified settings: 131072 context, FP8 KV, one lane, prefill chunk 128, MTP when the
@@ -159,6 +164,23 @@ def launcher_parser() -> argparse.ArgumentParser:
                         help="any (default): OpenAI requests may send any model name; exact: only --alias, no flag")
     parser.add_argument("--cuda-bin", type=Path)
     parser.add_argument("--no-mtp", action="store_true", help="leave speculative decoding off even if the file has MTP")
+    return parser
+
+
+def serve_check_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m tools.convert.gemma4_build serve-check",
+        description="Start what a generated serve launcher runs, probe the OpenAI endpoints (/v1/models and chat "
+        "completions: the launcher model id, another name under the launcher's --model-match, a missing model field, "
+        "an arbitrary bearer key), stop the child again and write a serving receipt JSON. Exit 0 only if every "
+        "check passes.",
+    )
+    parser.add_argument("--launcher", required=True, type=Path, help="serve-<name>.cmd written by the build or the "
+                        "launcher command")
+    parser.add_argument("--out", type=Path, help="receipt JSON path (default: serve-check-<utcstamp>.json beside "
+                        "the launcher)")
+    parser.add_argument("--host", help="override the launcher --host for the probe (default: the launcher's)")
+    parser.add_argument("--port", type=int, help="override the launcher --port for the probe (default: the launcher's)")
     return parser
 
 
@@ -322,6 +344,24 @@ def run_launcher(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_serve_check(args: argparse.Namespace) -> int:
+    checks, receipt = serve_check(args.launcher, args.out, host=args.host, port=args.port)
+    failed = [item for item in checks if item["status"] != "pass"]
+    for item in checks:
+        head = "PASS" if item["status"] == "pass" else "FAIL"
+        line = f"{head} {item['name']}" + (f": {item['detail']}" if item["detail"] else "")
+        if item["status"] != "pass":
+            action = SERVE_CHECK_ACTIONS.get(item["name"], "rerun serve-check after fixing the above")
+            line += f"\n     -> {action}"
+        print(line)
+    print(f"Receipt: {receipt}")
+    if failed:
+        action = SERVE_CHECK_ACTIONS.get(failed[0]["name"], "rerun serve-check after fixing the above")
+        print(f"ninfer.spo: serve-check failed: {failed[0]['name']}; {action}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None, probes: Probes | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
@@ -332,6 +372,8 @@ def main(argv: list[str] | None = None, probes: Probes | None = None) -> int:
     try:
         if argv and argv[0] == "setup-gptq":
             return setup_gptq(setup_parser().parse_args(argv[1:]), probes)
+        if argv and argv[0] == "serve-check":
+            return run_serve_check(serve_check_parser().parse_args(argv[1:]))
         if argv and argv[0] == "launcher":
             return run_launcher(launcher_parser().parse_args(argv[1:]))
         args = build_parser().parse_args(argv)

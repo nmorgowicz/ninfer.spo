@@ -120,6 +120,12 @@ receipts with the model. A build that stops can be resumed: run the same command
 each new build. Add `--no-mtp` instead of `--assistant` for a file without speculative decoding, or `--with-vision` to
 keep the vision tower.
 
+After a build, check the serving side too: `python -m tools.convert.gemma4_build serve-check --launcher
+serve-<name>.cmd` starts the launcher's server, probes `/v1/models` and the chat endpoint (the launcher's model id,
+another name under the launcher's `--model-match`, a missing `model` field, an arbitrary API key), stops the server
+again and writes a serving receipt `serve-check-<utcstamp>.json` beside the launcher; it exits non-zero and names the
+failing check if anything is off.
+
 ## Run it
 
 Double-click `serve-<name>.cmd`, or run it in a terminal. It starts the server on `127.0.0.1:8080` with the model

@@ -25,7 +25,9 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
 import urllib.request
 
 from . import gemma4_build_launcher as launcher_tools
@@ -934,6 +936,220 @@ class Builder:
             return False
         shutil.rmtree(work)
         return True
+
+
+# ---------------------------------------------------------------- serve-check
+
+SERVE_CHECK_SCHEMA = "ninfer.serve-check/v1"
+SERVE_CHECK_TIMEOUT = 300.0  # seconds until /v1/models must answer
+SERVE_CHECK_ACTIONS = {
+    "ready": "read the server's startup output (is the port free, is the artifact readable?) and start it by hand",
+    "models list": "write the launcher again with the intended --alias",
+    "chat with the launcher model id": "the server refuses its own --model-id; rebuild ninfer-spo-serve from this "
+                                      "checkout (docs/building.md)",
+    "chat with another model name": "the server does not honor --model-match; rebuild ninfer-spo-serve from this "
+                                    "checkout (docs/building.md) or write the launcher with --model-match exact",
+    "chat without a model field": "the server must answer 400 to a request without a model field; rebuild it from "
+                                  "this checkout",
+    "chat with an arbitrary bearer token": "start the server without --api-key so it accepts any key a client sends",
+}
+
+
+@dataclass(frozen=True)
+class LauncherCommand:
+    """What a generated serve launcher runs: the server exe, the artifact and the flat flag list."""
+
+    server: Path
+    artifact: Path
+    flags: tuple[str, ...]
+    host: str
+    port: int
+    alias: str | None  # --model-id; None when the launcher omits it (the server default)
+    model_match: str  # "any" only when the launcher passes --model-match any; the server default is exact
+    kv_dtype: str | None
+    context: int | None  # --max-context
+
+
+def _launcher_words(line: str) -> list[str]:
+    """Split a launcher command line into words, keeping quoted paths (Windows backslashes) whole."""
+    words: list[str] = []
+    for piece in re.split(r'("[^"]*")', line):
+        if piece.startswith('"') and piece.endswith('"') and len(piece) >= 2:
+            words.append(piece[1:-1])
+        else:
+            words.extend(piece.split())
+    return words
+
+
+def parse_launcher(path: Path) -> LauncherCommand:
+    """Read a generated serve `.cmd` and return the server command it runs; refuses anything unparsable."""
+    if not path.is_file():
+        raise ValueError(f"launcher not found: {path}")
+    logical: list[str] = []
+    pending = ""
+    for raw in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.lower().startswith("rem ") or line.startswith("@") or line.startswith("set "):
+            continue
+        if line == "exit /b %errorlevel%":
+            continue
+        if line.endswith("^"):
+            pending += " " + line[:-1].strip()
+            continue
+        logical.append((pending + " " + line).strip())
+        pending = ""
+    if pending:
+        logical.append(pending.strip())
+    command = next((line for line in logical if line.startswith('"')), "")
+    words = _launcher_words(command)
+    if len(words) < 2:
+        raise ValueError(f"no quoted \"<server>\" \"<artifact>\" command line found in {path}")
+    flags = words[2:]
+
+    def value(name: str, default=None):
+        return flags[flags.index(name) + 1] if name in flags else default
+
+    return LauncherCommand(
+        server=Path(words[0]), artifact=Path(words[1]), flags=tuple(flags),
+        host=value("--host", launcher_tools.DEFAULT_HOST), port=int(value("--port", launcher_tools.DEFAULT_PORT)),
+        alias=value("--model-id"), model_match=value("--model-match", "exact"),
+        kv_dtype=value("--kv-dtype"), context=int(value("--max-context")) if "--max-context" in flags else None,
+    )
+
+
+def _request(method: str, url: str, body: dict | None = None, headers: dict | None = None,
+             timeout: float = 30.0) -> tuple[int, bytes]:
+    """One HTTP request; returns (0, b"") on connection errors instead of raising, so polling stays simple."""
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(url, data=data, method=method)
+    request.add_header("Content-Type", "application/json")
+    for name, text in (headers or {}).items():
+        request.add_header(name, text)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as error:  # a real HTTP answer, just not 2xx
+        return error.code, error.read()
+    except (urllib.error.URLError, OSError):
+        return 0, b""
+
+
+def _utcstamp(moment: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment))
+
+
+def _stop_child(child: subprocess.Popen) -> None:
+    if child.poll() is not None:
+        return
+    child.terminate()
+    try:
+        child.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait(timeout=10)
+
+
+def _chat(url: str, headers: dict | None = None, **fields) -> tuple[int, bytes]:
+    return _request("POST", url + "/v1/chat/completions", body=dict(fields), headers=headers)
+
+
+def serve_check(launcher: Path, out: Path | None = None, *, host: str | None = None, port: int | None = None,
+                timeout: float = SERVE_CHECK_TIMEOUT) -> tuple[list[dict], Path]:
+    """Start what `launcher` runs, probe the OpenAI endpoints, stop the child and write a JSON receipt.
+
+    Returns (checks, receipt path); each check is {name, status, http_code, detail}. Raises ValueError/OSError for a
+    missing or unparsable launcher, which the CLI turns into a one-line error.
+    """
+    plan = parse_launcher(launcher)
+    host, port = host or plan.host, port or plan.port
+    flags = list(plan.flags)
+    if "--host" in flags:
+        flags[flags.index("--host") + 1] = host
+    if "--port" in flags:
+        flags[flags.index("--port") + 1] = str(port)
+    started = time.time()
+    base = f"http://{host}:{port}"
+    checks: list[dict] = []
+
+    def record(name: str, ok: bool, http_code: int, detail: str) -> bool:
+        checks.append({"name": name, "status": "pass" if ok else "fail", "http_code": http_code, "detail": detail})
+        return ok
+
+    with tempfile.TemporaryFile() as log:
+        child = subprocess.Popen(popen_argv([str(plan.server), str(plan.artifact), *flags]),
+                                 stdout=log, stderr=subprocess.STDOUT)
+        deadline = time.monotonic() + timeout
+        code, body = 0, b""
+        while time.monotonic() < deadline:
+            if child.poll() is not None:
+                break
+            code, body = _request("GET", base + "/v1/models", timeout=5.0)
+            if code == 200:
+                break
+            time.sleep(0.25)
+        ready = code == 200
+        record("ready", ready, code, "" if ready else
+               f"GET /v1/models did not answer 200 within {timeout:g} s (child exit code {child.poll()})")
+        models: dict = {}
+        if ready:
+            try:
+                models = json.loads(body)
+            except ValueError:
+                models = {}
+        listed = [item.get("id") for item in models.get("data", []) if isinstance(item, dict)]
+        expected_id = plan.alias or (listed[0] if listed else None)
+        if ready:
+            record("models list", expected_id is not None and expected_id in listed, code,
+                   f"/v1/models lists {listed}" + (f", expected {expected_id}" if expected_id else ""))
+            other = "160k" if expected_id != "160k" else "262k"
+            wanted = 200 if plan.model_match == "any" else 404
+            ok_code, _ = _chat(base, model=expected_id,
+                               messages=[{"role": "user", "content": "serve-check ping"}], max_tokens=1)
+            record("chat with the launcher model id", ok_code == 200, ok_code,
+                   f"model {expected_id!r} -> HTTP {ok_code}")
+            other_code, _ = _chat(base, model=other,
+                                  messages=[{"role": "user", "content": "serve-check ping"}], max_tokens=1)
+            record("chat with another model name", other_code == wanted, other_code,
+                   f"model {other!r} with --model-match {plan.model_match}: got HTTP {other_code}, want {wanted}")
+            missing_code, _ = _chat(base, messages=[{"role": "user", "content": "serve-check ping"}],
+                                    max_tokens=1)
+            record("chat without a model field", missing_code == 400, missing_code,
+                   f"no model field -> HTTP {missing_code}, want 400")
+            token_code, _ = _chat(base, headers={"Authorization": "Bearer sk-serve-check"}, model=expected_id,
+                                  messages=[{"role": "user", "content": "serve-check ping"}], max_tokens=1)
+            record("chat with an arbitrary bearer token", token_code == 200, token_code,
+                   f"Bearer sk-serve-check -> HTTP {token_code}")
+        else:
+            for name in list(SERVE_CHECK_ACTIONS)[1:]:
+                record(name, False, 0, "skipped: the server never became ready")
+        _stop_child(child)
+        log.seek(0)
+        stdout = log.read().decode("utf-8", errors="replace")
+
+    entry = next((item for item in models.get("data", []) if isinstance(item, dict)), {})
+    engine = {
+        "model_id": expected_id,
+        "model_match": plan.model_match,
+        "context": entry.get("max_context", plan.context),
+        "kv_dtype": entry.get("kv_dtype", plan.kv_dtype),
+        "kv_line": next((line for line in stdout.splitlines() if "KV" in line), ""),
+    }
+    receipt = {
+        "schema": SERVE_CHECK_SCHEMA,
+        "launcher": str(launcher.resolve()),
+        "server_exe": str(plan.server),
+        "artifact": {"path": str(plan.artifact), "size": plan.artifact.stat().st_size
+                     if plan.artifact.is_file() else None},
+        "url": base,
+        "pid": child.pid,
+        "started": _utcstamp(started),
+        "finished": _utcstamp(time.time()),
+        "engine": engine,
+        "checks": checks,
+    }
+    out = out or launcher.resolve().parent / f"serve-check-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(started))}.json"
+    write_json(Path(out), receipt)
+    return checks, Path(out)
 
 
 if __name__ == "__main__":

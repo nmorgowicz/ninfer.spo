@@ -112,6 +112,9 @@ Expect about 15–19 tok/s and a first token in up to a second, against 240–29
 
 To turn a Gemma 4 31B BF16 checkpoint into a 4-bit `.ninfer` that serves 131,072 tokens of context with FP8 KV and MTP on one 5090, follow `docs/gemma4-31b-conversion.md`. It has five ready-made builds (about 16.8 to 18.4 GB with the MTP assistant), one command for each, and the recommended serving settings with a generated launcher. **`best-small`** (GPTQ, group 256, 16.9 GB, about 30 minutes to build) is the recommended default; `best-medium` is the highest quality. If your machine cannot run GPTQ, `lite-medium` and `lite-small` (calibrated rounding via llama.cpp, about 40 minutes, lower quality at the same size) have lighter requirements. Measurements, flags and manual steps are in `docs/gemma4-31b-conversion-technical.md`.
 
+After a build, `python -m tools.convert.gemma4_build serve-check --launcher <serve-...cmd>` starts the generated
+launcher's server, probes the OpenAI endpoints, stops it again and writes a serving receipt JSON.
+
 ## Gemma 4 31B, voice chat
 
 The voice-chat setup below uses the FP8 A8 artifact: larger than the 4-bit files above, and a different recipe.
