@@ -296,7 +296,7 @@ def test_estimates_and_table_match_the_decided_presets():
     table = {p.id: (p.file_gb, p.kl, p.wait) for p in build.PRESETS.values()}
     assert table == {
         "best-small": (16.9, 0.1213, "about 30 min"), "best-medium": (18.4, 0.0845, "about 30 min"),
-        "lite-medium": (17.5, 0.1543, "about 40 min"), "lite-small": (16.8, 0.2376, "about 40 min"),
+        "lite-medium": (17.5, 0.1543, "about 35 min"), "lite-small": (16.8, 0.2376, "about 35 min"),
         "draft": (18.4, 0.2654, "about 15 min"),
     }
     for preset in build.PRESETS.values():
