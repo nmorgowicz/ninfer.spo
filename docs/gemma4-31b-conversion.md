@@ -78,10 +78,9 @@ python -m tools.convert.gemma4_build --preset best-small `
   --out-dir D:\ninfer\my-31b-best-small
 ```
 
-What to expect: about 30 minutes in one run. The GPTQ step alone is about 17 minutes (measured: 17.4 minutes for
-group 32 and 16.9 for group 256). The other steps are from the earlier end-to-end `best-small` build, which took 71
-minutes with 62.5 in GPTQ before the solver was made faster: text tree 1.7, file check 0.8, convert 5.2, calibration
-under 1. The 30 minutes is the sum of those measured steps, not one measured run. It needs a GPU with 12 GiB free,
+What to expect: about 25 to 30 minutes in one run (measured: one complete `best-small` build, from the command to the
+finished file and launcher, took 25.5 minutes on the RTX 5090: text tree 1.6, GPTQ 17.2, file check 0.9, convert 5.3,
+calibration under 1; before the GPTQ solver was made faster the same build took 71 minutes). It needs a GPU with 12 GiB free,
 64 GiB of RAM and at least 75 GB of disk (the builder says about 103 GB is comfortable; a 58 GB temporary copy of the
 model is removed when the build succeeds). To be honest about the RAM: the GPTQ step itself used about 38 GiB while it
 ran, and 64 GiB is still what we recommend. Put `--work-dir` on a big fast
