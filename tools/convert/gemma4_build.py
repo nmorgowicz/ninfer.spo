@@ -968,6 +968,7 @@ class LauncherCommand:
     model_match: str  # "any" only when the launcher passes --model-match any; the server default is exact
     kv_dtype: str | None
     context: int | None  # --max-context
+    env: dict[str, str] = field(default_factory=dict)  # `set NAME=VALUE` lines; PATH is prepended, not replaced
 
 
 def _launcher_words(line: str) -> list[str]:
@@ -986,10 +987,14 @@ def parse_launcher(path: Path) -> LauncherCommand:
     if not path.is_file():
         raise ValueError(f"launcher not found: {path}")
     logical: list[str] = []
+    env: dict[str, str] = {}
     pending = ""
     for raw in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
         line = raw.strip()
-        if not line or line.lower().startswith("rem ") or line.startswith("@") or line.startswith("set "):
+        if line.lower().startswith("set "):
+            name, sep, text = line[4:].partition("=")
+            if sep and name.strip():
+                env[name.strip()] = text.strip()
             continue
         if line == "exit /b %errorlevel%":
             continue
@@ -1014,6 +1019,7 @@ def parse_launcher(path: Path) -> LauncherCommand:
         host=value("--host", launcher_tools.DEFAULT_HOST), port=int(value("--port", launcher_tools.DEFAULT_PORT)),
         alias=value("--model-id"), model_match=value("--model-match", "exact"),
         kv_dtype=value("--kv-dtype"), context=int(value("--max-context")) if "--max-context" in flags else None,
+        env=env,
     )
 
 
@@ -1068,16 +1074,20 @@ def serve_check(launcher: Path, out: Path | None = None, *, host: str | None = N
     if "--port" in flags:
         flags[flags.index("--port") + 1] = str(port)
     started = time.time()
-    base = f"http://{host}:{port}"
+    # The server may bind 0.0.0.0 (all interfaces), which Windows refuses as a connect target; probe loopback.
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    base = f"http://{probe_host}:{port}"
     checks: list[dict] = []
 
     def record(name: str, ok: bool, http_code: int, detail: str) -> bool:
         checks.append({"name": name, "status": "pass" if ok else "fail", "http_code": http_code, "detail": detail})
         return ok
-
     with tempfile.TemporaryFile() as log:
+        child_env = {**os.environ, **plan.env}
+        if "PATH" in plan.env:
+            child_env["PATH"] = plan.env["PATH"] + os.pathsep + os.environ.get("PATH", "")
         child = subprocess.Popen(popen_argv([str(plan.server), str(plan.artifact), *flags]),
-                                 stdout=log, stderr=subprocess.STDOUT)
+                                 stdout=log, stderr=subprocess.STDOUT, env=child_env)
         deadline = time.monotonic() + timeout
         code, body = 0, b""
         while time.monotonic() < deadline:

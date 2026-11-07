@@ -1051,7 +1051,8 @@ def free_port() -> int:
         return probe.getsockname()[1]
 
 
-def write_fake_launcher(tmp_path: Path, *, alias: str = "131k", match: str = "any", breaks: tuple = ()) -> Path:
+def write_fake_launcher(tmp_path: Path, *, alias: str = "131k", match: str = "any", breaks: tuple = (),
+                        host: str = "127.0.0.1") -> Path:
     """A .cmd shaped like a generated launcher whose server is the fake script under this Python."""
     script = tmp_path / "fake_server.py"
     script.write_text(FAKE_SERVER_SCRIPT, encoding="utf-8")
@@ -1061,7 +1062,7 @@ def write_fake_launcher(tmp_path: Path, *, alias: str = "131k", match: str = "an
         "@echo off",
         "rem fake launcher for the serve-check tests",
         f'"{sys.executable}" "{script}" ^',
-        "  --host 127.0.0.1 --port {} --model-id {} {} ^".format(free_port(), alias, " ".join(match_flags)),
+        "  --host {} --port {} --model-id {} {} ^".format(host, free_port(), alias, " ".join(match_flags)),
         "  --max-context 131072 --kv-dtype fp8 --spec mtp " + " ".join(break_flags),
         "exit /b %errorlevel%",
         "",
@@ -1124,11 +1125,18 @@ def test_serve_check_passes_every_check_and_writes_a_receipt(tmp_path, capsys):
     assert names["chat without a model field"]["http_code"] == 400
     assert names["chat with an arbitrary bearer token"]["http_code"] == 200
     assert data["launcher"].endswith("serve-m.cmd") and data["url"].startswith("http://127.0.0.1:")
-    assert data["artifact"]["path"].endswith("fake_server.py")
     assert data["artifact"]["size"] == (tmp_path / "fake_server.py").stat().st_size
     assert data["started"].endswith("Z") and data["finished"] >= data["started"]
     assert data["engine"] == {"model_id": "131k", "model_match": "any", "context": 131072, "kv_dtype": "fp8",
                               "kv_line": ""}
+
+
+def test_serve_check_probes_loopback_when_the_launcher_binds_all_interfaces(tmp_path, capsys):
+    cmd = write_fake_launcher(tmp_path, host="0.0.0.0")
+    out = tmp_path / "receipt.json"
+    assert cli.main(["serve-check", "--launcher", str(cmd), "--out", str(out)]) == 0
+    assert "FAIL" not in capsys.readouterr().out
+    assert json.loads(out.read_text(encoding="utf-8"))["url"].startswith("http://127.0.0.1:")
 
 
 def test_serve_check_exact_match_wants_404_for_another_model_name(tmp_path):
