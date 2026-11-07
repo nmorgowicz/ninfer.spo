@@ -10,6 +10,8 @@ See [CUDA synchronization](cli.md#cuda-synchronization) for `NINFER_CUDA_SYNC`.
 
 When `--model-id` is omitted, the server advertises the artifact's `metadata.name`, or the architecture name when none is stored. An explicit `--model-id` is only the public HTTP alias.
 
+OpenAI endpoints compare the request `model` with that public model ID and answer 404 `model_not_found` for any other name (the default, `--model-match exact`). `--model-match any` skips the comparison, so a client or gateway that sends several model names to one server works unchanged. A missing or empty `model` is still HTTP 400, `GET /v1/models` still lists only the public model ID with its `max_model_len`, `GET /v1/models/{id}` returns that entry for any `{id}`, and responses echo the model name the request sent. The Anthropic `/v1/messages` endpoints never compare the name.
+
 Vision is off unless `--vision` is set. Media requests and token-count requests then fail with HTTP 400 `vision_disabled`, and the vision weights are not allocated. `--spec` (`mtp`, `dflash`, or `dflash2`) and `--draft-tokens` freeze the speculative backend at startup. Omitting `--spec` loads none. `--lm-head-draft` loads the proposal head. A later request cannot turn on a capability omitted at startup. The artifact needs the text backbone and the optional components selected for this process. Vision encode and prefill stay outside speculative decode.
 
 Requests acquire KV pages as execution advances. If concurrent growth exhausts the pool, the scheduler can pause a request and restore it later.
@@ -43,7 +45,7 @@ The non-expert part needs about 12 GiB of VRAM with a 32k bf16 KV cache, one lan
 | `GET /health` | Engine readiness |
 | `GET /metrics` | Prometheus counters, gauges and latency histograms |
 | `GET /v1/models` | configured OpenAI model alias and effective `max_model_len` |
-| `GET /v1/models/{id}` | lookup of the configured alias and effective `max_model_len` |
+| `GET /v1/models/{id}` | lookup of the configured alias and effective `max_model_len` (any `{id}` with `--model-match any`) |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
 | `POST /v1/responses/input_tokens` | Responses prompt-token count without generation |
@@ -213,7 +215,7 @@ server-error codes. Failures in the normalized prompt contract use `invalid_prom
 and availability failures retain their dedicated codes. Internal invariant failures are not
 relabeled as client input errors.
 
-The request `model` must equal the public model ID: the artifact `metadata.name` by default
+The request `model` must equal the public model ID (unless `--model-match any`): the artifact `metadata.name` by default
 (falling back to its architecture name when absent), or the explicit `--model-id` override.
 Reasoning is returned separately as `reasoning_content`; answer text remains in `content`.
 
@@ -519,7 +521,7 @@ wire response contains typed `output` Items.
 
 | Field | NInfer Responses Core contract |
 |---|---|
-| `model` | required non-empty string; must equal the artifact-derived public model ID or explicit `--model-id` override |
+| `model` | required non-empty string; must equal the artifact-derived public model ID or explicit `--model-id` override (any name with `--model-match any`) |
 | `input` | string or typed Item array; it may be omitted or empty only when `previous_response_id` already supplies a user query |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
 | `previous_response_id` | optional ID of a retained local Response |

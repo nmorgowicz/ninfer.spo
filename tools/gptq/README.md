@@ -3,7 +3,7 @@
 These scripts produce the checkpoint that `python -m tools.convert.gemma4_q4 convert --gptq-source DIR` imports:
 LLM Compressor GPTQ, symmetric INT4, static contiguous groups, no activation order. The converter copies the codes
 and the (binary16-exact) scales word for word; nothing is re-rounded. Measured on the author's calibrated 31B this
-route halves the KL of calibrated RTN at group 32 (see [the conversion guide](../../docs/gemma4-31b-conversion.md)),
+route halves the KL of calibrated RTN at group 32 (see [the technical reference](../../docs/gemma4-31b-conversion-technical.md#4-results)),
 so use the recommended `imatrix_mse` observer: the default `memoryless_minmax` observer is worse than calibrated RTN.
 
 | Script | What it does |
@@ -38,7 +38,7 @@ its `per_layer_config` error instead of the pinned 5.14.1). Check with
 ## 2. Calibration tokens
 
 Calibration text must be public text disjoint from whatever you evaluate on, rendered as chat-prefixed chunks exactly
-as for the imatrix route (`gemma4_q4 calibration-text`, section 5 of the conversion guide); the same 400 x 512 file
+as for the imatrix route (`gemma4_q4 calibration-text`, [section 5.2 of the technical reference](../../docs/gemma4-31b-conversion-technical.md#52-convert-with-calibration-rtn)); the same 400 x 512 file
 serves both. A chat fine-tune sees the chat prefix at run time, so bare text gives worse statistics.
 
 ```bash
@@ -105,12 +105,12 @@ python -m tools.convert.gemma4_q4 verify --artifact work/gptq-g32-a16.ninfer
 ```
 
 Use `--weights q4_g32` for the W4A8 artifact and `--mtp-assistant DIR` instead of `--no-mtp` for MTP, as in the
-conversion guide. For a group-128 or group-256 checkpoint add `--native-groups` to store the real
+[technical reference](../../docs/gemma4-31b-conversion-technical.md#51-convert-without-calibration). For a group-128 or group-256 checkpoint add `--native-groups` to store the real
 `q4_g128_fp16`/`q4_g256_fp16` formats (without it the scales are repeated into g32 words: same values, no size win).
 `--gptq-source` is mutually exclusive with `--scale-search`, `--imatrix`, `--group-size`, `--region-group` and
 `--scale-bits`. The converter refuses a checkpoint it cannot store exactly: zero points, `weight_g_idx`, scales that
 are not exactly representable in binary16, asymmetric or non-4-bit schemes. Score the artifact as in
-[section 6 of the conversion guide](../../docs/gemma4-31b-conversion.md#6-check-the-quality-of-your-own-conversion)
+[section 6 of the technical reference](../../docs/gemma4-31b-conversion-technical.md#6-check-the-quality-of-your-own-conversion)
 (`NINFER_Q4_EXACT=1` for W4A8).
 
 Global-layer permutations: the converter permutes global q/k rows and o columns (`prope_perm`). Row permutations never

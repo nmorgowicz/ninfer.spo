@@ -18,6 +18,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 |---|---|
 | Convert weights with an official or custom recipe | [`convert/`](convert/); [user guide](../docs/weight-conversion.md) |
 | Convert, verify, and calibrate a Gemma 4 31B Q4 custom model | [`convert/gemma4_q4.py`](convert/gemma4_q4.py), [`convert/gemma4_q4_cli.py`](convert/gemma4_q4_cli.py); [guide](../docs/gemma4-31b-conversion.md) |
+| Build a Gemma 4 31B 4-bit `.ninfer` in one command (checks, calibration or GPTQ, convert, receipts, launcher) | [`convert/gemma4_build.py`](convert/gemma4_build.py), [`convert/gemma4_build_cli.py`](convert/gemma4_build_cli.py); [section below](#gemma-4-31b-one-command-build) |
 | Produce a GPTQ INT4 checkpoint of Gemma 4 31B for `gemma4_q4 convert --gptq-source` | [`gptq/`](gptq/README.md) (own pinned environment) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
@@ -27,6 +28,36 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 | Measure the physical HBM read/copy ceiling | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu); [build command](#standalone-hbm-probe) |
+
+## Gemma 4 31B one-command build
+
+`python -m tools.convert.gemma4_build` chains the steps of the [Gemma 4 31B conversion guide](../docs/gemma4-31b-conversion.md)
+behind five presets (`best-small`, `best-medium`, `fast-medium`, `fast-small`, `draft`); `--help` and `--list-presets`
+print the table with the measured KL, file size and wait for each. It runs the converter, the `tools/gptq/` scripts and
+llama.cpp as child processes with their logs in the work directory, and writes `<name>.ninfer`, its receipts, a Windows
+launcher with the qualified serve settings (including `--model-match any`, so a gateway that sends several model names to
+one server works; `--model-match exact` omits it), and `BUILD-SUMMARY.md` into `--out-dir`.
+
+```bash
+# once, for the GPTQ presets: the pinned environment (needs uv)
+python -m tools.convert.gemma4_build setup-gptq --venv .venv-gptq
+
+# checks only, then the exact plan with time estimates and no writes, then the build
+python -m tools.convert.gemma4_build --preset best-small --model /path/to/gemma-4-31B-bf16 \
+  --assistant /path/to/gemma-4-31B-it-assistant --out-dir out/my-31b --check
+python -m tools.convert.gemma4_build --preset best-small ... --dry-run
+python -m tools.convert.gemma4_build --preset best-small ...            # asks before starting; --yes skips
+
+# a launcher for an artifact you already have
+python -m tools.convert.gemma4_build launcher --artifact my-31b.ninfer --out serve-my-31b.cmd
+```
+
+Every build checks first (GPU and free VRAM, RAM, disk, Python environments, llama.cpp, the model and assistant, the
+server binary and its DLLs) and names the next action for each failure. It resumes: rerun the same command after a
+failure and finished steps are skipped; a work directory made with other arguments is refused. It never overwrites an
+output, never writes in or next to the source model, and deletes only its own work directory after success (`--keep-work`
+keeps it). `gemma4_q4 convert` refuses a checkout with uncommitted tracked changes, so commit or stash first. Tests:
+`tests/convert/test_gemma4_build.py`.
 
 ## Standalone HBM probe
 

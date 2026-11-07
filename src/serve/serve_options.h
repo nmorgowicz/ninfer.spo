@@ -20,6 +20,10 @@ inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
 inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 
+// How an OpenAI `model` field is checked against the public model id. `Any` serves one model under
+// every requested name (the response still echoes the request's model).
+enum class ModelMatch { Exact, Any };
+
 struct ServeOptions {
     bool help_requested = false;
     std::string artifact_path;
@@ -31,6 +35,7 @@ struct ServeOptions {
     int port         = 8080;
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
+    ModelMatch model_match = ModelMatch::Exact;   // --model-match exact|any
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);

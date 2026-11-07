@@ -246,7 +246,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request = parse_openai_responses_create_request(parse_json_body(req), limits);
-        validate_openai_model(request.prompt.model, public_model_id_);
+        validate_openai_model(request.prompt.model, public_model_id_,
+                              options_.model_match == ModelMatch::Any);
         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_, id,
                                                    request.store);
     } catch (const ApiException& exception) {
@@ -526,7 +527,8 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
         limits.default_max_tokens = options_.default_max_tokens;
         OpenAIResponsesPromptRequest request =
             parse_openai_responses_input_tokens_request(parse_json_body(req), limits);
-        validate_openai_model(request.model, public_model_id_);
+        validate_openai_model(request.model, public_model_id_,
+                              options_.model_match == ModelMatch::Any);
         OpenAIResponsesResolvedPrompt resolved =
             resolve_openai_responses_prompt(request, openai_responses_store_, std::nullopt, false);
         const int tokens = service_->count_prompt_tokens(

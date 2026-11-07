@@ -976,6 +976,17 @@ int test_common_objects() {
     const Json model = Json::parse(make_model_object("qwen", 7, 240000));
     failures += check(model["max_model_len"] == 240000,
                       "model lookup advertises the configured context limit");
+    failures += check(api_error([] { validate_openai_model("qwen", "qwen", false); }).status == 0,
+                      "exact model match accepts the public model id");
+    const ApiError wrong = api_error([] { validate_openai_model("other", "qwen", false); });
+    failures +=
+        check(wrong.status == 404 && wrong.code == "model_not_found" && wrong.param == "model",
+              "exact model match rejects another name with model_not_found");
+    const auto accepted = [](const char* requested) {
+        return api_error([&] { validate_openai_model(requested, "qwen", true); }).status == 0;
+    };
+    failures += check(accepted("other") && accepted("qwen"),
+                      "--model-match any accepts every requested model name");
     const Json error = Json::parse(make_error_body(
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",

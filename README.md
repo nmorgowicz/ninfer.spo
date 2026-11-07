@@ -108,11 +108,15 @@ Short greedy replies on this card with the budget limited, `--draft-tokens 3`:
 
 Expect about 15–19 tok/s and a first token in up to a second, against 240–290 tok/s with every expert in VRAM. The 19 and 21 GiB CPU rows are the same four prompts as the 13 GiB row, measured 2026-10-29. Raising the budget from 13 to 21 GiB does not make those short replies faster. The PCIe rows are the earlier decode path, kept to compare the two. The CPU dot is fp32 against the GPU's FP4 tensor core, so greedy text can differ from a full-VRAM run.
 
+## Gemma 4 31B, 4-bit on one RTX 5090
+
+To turn a Gemma 4 31B BF16 checkpoint into a 4-bit `.ninfer` that serves 131,072 tokens of context with FP8 KV and MTP on one 5090, follow `docs/gemma4-31b-conversion.md`. It has five ready-made builds (about 16.8 to 18.4 GB with the MTP assistant), one command for each, and the recommended serving settings with a generated launcher. **`best-small`** (GPTQ, group 256, 16.9 GB) is the recommended default. Measurements, flags and manual steps are in `docs/gemma4-31b-conversion-technical.md`.
+
 ## Gemma 4 31B, voice chat
 
-Convert `gemma4_31b_fp8` with `--components text,vision,mtp` and `--override gemma4_fp8_a8` (`docs/weight-conversion.md`). That artifact has the FP8 A8 text trunk, one FP8 vocabulary table, the MTP assistant, and the vision tower. The text-only FP8 artifact has no vision. The NVFP4 recipes missed the quality gate.
+The voice-chat setup below uses the FP8 A8 artifact: larger than the 4-bit files above, and a different recipe.
 
-For the 17 GB 4-bit file that fits 131,072 tokens of context on one 5090 (calibrated group-wise Q4, FP8 KV, MTP), see `docs/gemma4-31b-conversion.md`: sizes, KL/PPL table, commands.
+Convert `gemma4_31b_fp8` with `--components text,vision,mtp` and `--override gemma4_fp8_a8` (`docs/weight-conversion.md`). That artifact has the FP8 A8 text trunk, one FP8 vocabulary table, the MTP assistant, and the vision tower. The text-only FP8 artifact has no vision. The NVFP4 recipes missed the quality gate.
 
 ```
 ninfer-spo-serve <artifact> --port 8080 --model-id local --max-context 16384 --kv-dtype bf16 \

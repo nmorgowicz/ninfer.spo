@@ -498,7 +498,7 @@ void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) 
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != public_model_id_) {
+    if (id != public_model_id_ && options_.model_match != ModelMatch::Any) {
         ApiError error;
         error.status  = 404;
         error.type    = "invalid_request_error";

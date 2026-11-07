@@ -154,19 +154,28 @@ def test_invalid_parameters_are_refused(parameters):
         _prepare(("gate",), parameters)
 
 
+@pytest.mark.parametrize("seed", range(50))
 @pytest.mark.parametrize("bits", [8, 6, 4])
-def test_emulated_two_level_scales_are_integer_multiples_of_a_shared_super_scale(bits):
-    values = torch.from_numpy(_random(512))[:2] * torch.rand(2, 1) * 3
+def test_emulated_two_level_scales_are_integer_multiples_of_a_shared_super_scale(bits, seed):
+    # Row scales stay in 0.5..2 standard deviations so every group scale (about 0.36 sigma) is a normal binary16
+    # number. An unseeded torch.rand once produced rows near 0.01: the super scale max/levels then fell into the
+    # binary16 subnormal range, round(max/S) came out at levels - 1, and the multiples were off by up to 1.
+    generator = torch.Generator().manual_seed(seed)
+    values = torch.from_numpy(_random(512))[:2] * (25.0 + 75.0 * torch.rand(2, 1, generator=generator))
     two = quantize_q4_scale_search(values, 32, None, device="cpu", scale_bits=bits)
     plain = quantize_q4_scale_search(values, 32, None, device="cpu")
     scales = two.scales.float()
     levels = (1 << bits) - 1
+    # Each stored scale is fp16(S * m) with the binary16 super scale S and an integer m <= levels; the run's top
+    # multiplier is exactly `levels`, so run.max()/levels = S(1 + e1) and run[j] = S m (1 + e2) with |e| <= 2^-11
+    # (normal range, one fp16 rounding each; S itself cancels). The multiples therefore sit within
+    # m * 2 * 2^-11 / (1 - 2^-11) <= levels * 2^-10 * 1.0005 of an integer: 1% headroom, independent of the data.
+    tolerance = levels * 2**-10 * 1.01
     for row in range(2):
         for start in range(0, 16, 8):  # eight g32 scales per 256 columns
             run = scales[row, start : start + 8]
-            super_scale = float(run.max()) / levels
-            multiples = run / super_scale
-            assert torch.allclose(multiples, multiples.round(), atol=0.02 * levels / 255 + 1e-3 * multiples.max().item())
+            multiples = run / (float(run.max()) / levels)
+            assert torch.allclose(multiples, multiples.round(), rtol=0, atol=tolerance)
             assert float(multiples.max()) <= levels + 0.5
     assert two.scales.shape == plain.scales.shape and two.codes.shape == plain.codes.shape
     # Coarser scales cannot beat the exact binary16 scales on the same unweighted error.

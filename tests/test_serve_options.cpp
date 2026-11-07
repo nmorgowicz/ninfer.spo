@@ -128,6 +128,23 @@ int main() {
                   resolve_public_model_id(model_alias, "artifact-model") == "deployment-alias",
               "explicit model id did not override the artifact identity");
 
+    failures += check(defaults.model_match == ModelMatch::Exact,
+                      "model matching is not exact by default");
+    const ServeOptions match_any = parse({"ninfer-serve", "model.ninfer", "--model-match", "any"});
+    failures += check(match_any.model_match == ModelMatch::Any,
+                      "--model-match any did not select any-name matching");
+    const ServeOptions match_exact =
+        parse({"ninfer-serve", "model.ninfer", "--model-match", "exact"});
+    failures += check(match_exact.model_match == ModelMatch::Exact,
+                      "--model-match exact did not select exact matching");
+    bool bad_match_refused = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--model-match", "some"});
+    } catch (const std::invalid_argument&) { bad_match_refused = true; }
+    failures += check(bad_match_refused, "--model-match accepted an unknown value");
+    failures += check(serve_usage_text("ninfer-serve").find("--model-match") != std::string::npos,
+                      "serve help omits --model-match");
+
     const ServeOptions context_cost =
         parse({"ninfer-serve", "model.ninfer", "--context-cost-presets", "local-costs.json"});
     failures += check(context_cost.context_cost_presets == "local-costs.json",

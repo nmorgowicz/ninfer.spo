@@ -30,7 +30,10 @@ Source-weight conversion requires a Python 3.11 environment with PyTorch and Num
 by default; `--device cpu` selects CPU conversion. The input paths below are placeholders for your
 local checkpoint directories. The Gemma 4 31B Q4 command (`python -m tools.convert.gemma4_q4`) also
 needs `gguf` (`pip install gguf`) only for `--imatrix`, and `tokenizers` only for `calibration-text`.
-The step-by-step guide with sizes and quality numbers is [gemma4-31b-conversion.md](gemma4-31b-conversion.md).
+For Gemma 4 31B in 4 bits (one RTX 5090, 131,072 tokens of context), start with the simple guide,
+[gemma4-31b-conversion.md](gemma4-31b-conversion.md): five ready-made builds, `best-small` recommended, and one command
+for each. The measurements, flags and manual commands are in
+[gemma4-31b-conversion-technical.md](gemma4-31b-conversion-technical.md).
 
 For Qwen3.6-27B floating-point source weights:
 
@@ -185,7 +188,7 @@ The converter currently writes these formats:
 |---|---|---|
 | `bf16`, `fp32`, `int32` | `cast_direct` | Direct words through the source reader |
 | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax` | Supply a custom method/source if needed |
-| `q4_g32_fp16` | `q4_g32_qat` | Recovers the scale already stored in a QAT matrix. `grouped_absmax` is also legal and requantizes. `import_encoded` copies the codes and binary16-exact scales of an external compressed-tensors INT4 checkpoint through `tools/convert/sources/packed_int4.py` (see `--gptq-source` in [gemma4-31b-conversion.md](gemma4-31b-conversion.md)) |
+| `q4_g32_fp16` | `q4_g32_qat` | Recovers the scale already stored in a QAT matrix. `grouped_absmax` is also legal and requantizes. `import_encoded` copies the codes and binary16-exact scales of an external compressed-tensors INT4 checkpoint through `tools/convert/sources/packed_int4.py` (see `--gptq-source` in [gemma4-31b-conversion-technical.md](gemma4-31b-conversion-technical.md#56-gptq-import---gptq-source)) |
 | `q4_g128_fp16`, `q4_g256_fp16` | `grouped_absmax_emulated`, `grouped_mse_search` (parameter `group_size` equal to the format's group; `weighted` optional) | Native coarse groups; the same methods with `group_size` 64/128/256 into `q4_g32_fp16` emulate them with repeated scales, for quality measurement only |
 | `q4_g32_s6_fp16` | `grouped_mse_search` with parameters `group_size` 32 and `scale_bits` 6 (`weighted` optional) | Gemma two-level scale plane (one binary16 super scale and eight 6-bit multipliers per 256 columns, 4.25 bits per weight); the search result is the same as `scale_bits` 6 into `q4_g32_fp16`, which only emulates it. K padded to 128 must be a multiple of 256. `grouped_absmax` into it is refused |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
