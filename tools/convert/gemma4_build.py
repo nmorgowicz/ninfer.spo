@@ -515,8 +515,13 @@ def render_summary(info: dict) -> str:
         "```",
         "",
         "Check the real KV capacity in the server's startup log: the model list can overstate an auto-sized pool. "
-        f"`/v1/models` reports `{info['alias']}`; OpenAI-style requests must send that exact model name. "
-        "No API key is required.",
+        f"`/v1/models` reports `{info['alias']}`; "
+        + (
+            "OpenAI-style requests may send any model name (`--model-match any`). "
+            if "--model-match any" in (info["serve_command"] or "")
+            else "OpenAI-style requests must send that exact model name. "
+        )
+        + "No API key is required.",
         "",
         "## Versions",
         "",
