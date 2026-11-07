@@ -110,7 +110,7 @@ Expect about 15–19 tok/s and a first token in up to a second, against 240–29
 
 ## Gemma 4 31B, 4-bit on one RTX 5090
 
-To turn a Gemma 4 31B BF16 checkpoint into a 4-bit `.ninfer` that serves 131,072 tokens of context with FP8 KV and MTP on one 5090, follow `docs/gemma4-31b-conversion.md`. It has five ready-made builds (about 16.8 to 18.4 GB with the MTP assistant), one command for each, and the recommended serving settings with a generated launcher. **`best-small`** (GPTQ, group 256, 16.9 GB, about 30 minutes to build) is the recommended default. Measurements, flags and manual steps are in `docs/gemma4-31b-conversion-technical.md`.
+To turn a Gemma 4 31B BF16 checkpoint into a 4-bit `.ninfer` that serves 131,072 tokens of context with FP8 KV and MTP on one 5090, follow `docs/gemma4-31b-conversion.md`. It has five ready-made builds (about 16.8 to 18.4 GB with the MTP assistant), one command for each, and the recommended serving settings with a generated launcher. **`best-small`** (GPTQ, group 256, 16.9 GB, about 30 minutes to build) is the recommended default; `best-medium` is the highest quality. If your machine cannot run GPTQ, `lite-medium` and `lite-small` (calibrated rounding via llama.cpp, about 40 minutes, lower quality at the same size) have lighter requirements. Measurements, flags and manual steps are in `docs/gemma4-31b-conversion-technical.md`.
 
 ## Gemma 4 31B, voice chat
 

@@ -14,20 +14,23 @@ You do not need it to follow this guide.
 |---|---|---|---|---|---|---|
 | `best-small` | Most people | 16.9 GB | Very close (90.0%) | 0.1213 | about 30 min | GPU with 12 GiB free, 64 GiB RAM, about 75 GB disk |
 | `best-medium` | Highest quality | 18.4 GB | Closest (91.6%) | 0.0845 | about 30 min | Same as `best-small` |
-| `fast-medium` | No GPTQ wait | 17.5 GB | Close (89.3%) | 0.1543 | about 40 min | llama.cpp, about 35 GB disk |
-| `fast-small` | Smallest file, lower quality | 16.8 GB | Noticeably lower (85.9%) | 0.2376 | about 40 min | llama.cpp, about 35 GB disk |
+| `lite-medium` | If your machine cannot run GPTQ (best of the two lite builds) | 17.5 GB | Close (89.3%) | 0.1543 | about 40 min | llama.cpp, about 35 GB disk |
+| `lite-small` | If your machine cannot run GPTQ, and you want a smaller file | 16.8 GB | Noticeably lower (85.9%) | 0.2376 | about 40 min | llama.cpp, about 35 GB disk |
 | `draft` | A quick test build only | 18.4 GB | Lowest (85.7%) | 0.2654 | about 15 min | Nothing extra |
 
 Sizes are the whole file with the MTP helper. Waits are for an RTX 5090. The GPTQ step of the two GPTQ builds was
-measured at 17 minutes and the other steps come from an earlier full build (see "What to expect" below); the `fast` and
+measured at 17 minutes and the other steps come from an earlier full build (see "What to expect" below); the `lite` and
 `draft` waits were measured earlier on the same GPU.
-"GPTQ" is a smarter way of rounding the weights to 4 bits and needs its own Python environment; the two `fast` builds
-use a simpler method that needs statistics from llama.cpp.
+"GPTQ" is a smarter way of rounding the weights to 4 bits. It needs its own Python environment, a GPU with 12 GiB free
+and a lot of RAM. The two `lite` builds ask for less: they use a simpler rounding method (calibrated rounding) with
+statistics from llama.cpp, no GPTQ environment and less RAM and VRAM. They give lower quality than the GPTQ builds at
+the same size.
 
 - **Most people: `best-small`.** Best quality for its size.
-- Highest quality: `best-medium`. 1.6 GB bigger than `best-small`.
-- Do not want to wait for GPTQ: `fast-medium`. The best quality you can get in about 40 minutes.
-- Want a smaller file without GPTQ: `fast-small`. It is 0.7 GB smaller than `fast-medium` and 1.6 GB smaller than `draft`, but its quality is noticeably lower, and only a little better than `draft`.
+- Highest quality: `best-medium`. 1.5 GB bigger than `best-small`.
+- If your machine cannot run GPTQ (under 12 GiB of free VRAM, under about 64 GiB of RAM, or you do not want the GPTQ environment): `lite-medium`, the best of the two, in about 40 minutes.
+- The same, with a smaller file: `lite-small`. It is 0.7 GB smaller than `lite-medium` and 1.6 GB smaller than `draft`, but its quality is noticeably lower, and only a little better than `draft`.
+- A quick test build: `draft`.
 
 ### What the quality numbers mean
 
@@ -37,7 +40,7 @@ whole next-token predictions: lower is better, and 0 would mean identical. KL te
 agreement does, so use KL to choose.
 
 Read the scale from the table: the old default build (`draft`) scores 0.27 and our best (`best-medium`) scores 0.08,
-about a third of that. `best-small` scores 0.12 in a file 1.6 GB smaller.
+about a third of that. `best-small` scores 0.12 in a file 1.5 GB smaller.
 
 These numbers come from one model (a Gemma 4 31B fine-tune) and English text. Another model can score differently. To
 measure your own build, see [section 6 of the technical reference](gemma4-31b-conversion-technical.md#6-check-the-quality-of-your-own-conversion),
@@ -80,24 +83,25 @@ group 32 and 16.9 for group 256). The other steps are from the earlier end-to-en
 minutes with 62.5 in GPTQ before the solver was made faster: text tree 1.7, file check 0.8, convert 5.2, calibration
 under 1. The 30 minutes is the sum of those measured steps, not one measured run. It needs a GPU with 12 GiB free,
 64 GiB of RAM and at least 75 GB of disk (the builder says about 103 GB is comfortable; a 58 GB temporary copy of the
-model is removed when the build succeeds). Put `--work-dir` on a big fast
+model is removed when the build succeeds). To be honest about the RAM: the GPTQ step itself used about 38 GiB while it
+ran, and 64 GiB is still what we recommend. Put `--work-dir` on a big fast
 drive to move the scratch files. No llama.cpp is needed.
 
-### Fast builds: `fast-medium`, `fast-small`
+### Lite builds: `lite-medium`, `lite-small`
 
 These need a llama.cpp source checkout (the release zips do not include `convert_hf_to_gguf.py`) and a
 `llama-imatrix` program. The build makes a temporary 35 GB file, collects statistics from it, then deletes it.
 
 ```powershell
-python -m tools.convert.gemma4_build --preset fast-medium `
+python -m tools.convert.gemma4_build --preset lite-medium `
   --model D:\models\my-31b-bf16 `
   --assistant D:\models\gemma-4-31B-it-assistant `
-  --out-dir D:\ninfer\my-31b-fast-medium `
+  --out-dir D:\ninfer\my-31b-lite-medium `
   --llama-cpp-dir D:\tools\llama.cpp
 ```
 
 `--llama-imatrix PATH` names the `llama-imatrix` program if it is not under `--llama-cpp-dir` or on your PATH. About
-40 minutes in total. Use `--preset fast-small` for the smaller file.
+40 minutes in total. Use `--preset lite-small` for the smaller file.
 
 ### Quick test build: `draft`
 

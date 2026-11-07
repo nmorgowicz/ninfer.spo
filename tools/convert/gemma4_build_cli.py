@@ -32,8 +32,8 @@ SUBCOMMANDS = ("setup-gptq", "launcher")
 METHODS = {
     "best-small": "GPTQ g256",
     "best-medium": "GPTQ g32",
-    "fast-medium": "RTN g32, 6-bit scales",
-    "fast-small": "RTN g256",
+    "lite-medium": "RTN g32, 6-bit scales",
+    "lite-small": "RTN g256",
     "draft": "absmax g32, no calibration",
 }
 NEEDS = {
@@ -47,8 +47,9 @@ lower is better):
 
 {{table}}
 
-Recommended: best-small for most people (best quality per byte), best-medium for the highest quality, fast-medium
-when you will not wait for GPTQ. fast-small is quality-compromised; draft is a quick test build only.
+Recommended: best-small for most people (best quality per byte); best-medium for the highest quality; lite-medium or
+lite-small only if you cannot run GPTQ (less RAM and VRAM, no GPTQ environment): they score lower. draft is a quick
+test build only.
 
 other commands:
   python -m tools.convert.gemma4_build setup-gptq --venv DIR     create the pinned GPTQ environment
@@ -97,7 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     add("--calibration-text", type=Path, help="your own public UTF-8 calibration text, disjoint from anything you "
         "evaluate on (default: download the pinned public English corpus)")
     add("--gptq-python", type=Path, help="python.exe of the GPTQ environment (default: <checkout>/.venv-gptq)")
-    add("--llama-cpp-dir", type=Path, help="llama.cpp source checkout holding convert_hf_to_gguf.py (fast presets)")
+    add("--llama-cpp-dir", type=Path, help="llama.cpp source checkout holding convert_hf_to_gguf.py (lite presets)")
     add("--llama-imatrix", type=Path, help="llama-imatrix executable (default: searched in --llama-cpp-dir, "
         "its build/bin, and PATH)")
     add("--llama-python", default=sys.executable, help="Python that runs convert_hf_to_gguf.py (needs gguf, "

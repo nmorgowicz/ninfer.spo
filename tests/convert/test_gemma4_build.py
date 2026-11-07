@@ -204,9 +204,9 @@ def test_every_preset_has_the_documented_recipe_flags(env):
     expected = {
         "best-small": ("--gptq-source", "{w}/gptq", "--native-groups"),
         "best-medium": ("--gptq-source", "{w}/gptq"),
-        "fast-medium": ("--scale-search", "weighted", "--imatrix", "{w}/model.imatrix.gguf",
+        "lite-medium": ("--scale-search", "weighted", "--imatrix", "{w}/model.imatrix.gguf",
                         "--scale-bits", "6", "--native-groups"),
-        "fast-small": ("--scale-search", "weighted", "--imatrix", "{w}/model.imatrix.gguf",
+        "lite-small": ("--scale-search", "weighted", "--imatrix", "{w}/model.imatrix.gguf",
                        "--group-size", "256", "--native-groups"),
         "draft": (),
     }
@@ -247,7 +247,7 @@ def test_gptq_steps_are_the_documented_commands(env):
 
 
 def test_rtn_steps_are_the_documented_commands_and_download_without_a_text_file(env):
-    cfg = env.config("fast-medium", calibration_text=None)
+    cfg = env.config("lite-medium", calibration_text=None)
     steps = plan_by_id(cfg)
     assert list(steps) == ["calibration-source", "calibration-render", "gguf", "imatrix", "convert",
                            "receipt-check", "finalize"]
@@ -293,7 +293,7 @@ def test_estimates_and_table_match_the_decided_presets():
     table = {p.id: (p.file_gb, p.kl, p.wait) for p in build.PRESETS.values()}
     assert table == {
         "best-small": (16.9, 0.1213, "about 30 min"), "best-medium": (18.4, 0.0845, "about 30 min"),
-        "fast-medium": (17.5, 0.1543, "about 40 min"), "fast-small": (16.8, 0.2376, "about 40 min"),
+        "lite-medium": (17.5, 0.1543, "about 40 min"), "lite-small": (16.8, 0.2376, "about 40 min"),
         "draft": (18.4, 0.2654, "about 15 min"),
     }
     for preset in build.PRESETS.values():
@@ -379,6 +379,8 @@ def test_help_lists_every_preset_and_flag(capsys):
                   "--calibration-text", "--gptq-python", "--score", "--keep-work", "--yes", "--dry-run", "--check",
                   "setup-gptq", "launcher"):
         assert token in text
+    assert "fast-" not in text
+    assert "lite-medium or\nlite-small only if you cannot run GPTQ" in text
 
 
 def test_module_entry_point_runs_from_the_repository_root():
@@ -386,7 +388,7 @@ def test_module_entry_point_runs_from_the_repository_root():
         [sys.executable, "-m", "tools.convert.gemma4_build", "--list-presets"], cwd=build.FORK_ROOT,
         capture_output=True, text=True, check=True,
     )
-    assert "best-small" in result.stdout and "fast-medium" in result.stdout
+    assert "best-small" in result.stdout and "lite-medium" in result.stdout and "fast-" not in result.stdout
 
 
 # ---------------------------------------------------------------- preflight with fake probes
@@ -433,11 +435,11 @@ def test_missing_gptq_environment_points_at_setup_gptq(env, tmp_path):
 
 
 def test_rtn_presets_name_missing_llama_cpp_pieces(env):
-    cfg = env.config("fast-small", llama_cpp_dir=None, llama_imatrix=None)
+    cfg = env.config("lite-small", llama_cpp_dir=None, llama_imatrix=None)
     report = preflight(env, cfg)
     assert "--llama-cpp-dir" in finding(report, "llama.cpp convert script").action
     assert "--llama-imatrix" in finding(report, "llama-imatrix").action
-    wrong = preflight(env, env.config("fast-small"), FakeProbes(missing_packages=("gguf",)))
+    wrong = preflight(env, env.config("lite-small"), FakeProbes(missing_packages=("gguf",)))
     assert "pip install gguf" in finding(wrong, "converter Python packages").action
 
 
@@ -673,17 +675,17 @@ def test_receipt_check_refuses_an_unverified_or_mismatched_receipt(env):
 
 
 def test_main_builds_end_to_end_with_a_fake_runner(env, capsys, monkeypatch):
-    cfg = env.config("fast-small", name="m-fast-small", work_dir=env.out / "work-m-fast-small", python=sys.executable)
+    cfg = env.config("lite-small", name="m-lite-small", work_dir=env.out / "work-m-lite-small", python=sys.executable)
     plan = build.build_plan(cfg)
     runner = FakeRunner(cfg, plan)
     monkeypatch.setattr(cli, "Builder", partial(build.Builder, runner=runner, disk_free=lambda path: 10**13))
     monkeypatch.setattr(launcher, "artifact_info", lambda path: launcher.ArtifactInfo(True, False, 262144))
-    argv = env.argv("fast-small", "--name", "m-fast-small", "--yes")
+    argv = env.argv("lite-small", "--name", "m-lite-small", "--yes")
     assert cli.main(argv, probes=FakeProbes()) == 0
     out = capsys.readouterr().out
     assert "Done. Artifact:" in out and "Work dir removed." in out
     assert runner.calls == ["calibration-render", "gguf", "imatrix", "convert"]
-    assert (env.out / "BUILD-SUMMARY.md").is_file() and not (env.out / "work-m-fast-small").exists()
+    assert (env.out / "BUILD-SUMMARY.md").is_file() and not (env.out / "work-m-lite-small").exists()
 
 
 # ---------------------------------------------------------------- child processes

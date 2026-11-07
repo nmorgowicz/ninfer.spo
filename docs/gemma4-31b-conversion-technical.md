@@ -198,9 +198,13 @@ resolved at g128 or g256 (the intervals span zero).
 |---|---|---|---|---|---|
 | `best-medium` | GPTQ `imatrix_mse` g32 | 0.0845 | 91.6% | 17.92 GB | 18.4 GB |
 | `best-small` | GPTQ `imatrix_mse` g256, `--native-groups` | 0.1213 | 90.0% | 16.37 GB | 16.85 GB (16,852,045,060 B, measured) |
-| `fast-medium` | RTN calibrated g32, `--scale-bits 6 --native-groups` | 0.1543 | 89.3% | about 17.0 GB | 17.5 GB |
-| `fast-small` | RTN calibrated g256, `--native-groups` | 0.2376 | 85.9% | 16.32 GB | 16.8 GB |
+| `lite-medium` | RTN calibrated g32, `--scale-bits 6 --native-groups` | 0.1543 | 89.3% | about 17.0 GB | 17.5 GB |
+| `lite-small` | RTN calibrated g256, `--native-groups` | 0.2376 | 85.9% | 16.32 GB | 16.8 GB |
 | `draft` | RTN absmax g32 | 0.2654 | 85.7% | 17.9 GB | 18.4 GB |
+
+The `lite` presets are the "lighter requirements" builds: calibrated rounding with llama.cpp statistics instead of
+GPTQ, so they need no GPTQ environment and less RAM and VRAM, and they score lower than the GPTQ presets at the same
+size (`lite-medium` 0.1543 against `best-medium` 0.0845; `lite-small` 0.2376 against `best-small` 0.1213).
 
 The `best-small` text + MTP file was built end to end (a second GPTQ run, the converter, the FP8 assistant) and
 measured: 16,852,045,060 bytes. The second GPTQ run was bit-reproducible: the scored W4A8 KL, ΔNLL and PPL are

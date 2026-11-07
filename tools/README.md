@@ -32,7 +32,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 ## Gemma 4 31B one-command build
 
 `python -m tools.convert.gemma4_build` chains the steps of the [Gemma 4 31B conversion guide](../docs/gemma4-31b-conversion.md)
-behind five presets (`best-small`, `best-medium`, `fast-medium`, `fast-small`, `draft`); `--help` and `--list-presets`
+behind five presets (`best-small`, `best-medium`, `lite-medium`, `lite-small`, `draft`); `--help` and `--list-presets`
 print the table with the measured KL, file size and wait for each. It runs the converter, the `tools/gptq/` scripts and
 llama.cpp as child processes with their logs in the work directory, and writes `<name>.ninfer`, its receipts, a Windows
 launcher with the qualified serve settings (including `--model-match any`, so a gateway that sends several model names to
