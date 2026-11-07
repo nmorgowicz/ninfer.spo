@@ -14,13 +14,13 @@ You do not need it to follow this guide.
 |---|---|---|---|---|---|---|
 | `best-small` | Most people | 16.9 GB | Very close (90.0%) | 0.1213 | about 30 min | GPU with 12 GiB free, 64 GiB RAM, about 75 GB disk |
 | `best-medium` | Highest quality | 18.4 GB | Closest (91.6%) | 0.0845 | about 30 min | Same as `best-small` |
-| `lite-medium` | If your machine cannot run GPTQ (best of the two lite builds) | 17.5 GB | Close (89.3%) | 0.1543 | about 40 min | llama.cpp, about 35 GB disk |
-| `lite-small` | If your machine cannot run GPTQ, and you want a smaller file | 16.8 GB | Noticeably lower (85.9%) | 0.2376 | about 40 min | llama.cpp, about 35 GB disk |
+| `lite-medium` | If your machine cannot run GPTQ (best of the two lite builds) | 17.5 GB | Close (89.3%) | 0.1543 | about 35 min | llama.cpp, about 35 GB disk |
+| `lite-small` | If your machine cannot run GPTQ, and you want a smaller file | 16.8 GB | Noticeably lower (85.9%) | 0.2376 | about 35 min | llama.cpp, about 35 GB disk |
 | `draft` | A quick test build only | 18.4 GB | Lowest (85.7%) | 0.2654 | about 15 min | Nothing extra |
 
-Sizes are the whole file with the MTP helper. Waits are for an RTX 5090. The GPTQ step of the two GPTQ builds was
-measured at 17 minutes and the other steps come from an earlier full build (see "What to expect" below); the `lite` and
-`draft` waits were measured earlier on the same GPU.
+Sizes are the whole file with the MTP helper. Waits are for an RTX 5090. Both are measured complete runs: the GPTQ
+builds take 25.5 minutes end to end (see "What to expect" below), a full `lite-small` build took 33 minutes (GGUF
+conversion 7, statistics 16, conversion 9), and `draft` was measured earlier on the same GPU.
 "GPTQ" is a smarter way of rounding the weights to 4 bits. It needs its own Python environment, a GPU with 12 GiB free
 and a lot of RAM. The two `lite` builds ask for less: they use a simpler rounding method (calibrated rounding) with
 statistics from llama.cpp, no GPTQ environment and less RAM and VRAM. They give lower quality than the GPTQ builds at
@@ -28,7 +28,7 @@ the same size.
 
 - **Most people: `best-small`.** Best quality for its size.
 - Highest quality: `best-medium`. 1.5 GB bigger than `best-small`.
-- If your machine cannot run GPTQ (under 12 GiB of free VRAM, under about 64 GiB of RAM, or you do not want the GPTQ environment): `lite-medium`, the best of the two, in about 40 minutes.
+- If your machine cannot run GPTQ (under 12 GiB of free VRAM, under about 64 GiB of RAM, or you do not want the GPTQ environment): `lite-medium`, the best of the two, in about 35 minutes.
 - The same, with a smaller file: `lite-small`. It is 0.7 GB smaller than `lite-medium` and 1.6 GB smaller than `draft`, but its quality is noticeably lower, and only a little better than `draft`.
 - A quick test build: `draft`.
 

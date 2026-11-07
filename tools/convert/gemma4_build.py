@@ -88,7 +88,7 @@ PRESETS: dict[str, Preset] = {
         "lite-medium", "rtn", "calibrated RTN, g32 with 6-bit two-level scales",
         "Lighter requirements, lower quality: no GPTQ environment and no GPTQ-sized VRAM/RAM, but it needs llama.cpp "
         "for statistics and scores below best-small.",
-        "medium", 17.5, 0.1543, "about 40 min", 32, True, 6, "q4_g32_s6_fp16", 36, 54, 1,
+        "medium", 17.5, 0.1543, "about 35 min", 32, True, 6, "q4_g32_s6_fp16", 36, 54, 1,
         {"calibration-source": 1, "calibration-render": 1, "gguf": 7, "imatrix": 12, "convert": 15,
          "receipt-check": 0.5, "finalize": 0.5},
     ),
@@ -96,7 +96,7 @@ PRESETS: dict[str, Preset] = {
         "lite-small", "rtn", "calibrated RTN, group 256",
         "Lighter requirements like lite-medium with a small file, but quality-compromised (KL 0.2376, about twice "
         "best-small); prefer best-small if you can run GPTQ.",
-        "small", 16.8, 0.2376, "about 40 min", 256, True, None, "q4_g256_fp16", 36, 54, 1,
+        "small", 16.8, 0.2376, "about 35 min", 256, True, None, "q4_g256_fp16", 36, 54, 1,
         {"calibration-source": 1, "calibration-render": 1, "gguf": 7, "imatrix": 12, "convert": 15,
          "receipt-check": 0.5, "finalize": 0.5},
     ),
