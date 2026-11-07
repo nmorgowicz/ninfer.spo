@@ -13,7 +13,8 @@ Refused: ``weight_zero_point`` and ``weight_g_idx`` (asymmetric or activation-or
 fork's contiguous symmetric groups), a ``K`` that is not a multiple of ``G``, and a ``G`` that is not one of the above.
 
 Fork-side permutations (rows of global q/k, columns of global o) are applied to the encoded words as a row gather
-and a 32-wide column-group gather. A column permutation must move whole 32-groups, otherwise it is refused.
+and a column-group gather (32-wide, or the whole source group for native storage). A column permutation must move
+whole groups, otherwise it is refused.
 """
 
 from __future__ import annotations
@@ -23,25 +24,25 @@ import torch
 from .logical import EncodedRows, LogicalSource
 from .safetensors import SafetensorsSource
 
-FORMAT = "q4_g32_fp16"
 GROUP_SIZES = (32, 64, 128, 256)
+NATIVE_GROUP_SIZES = (128, 256)
 _PADDED_K = 128
 _SCALE_DTYPES = ("BF16", "F16", "F32")
 
 
-def column_group_index(col_index: torch.Tensor) -> torch.Tensor:
-    """Fork 32-group -> source 32-group for a fork-column -> source-column index; refuse a split group."""
-    if col_index.dim() != 1 or col_index.numel() % 32:
-        raise ValueError("column permutation must be a vector whose length is a multiple of 32")
-    blocks = col_index.reshape(-1, 32)
+def column_group_index(col_index: torch.Tensor, width: int = 32) -> torch.Tensor:
+    """Fork ``width``-group -> source ``width``-group for a fork-column -> source-column index; refuse a split group."""
+    if col_index.dim() != 1 or col_index.numel() % width:
+        raise ValueError(f"column permutation must be a vector whose length is a multiple of {width}")
+    blocks = col_index.reshape(-1, width)
     first = blocks[:, 0]
-    expected = first[:, None] + torch.arange(32, dtype=col_index.dtype)
-    if bool((first % 32).any()) or not torch.equal(blocks, expected):
+    expected = first[:, None] + torch.arange(width, dtype=col_index.dtype)
+    if bool((first % width).any()) or not torch.equal(blocks, expected):
         raise ValueError(
-            "the column permutation does not map every 32-group onto a whole source 32-group; "
+            f"the column permutation does not map every {width}-group onto a whole source {width}-group; "
             "its tensor cannot be imported exactly"
         )
-    return first // 32
+    return first // width
 
 
 def unpack_codes(packed: torch.Tensor) -> torch.Tensor:
@@ -75,13 +76,22 @@ def packed_int4_matrix_source(
     *,
     row_index: torch.Tensor | None = None,
     col_index: torch.Tensor | None = None,
+    native: bool = False,
 ) -> LogicalSource:
-    """Encoded ``q4_g32_fp16`` rows of ``shape`` read from the packed matrix at ``prefix``.
+    """Encoded rows of ``shape`` read from the packed matrix at ``prefix``.
+
+    Without ``native`` the format is ``q4_g32_fp16`` (a coarse scale repeated over its 32-wide subgroups). With
+    ``native`` and group size 128 or 256 it is the real ``q4_g128_fp16`` / ``q4_g256_fp16``: the source codes with one
+    scale per source group; a column permutation must then move whole source groups, otherwise it is refused.
 
     ``row_index[i]`` is the source row of fork row ``i``; ``col_index[j]`` the source column of fork column ``j``.
     """
     if group_size not in GROUP_SIZES:
         raise ValueError(f"{prefix}: group size {group_size} is not one of {GROUP_SIZES}")
+    if native and group_size not in (32, *NATIVE_GROUP_SIZES):
+        raise ValueError(f"{prefix}: native storage exists for group sizes 32, 128 and 256 (no Gemma g64 kernels), not {group_size}")
+    width = group_size if native else 32  # code-plane group width of the stored format
+    target = f"q4_g{width}_fp16"
     n, k = shape
     if k % group_size:
         raise ValueError(f"{prefix}: K {k} is not a multiple of the group size {group_size}")
@@ -89,7 +99,7 @@ def packed_int4_matrix_source(
         raise ValueError(f"{prefix}: the row index must be a permutation of the {n} rows")
     if col_index is not None and (col_index.shape != (k,) or sorted(col_index.tolist()) != list(range(k))):
         raise ValueError(f"{prefix}: the column index must be a permutation of the {k} columns")
-    groups = None if col_index is None else column_group_index(col_index)
+    groups = None if col_index is None else column_group_index(col_index, width)
     for extra in ("weight_zero_point", "weight_g_idx"):
         if store.has(f"{prefix}.{extra}"):
             raise ValueError(f"{prefix}: {extra} is present; asymmetric or reordered groups are not importable")
@@ -106,7 +116,9 @@ def packed_int4_matrix_source(
     if store.read_flat(shape_name).tolist() != [n, k]:
         raise ValueError(f"{shape_name}: stored shape differs from {[n, k]}")
     k_pad = -(-k // _PADDED_K) * _PADDED_K
-    subgroups = group_size // 32
+    if native and k_pad % width:
+        raise ValueError(f"{prefix}: K padded to {_PADDED_K} ({k_pad}) must be a multiple of {width} for {target}")
+    subgroups = 1 if native else group_size // 32
 
     def encoded(begin: int, end: int) -> EncodedRows:
         if not 0 <= begin < end <= n:
@@ -119,14 +131,14 @@ def packed_int4_matrix_source(
         )
         if rows is not None:
             words, raw = words[rows - low], raw[rows - low]
-        codes = unpack_codes(words).reshape(end - begin, k // 32, 32)
+        codes = unpack_codes(words).reshape(end - begin, k // width, width)
         scales = exact_fp16_scales(raw, scale_name).repeat_interleave(subgroups, dim=1)
         if groups is not None:
             codes, scales = codes[:, groups], scales[:, groups]
         if k_pad != k:
-            codes = torch.cat((codes, torch.zeros(end - begin, (k_pad - k) // 32, 32, dtype=torch.int8)), dim=1)
-            scales = torch.cat((scales, torch.zeros(end - begin, (k_pad - k) // 32, dtype=torch.float16)), dim=1)
-        return EncodedRows(FORMAT, codes.contiguous(), scales.contiguous())
+            codes = torch.cat((codes, torch.zeros(end - begin, (k_pad - k) // width, width, dtype=torch.int8)), dim=1)
+            scales = torch.cat((scales, torch.zeros(end - begin, (k_pad - k) // width, dtype=torch.float16)), dim=1)
+        return EncodedRows(target, codes.contiguous(), scales.contiguous())
 
     def read(begin: int, end: int) -> torch.Tensor:
         if begin == end:

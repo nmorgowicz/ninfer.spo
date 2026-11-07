@@ -446,9 +446,9 @@ def nvfp4_absmax(request: PrepareRequest) -> PreparedMethod:
 
 
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
-    """Preserve the current FP8/NVFP4/q4_g32_fp16 source codes, scales and weight divisor."""
+    """Preserve the current FP8/NVFP4/q4 source codes, scales and weight divisor."""
     if (
-        request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16", "q4_g32_fp16")
+        request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16", "q4_g32_fp16", "q4_g128_fp16", "q4_g256_fp16")
         or len(request.target.shape) != 2
     ):
         raise ValueError("import_encoded requires a known encoded matrix target")

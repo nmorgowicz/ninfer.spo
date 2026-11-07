@@ -14,7 +14,7 @@ import torch
 
 from .gemma4 import prope_perm
 from .sources.logical import LogicalSource
-from .sources.packed_int4 import GROUP_SIZES, packed_int4_matrix_source
+from .sources.packed_int4 import GROUP_SIZES, column_group_index, packed_int4_matrix_source
 from .sources.safetensors import SafetensorsSource
 
 _HF_ROLES = {
@@ -59,10 +59,16 @@ def _head_index(perm: torch.Tensor, heads: int) -> torch.Tensor:
     return (torch.arange(heads, dtype=torch.int64)[:, None] * dim + perm[None, :]).reshape(-1)
 
 
-def gptq_projection_sources(model, root: Path) -> tuple[dict[str, LogicalSource], int]:
-    """Encoded `q4_g32_fp16` sources for every text-layer projection of `model`, read from `root`.
+def gptq_projection_sources(
+    model, root: Path, *, native: bool = False
+) -> tuple[dict[str, LogicalSource], int, dict[str, str]]:
+    """Encoded sources for every text-layer projection of `model`, read from `root`.
 
-    Returns (sources by fork parameter name, the checkpoint group size). The sources reopen files on demand.
+    Returns (sources by fork parameter name, the checkpoint group size, target format by parameter name). Without
+    `native` every source is `q4_g32_fp16` (a coarse scale repeated over its 32-wide subgroups). With `native` and a
+    group size of 128 or 256 a source is the real `q4_g{G}_fp16`, except a global-layer o projection: the converter's
+    column permutation interleaves 64-wide runs of two source groups into one fork group, so its source stays
+    `q4_g32_fp16` (still exact: the repeated scales decode to the same values). The sources reopen files on demand.
     """
     store = SafetensorsSource(root)
     try:
@@ -77,7 +83,7 @@ def gptq_projection_sources(model, root: Path) -> tuple[dict[str, LogicalSource]
         config = model.config
         perm = prope_perm(config["global_head_dim"], config["partial_rotary_factor"])
         heads, kv = config["num_attention_heads"], config["num_global_key_value_heads"]
-        sources = {}
+        sources, formats = {}, {}
         for name, parameter in model.parameters.items():
             if not (name.startswith("text/layers/") and parameter.projection):
                 continue
@@ -89,6 +95,12 @@ def gptq_projection_sources(model, root: Path) -> tuple[dict[str, LogicalSource]
                 row_index = _head_index(perm, heads if role == "attention/query" else kv)
             elif global_layer and role == "attention/output":
                 col_index = _head_index(perm, heads)
+            keep_groups = native and group_size > 32
+            if keep_groups and col_index is not None:
+                try:
+                    column_group_index(col_index, group_size)
+                except ValueError:
+                    keep_groups = False
             sources[name] = packed_int4_matrix_source(
                 store,
                 f"{stem}{index}.{_HF_ROLES[role]}",
@@ -96,9 +108,11 @@ def gptq_projection_sources(model, root: Path) -> tuple[dict[str, LogicalSource]
                 group_size,
                 row_index=row_index,
                 col_index=col_index,
+                native=keep_groups,
             )
+            formats[name] = f"q4_g{group_size}_fp16" if keep_groups else "q4_g32_fp16"
         if not sources:
             raise ValueError("the model has no text-layer projections")
-        return sources, group_size
+        return sources, group_size, formats
     finally:
         store.close()

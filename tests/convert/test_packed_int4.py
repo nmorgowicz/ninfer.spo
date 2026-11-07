@@ -22,7 +22,7 @@ from tools.convert.sources.logical import array_source
 from tools.convert.sources.packed_int4 import column_group_index, packed_int4_matrix_source, unpack_codes
 from tools.convert.sources.safetensors import SafetensorsSource
 
-HIDDEN, INTER, HEADS, KV, SLIDING_DIM, GLOBAL_DIM = 128, 256, 2, 1, 64, 128
+HIDDEN, INTER, HEADS, KV, SLIDING_DIM, GLOBAL_DIM = 256, 512, 4, 1, 64, 128
 KINDS = ["sliding_attention", "full_attention"]
 CONFIG = {
     "model_type": "gemma4_text",
@@ -144,9 +144,9 @@ def fork_order(name: str, hf: torch.Tensor) -> torch.Tensor:
     return hf
 
 
-def written(tmp_path: Path, built, model: Model):
+def written(tmp_path: Path, built, model: Model, name: str = "toy.ninfer"):
     prepared = built.recipe.prepare(device="cpu", rows_per_chunk=3)
-    path = tmp_path / "toy.ninfer"
+    path = tmp_path / name
     specs = [job.spec for job in prepared.weights]
     with ArtifactWriter(
         path, specs, components=model.components, bindings=prepared.bindings, uses=prepared.uses
@@ -191,7 +191,7 @@ def test_import_reaches_the_artifact_unchanged_with_global_permutations(tmp_path
 def test_codes_and_scales_are_the_checkpoints_own_words(tmp_path):
     model = toy_model()
     values = write_checkpoint(tmp_path / "gptq", model)
-    sources, group = gptq_projection_sources(model, tmp_path / "gptq")
+    sources, group, _ = gptq_projection_sources(model, tmp_path / "gptq")
     assert group == 32
     name = "text/layers/1/attention/output"  # global o: columns permuted in 32-groups, scales follow the codes
     codes, scales, _ = values[name]
@@ -212,7 +212,7 @@ def test_codes_and_scales_are_the_checkpoints_own_words(tmp_path):
 def test_global_rows_follow_the_fork_row_permutation(tmp_path):
     model = toy_model()
     values = write_checkpoint(tmp_path / "gptq", model)
-    sources, _ = gptq_projection_sources(model, tmp_path / "gptq")
+    sources, _, _ = gptq_projection_sources(model, tmp_path / "gptq")
     for name in ("text/layers/1/attention/query", "text/layers/1/attention/key"):
         words = sources[name].read_encoded(0, model.parameters[name].shape[0])
         got = words.codes.float() * words.scales.float().unsqueeze(-1)
@@ -224,7 +224,7 @@ def test_global_rows_follow_the_fork_row_permutation(tmp_path):
 def test_coarse_source_groups_repeat_their_scale_exactly(tmp_path, group_size):
     model = toy_model()
     values = write_checkpoint(tmp_path / "gptq", model, group_size=group_size)
-    sources, group = gptq_projection_sources(model, tmp_path / "gptq")
+    sources, group, _ = gptq_projection_sources(model, tmp_path / "gptq")
     assert group == group_size
     for name, source in sources.items():
         words = source.read_encoded(0, source.shape[0])
@@ -276,7 +276,7 @@ def refusal(tmp_path, extra=None, scales=None, config=None, match=""):
             tensors["model.layers.0.mlp.down_proj.weight_scale"] = scales
         save_file(tensors, str(file))
     with pytest.raises(ValueError, match=match):
-        sources, _ = gptq_projection_sources(model, tmp_path / "gptq")
+        sources, _, _ = gptq_projection_sources(model, tmp_path / "gptq")
         for source in sources.values():
             source.read_encoded(0, 1)
 
@@ -348,7 +348,6 @@ def test_options_exclude_every_other_scale_choice(tmp_path):
         {"scale_search": "mse"},
         {"group_size": 128},
         {"region_groups": ("attn_out=32",)},
-        {"native_groups": True},
         {"scale_bits": 6},
         {"weights": "fp8_row"},
     ):
@@ -373,3 +372,109 @@ def test_the_global_permutations_are_not_the_identity_on_the_toy_geometry():
         hf = torch.randn(*shape, generator=generator)
         assert not torch.equal(fork_order(f"text/layers/1/{role}", hf), hf)
         assert torch.equal(fork_order(f"text/layers/0/{role}", hf), hf)
+
+
+# --- native coarse groups (q4_g128_fp16 / q4_g256_fp16) ---------------------------------------------------------
+
+
+def decoded_by_member(tmp_path, built, model, name):
+    """{member parameter: (format, decoded float32 rows)} of a written artifact."""
+    path, prepared = written(tmp_path, built, model, name)
+    result = {}
+    with Artifact(path) as artifact:
+        for job in prepared.weights:
+            if not job.spec.format.startswith("q4_g"):
+                continue
+            payload = artifact.read_object(job.spec.id)
+            decoded = dequantize_row_split(payload, job.spec.format, job.spec.shape, dtype=torch.float32)
+            row = 0
+            for member in job.parameters:
+                n = model.parameters[member].shape[0]
+                result[member] = (job.spec.format, decoded[row : row + n], job.spec.shape)
+                row += n
+    return result
+
+
+@pytest.mark.parametrize("group_size", [128, 256])
+@pytest.mark.parametrize("weights", ["q4_g32_a16", "q4_g32"])
+def test_native_import_stores_real_coarse_formats_and_decodes_like_the_emulation(tmp_path, group_size, weights):
+    model = toy_model()
+    values = write_checkpoint(tmp_path / "gptq", model, group_size=group_size)
+    options = {"weights": weights, "gptq_source": tmp_path / "gptq"}
+    native = build_recipe(model, None, Q4Options(native_groups=True, **options), device="cpu", rows_per_chunk=3)
+    emulated = build_recipe(model, None, Q4Options(**options), device="cpu", rows_per_chunk=3)
+    assert native.name == f"q4_g32_gptq_import_fp8_vocab_{'a8' if weights == 'q4_g32' else 'a16'}_native_groups"
+    assert emulated.name.endswith("_virtual_groups")
+    got_native = decoded_by_member(tmp_path, native, model, "native.ninfer")
+    got_emulated = decoded_by_member(tmp_path, emulated, model, "emulated.ninfer")
+    keep = {"text/layers/1/attention/output"}  # the only tensor whose column permutation splits a source group
+    for member, (fmt, decoded, _) in got_native.items():
+        want = fork_order(member, values[member][2])
+        assert torch.equal(decoded, want), member  # bit identity with the checkpoint, and with the emulation:
+        assert torch.equal(decoded, got_emulated[member][1]), member
+        assert fmt == ("q4_g32_fp16" if member in keep else f"q4_g{group_size}_fp16"), member
+        assert got_emulated[member][0] == "q4_g32_fp16"
+    assert native.scale_search["native"] is True and native.scale_search["kept_g32_storage"] == sorted(keep)
+    assert native.scale_search["storage_formats"] == {
+        f"q4_g{group_size}_fp16": len(values) - 1,
+        "q4_g32_fp16": 1,
+    }
+    assert native.payload < emulated.payload  # the scale planes really shrank
+    assert native.q4_groups["projection_note"] == "weight_bytes is the real native size"
+    # W4A8 permission reaches every projection, native ones included
+    allowed = {name for (name, _), policy in native.recipe.policies.items() if policy == "AllowA8"}
+    assert allowed == (set(values) if weights == "q4_g32" else set())
+
+
+@pytest.mark.parametrize("group_size", [128, 256])
+def test_native_source_words_are_the_checkpoints_own(tmp_path, group_size):
+    model = toy_model()
+    values = write_checkpoint(tmp_path / "gptq", model, group_size=group_size)
+    sources, group, formats = gptq_projection_sources(model, tmp_path / "gptq", native=True)
+    assert group == group_size
+    name = "text/layers/0/mlp/down"
+    codes, scales, _ = values[name]
+    words = sources[name].read_encoded(2, 7)
+    assert words.format == f"q4_g{group_size}_fp16" == formats[name]
+    assert words.codes.shape == (5, INTER // group_size, group_size) and words.scales.shape == (5, INTER // group_size)
+    assert torch.equal(words.codes, codes.reshape(HIDDEN, -1, group_size)[2:7])
+    assert torch.equal(words.scales.float(), scales.float()[2:7])
+    # global q/k: rows permuted, groups untouched
+    q = "text/layers/1/attention/query"
+    words = sources[q].read_encoded(0, model.parameters[q].shape[0])
+    got = (words.codes.float() * words.scales.float().unsqueeze(-1)).reshape(words.codes.shape[0], -1)
+    assert torch.equal(got, fork_order(q, values[q][2]))
+    assert formats[q] == f"q4_g{group_size}_fp16"
+    assert formats["text/layers/1/attention/output"] == "q4_g32_fp16"
+
+
+def test_native_refusals(tmp_path):
+    model = toy_model()
+    write_checkpoint(tmp_path / "g64", model, group_size=64)
+    with pytest.raises(ValueError, match="no Gemma g64 kernels"):
+        gptq_projection_sources(model, tmp_path / "g64", native=True)
+    # K must be a multiple of the group size (384 is not a multiple of 256) ...
+    generator = torch.Generator().manual_seed(4)
+    codes, scales = random_matrix(generator, 4, 384, 128)
+    save_file(
+        {"m.weight_packed": pack(codes), "m.weight_scale": scales, "m.weight_shape": torch.tensor([4, 384], dtype=torch.int64)},
+        str(tmp_path / "model.safetensors"),
+    )
+    with SafetensorsSource(tmp_path) as store:
+        with pytest.raises(ValueError, match="not a multiple of the group size 256"):
+            packed_int4_matrix_source(store, "m", (4, 384), 256, native=True)
+        # a g128 source of the same K is fine natively
+        source = packed_int4_matrix_source(store, "m", (4, 384), 128, native=True)
+        assert source.read_encoded(0, 4).format == "q4_g128_fp16"
+    # the tensors a column permutation splits cannot be native; the importer refuses to store them so
+    perm_cols = (torch.arange(2)[:, None] * 512 + prope_perm(512, 0.25)[None, :]).reshape(-1)
+    for width in (128, 256):
+        with pytest.raises(ValueError, match="whole source"):
+            column_group_index(perm_cols, width)
+    column_group_index(perm_cols, 32)
+
+
+def test_native_options_are_allowed_with_a_gptq_source(tmp_path):
+    assert Q4Options(weights="q4_g32_a16", native_groups=True, gptq_source=tmp_path).native_groups
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        Q4Options(weights="q4_g32_a16", native_groups=True, group_size=256, gptq_source=tmp_path)

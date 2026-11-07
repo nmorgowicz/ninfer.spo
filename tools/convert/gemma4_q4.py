@@ -266,12 +266,12 @@ class Q4Options:
                 or self.imatrix
                 or regions
                 or self.group_size != 32
-                or self.native_groups
                 or self.scale_bits is not None
             ):
                 raise ValueError(
                     "--gptq-source is mutually exclusive with --scale-search/--imatrix/--group-size/"
-                    "--region-group/--native-groups/--scale-bits (the source decides codes and scales)"
+                    "--region-group/--scale-bits (the source decides codes and scales; --native-groups stores a "
+                    "128/256 source in the real q4_g128_fp16/q4_g256_fp16 formats)"
                 )
 
     @property
@@ -344,25 +344,36 @@ def build_recipe(model, source, options: Q4Options, *, device: str, rows_per_chu
                 "sha256": sha256_file(options.imatrix),
                 "role": "sensitivity unless collected from the target model",
             }
-        imported, imported_group = {}, None
+        imported, imported_group, imported_formats = {}, None, {}
         if options.gptq_source is not None:
             from .gemma4_gptq import gptq_projection_sources
 
-            imported, imported_group = gptq_projection_sources(model, options.gptq_source)
+            imported, imported_group, imported_formats = gptq_projection_sources(
+                model, options.gptq_source, native=options.native_groups
+            )
             if set(imported) != set(projections):
                 raise ValueError("the GPTQ source does not cover exactly the model's text-layer projections")
             scale_search = {
                 "method": "external_gptq_import",
                 "gptq_source": str(options.gptq_source.resolve()),
                 "group_size": imported_group,
+                "native": options.native_groups and imported_group > 32,
+                "storage_formats": {
+                    fmt: sum(1 for value in imported_formats.values() if value == fmt)
+                    for fmt in sorted(set(imported_formats.values()))
+                },
+                "kept_g32_storage": sorted(
+                    name for name, fmt in imported_formats.items() if fmt == "q4_g32_fp16" and imported_group > 32
+                )
+                if options.native_groups and imported_group > 32
+                else [],
                 "note": "codes and binary16 scales copied exactly from the external checkpoint; nothing re-rounded",
             }
         for name in projections:
             if name in imported:
-                groups[name] = imported_group
-                recipe.assign(
-                    name, format="q4_g32_fp16", layout="auto", method="import_encoded", source=imported[name]
-                )
+                target = imported_formats[name]
+                groups[name] = imported_group if target != "q4_g32_fp16" or not options.native_groups else 32
+                recipe.assign(name, format=target, layout="auto", method="import_encoded", source=imported[name])
                 continue
             groups[name] = q4_group_for(name, layer_types, regions, options.group_size)
             if options.native_groups and groups[name] == 64:
