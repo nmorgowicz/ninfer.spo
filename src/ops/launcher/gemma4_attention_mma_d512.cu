@@ -123,6 +123,18 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
     const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
     const unsigned v_r  = static_cast<unsigned>(b_rin << 4);
 
+    // De-duplicated QK: warp (r, h) contracts only the 256-dim half h of every key (one
+    // FP8 scale group) and the warp pair (w, w ^ 4) exchanges its partial score tile
+    // through this region, which aliases the K staging bytes: by exchange time every
+    // warp finished its ldmatrix reads of the tile, and the next K stage starts only
+    // after the CTA barrier below the exchange. Lane i of both paired warps holds the
+    // identical (row, key) C-fragment coordinates, so the exchange is lane-symmetric.
+    // The two contributions are added in opposite order by the two warps; FP addition is
+    // commutative, so both hold bit-identical full scores and softmax state without the
+    // duplicate QK MMAs of the old "each warp computes all 512 dims" layout.
+    float* xchg = Fp8Qk ? reinterpret_cast<float*>(k_fp8) : reinterpret_cast<float*>(k_s);
+    const int pair = 1 + (warp & 3); // named 64-thread barrier for warps r and r + 4
+
     if constexpr (Fp8Qk) {
         const auto* q_block = q + (static_cast<std::int64_t>(q0) * q_heads + q_head) * kD;
         gemma4_fp8_qk_queries<kRows, kWarps>(
@@ -242,7 +254,9 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
 
         float score[kQkNt][4];
         if constexpr (Fp8Qk) {
-            gemma4_fp8_qk_scores<kBc>(score, q_fp8, k_fp8, q_scale_s, k_scale_s, row_base, lane);
+            // Only this warp's 256-dim group; the pair exchange adds the other group.
+            gemma4_fp8_qk_scores<kBc>(score, q_fp8, k_fp8, q_scale_s, k_scale_s, row_base,
+                                      lane, half);
         } else {
 #pragma unroll
             for (int nt = 0; nt < kQkNt; ++nt) {
@@ -261,11 +275,13 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
                                                ck, k_as, k_r));
                 }
             };
-            load(af[0], bf[0], 0);
+            // Half of the k-steps: dims [256 half, 256 (half + 1)).
+            const int k_lo = half * (kQkKs / 2);
+            load(af[0], bf[0], k_lo);
 #pragma unroll
-            for (int k = 0; k < kQkKs; ++k) {
-                const int cur = k & 1;
-                if (k + 1 < kQkKs) { load(af[cur ^ 1], bf[cur ^ 1], k + 1); }
+            for (int i = 0; i < kQkKs / 2; ++i) {
+                const int cur = i & 1;
+                if (i + 1 < kQkKs / 2) { load(af[cur ^ 1], bf[cur ^ 1], k_lo + i + 1); }
 #pragma unroll
                 for (int nt = 0; nt < kQkNt; ++nt) {
                     mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[cur][0],
@@ -276,6 +292,28 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
 
         cp_wait<0>();
         __syncthreads();
+        // Exchange the half contractions: publish, meet the pair, add the partner's
+        // partials. Every warp's K ldmatrix reads finished above, so the aliased K
+        // staging bytes are dead; the trailing CTA barrier retires the reads before
+        // the next K stage (or the V expand) reuses any of them.
+        {
+            float* slot = xchg + (warp * 32 + lane) * 8;
+            *reinterpret_cast<float4*>(slot) = *reinterpret_cast<const float4*>(&score[0][0]);
+            *reinterpret_cast<float4*>(slot + 4) = *reinterpret_cast<const float4*>(&score[1][0]);
+            asm volatile("bar.sync %0, 64;" :: "r"(pair) : "memory");
+            const float4* other = reinterpret_cast<const float4*>(xchg + ((warp ^ 4) * 32 + lane) * 8);
+            const float4 lo = other[0];
+            const float4 hi = other[1];
+            score[0][0] += lo.x;
+            score[0][1] += lo.y;
+            score[0][2] += lo.z;
+            score[0][3] += lo.w;
+            score[1][0] += hi.x;
+            score[1][1] += hi.y;
+            score[1][2] += hi.z;
+            score[1][3] += hi.w;
+            __syncthreads();
+        }
         if constexpr (kQuantKv) {
             expand(v_s, v_scales, physical, k0);
             __syncthreads();

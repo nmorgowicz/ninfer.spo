@@ -78,13 +78,16 @@ __device__ __forceinline__ void gemma4_fp8_qk_keys(
     }
 }
 
-// Warps paired for PV output halves must both reconstruct the complete score.
-// Eight m16n8k32 steps per group; correct EACH partial before adding groups.
-// mma_fp8_e4m3 supplies unit UE8M0 block scales, not these row scales.
+// Warps paired for PV output halves each reconstruct the complete score from their own
+// 256-dim group when only_group >= 0: only that group's mma runs and only its scaled
+// partial is produced, for the caller's pair exchange. mma_fp8_e4m3 supplies unit
+// UE8M0 block scales, not these row scales, so EACH partial is corrected before it is
+// published.
 template <int Bc>
 __device__ __forceinline__ void gemma4_fp8_qk_scores(
     float (&score)[Bc / 8][4], const std::uint8_t* q, const std::uint8_t* k,
-    const __half* q_scales, const __half* k_scales, int row_base, int lane) {
+    const __half* q_scales, const __half* k_scales, int row_base, int lane,
+    int only_group = -1) {
     const int gid = lane >> 2;
     const int lid = lane & 3;
     const int a_mat = lane >> 3;
@@ -101,6 +104,7 @@ __device__ __forceinline__ void gemma4_fp8_qk_scores(
     }
 #pragma unroll
     for (int group = 0; group < 2; ++group) {
+        if (only_group >= 0 && group != only_group) { continue; }
         float partial[Bc / 8][4]{};
         unsigned af[2][4];
         unsigned bf[2][Bc / 8][2];
