@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <set>
 #include <iomanip>
 #include <iostream>
@@ -308,6 +309,25 @@ std::string resource_text(artifact::Binder& binder, std::string_view role) {
     return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
 }
 
+// `--chat-template FILE` replaces the artifact's template; same limits as the Qwen frontend.
+std::string gemma4_chat_template(artifact::Binder& binder, const std::filesystem::path& path) {
+    if (path.empty()) return resource_text(binder, "chat_template.jinja");
+    const std::string name = path.string();
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) throw std::invalid_argument("cannot read chat template: " + name);
+    const auto size = file.tellg();
+    if (size <= 0 || size > 16 * 1024 * 1024) {
+        throw std::invalid_argument(
+            "chat template must be a nonempty UTF-8 source file up to 16 MiB: " + name);
+    }
+    std::string source(static_cast<std::size_t>(size), '\0');
+    file.seekg(0);
+    if (!file.read(source.data(), static_cast<std::streamsize>(source.size()))) {
+        throw std::invalid_argument("cannot read chat template: " + name);
+    }
+    return source;
+}
+
 ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
                                   artifact::Reader& reader,
                                   std::chrono::steady_clock::time_point start) {
@@ -330,7 +350,7 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
         !mtp ? 0U : speculative.adaptive_draft_tokens ? kGemma4AutoDraftTokens : speculative.draft_tokens;
     artifact::Binder binder(reader);
     const std::string tokenizer = resource_text(binder, "tokenizer.json");
-    const std::string chat      = resource_text(binder, "chat_template.jinja");
+    const std::string chat      = gemma4_chat_template(binder, options.chat_template_path);
     auto loaded                 = std::make_unique<models::gemma4::LoadedText>(
         models::gemma4::load_text(options.artifact_path.string(), device, mtp));
     device.synchronize();
