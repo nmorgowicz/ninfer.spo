@@ -126,6 +126,9 @@ void log_if_set(const RuntimeSwitches& switches) {
         std::fprintf(stderr, " routing_dump=%s", switches.routing_dump.c_str());
     }
     if (!switches.gemma4_attn_split_k) { std::fprintf(stderr, " gemma4_attn_split_k=off"); }
+    if (switches.gemma4_attn_segments != 0) {
+        std::fprintf(stderr, " gemma4_attn_segments=%d", switches.gemma4_attn_segments);
+    }
     std::fprintf(stderr, "\n");
 }
 
@@ -175,7 +178,10 @@ RuntimeSwitches& mutable_switches() {
         if (env_string("NINFER_EXPERT_ADAPT") == "0") { out.expert_adapt = false; }
         const std::string attn_split = env_string("NINFER_GEMMA4_ATTN_SPLIT_K");
         out.gemma4_attn_split_k      = !(attn_split == "0" || attn_split == "off");
-        out.routing_dump = env_string("NINFER_ROUTING_DUMP");
+        if (env_present("NINFER_GEMMA4_ATTN_SEGMENTS")) {
+            const int segments = env_int("NINFER_GEMMA4_ATTN_SEGMENTS", 0);
+            out.gemma4_attn_segments = segments < 1 ? 0 : (segments > 32 ? 32 : segments);
+        }
         return out;
     }();
     return switches;

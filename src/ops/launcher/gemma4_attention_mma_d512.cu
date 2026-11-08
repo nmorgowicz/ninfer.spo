@@ -494,14 +494,27 @@ __global__ void gemma4_attention_d512_combine_kernel(
 
 constexpr int kMinSegmentBlocks = 16; // shorter contexts keep the single-kernel path
 constexpr int kMaxSegments      = 32;
+constexpr int kWaveSegments     = 8; // beyond this, combine traffic outweighs the fill
 
-// Context split-K heuristic: add grid.z segments only when the (query tile x head) grid
-// cannot fill the device, and never below kMinSegmentBlocks 16-key blocks per segment so
-// short contexts skip the combine. pages <= 0 returns the context-unclamped bound, which
-// sizes the preallocated workspace for every context length a bucket can later reach.
+// Context split-K heuristic (wave-aware, adapted from mxfp8_tiled_partition): at the
+// kernel's 1-CTA/SM occupancy each wave holds sm_count CTAs, and a CTA's mainloop time
+// scales with its share of the key range, so relative cost is waves(segments)/segments
+// with waves = ceil(ctas * segments / SMs). Minimize that over segments, keeping the
+// fewest segments on a tie. Unlike ceil(SMs / ctas) alone this reaches whole waves at
+// every chunk width (chunk 128: 64 CTAs x 5 = 320 CTAs, 94% of one 170-SM wave pair).
+// The segment choice depends only on (tokens, q_heads, SMs): the live key range comes
+// from positions on device, so extra segments beyond the live range launch, see an
+// empty block range, and publish -inf stats the combine skips. The grid therefore stays
+// fixed per captured width and replay is capture-safe.
+// pages <= 0 returns the context-unclamped bound, which sizes the preallocated workspace
+// for every context length a bucket can later reach. NINFER_GEMMA4_ATTN_SEGMENTS pins
+// the count for sweeps; the pinned value skips the context clamp like pages <= 0.
 int d512_segment_count(std::int32_t tokens, std::int32_t q_heads, std::int32_t pages,
                        std::int32_t window) {
     if (!runtime_switches().gemma4_attn_split_k || tokens < kRows || q_heads <= 0) { return 1; }
+    if (runtime_switches().gemma4_attn_segments > 0) {
+        return std::min(runtime_switches().gemma4_attn_segments, kMaxSegments);
+    }
     static const int sm_count = [] {
         int device = 0;
         int count  = 1;
@@ -514,7 +527,16 @@ int d512_segment_count(std::int32_t tokens, std::int32_t q_heads, std::int32_t p
     }();
     const std::int64_t ctas =
         ((static_cast<std::int64_t>(tokens) + kRows - 1) / kRows) * q_heads;
-    std::int64_t segments = std::min<std::int64_t>((sm_count + ctas - 1) / ctas, kMaxSegments);
+    std::int64_t segments = 1;
+    std::int64_t waves    = (ctas + sm_count - 1) / sm_count;
+    for (int splits = 2; splits <= kWaveSegments; ++splits) {
+        const std::int64_t next = (ctas * splits + sm_count - 1) / sm_count;
+        if (next * segments < waves * splits) {
+            segments = splits;
+            waves    = next;
+        }
+    }
+    segments = std::min(segments, static_cast<std::int64_t>(kMaxSegments));
     if (pages > 0) {
         std::int64_t keys = static_cast<std::int64_t>(pages) * kPagedKVPageSize;
         if (window > 0) { keys = std::min(keys, static_cast<std::int64_t>(window)); }

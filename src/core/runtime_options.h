@@ -51,6 +51,9 @@ struct RuntimeSwitches {
     // Context split-K for the D=512 attention tensor-core kernel; "0"/"off" restores the
     // single-kernel walk for A/B measurement.
     bool gemma4_attn_split_k = true;
+    // 0 keeps the wave-aware automatic choice for the D=512 context split. 1..32 pins the
+    // grid.z segment count for NINFER_GEMMA4_ATTN_SEGMENTS sweeps (diagnostics).
+    int gemma4_attn_segments = 0;
 };
 
 struct RuntimeSwitchFlags {

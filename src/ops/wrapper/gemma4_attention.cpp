@@ -39,11 +39,11 @@ std::size_t gemma4_attention_workspace_capacity_bytes(std::int32_t head_dim, std
         if (count < detail::kGemma4AttentionMmaMinTokens) {
             parts = detail::gemma4_attention_chunks(count, kv_heads);
         } else if (head_dim == 512) {
-            // Unclamped bound covers every context length a graph bucket can reach.
+            // Unclamped bound covers every context length a graph bucket can reach. The
+            // wave-aware segment search is not monotonic in the width, so scan every
+            // count; the loop runs once per program at chunk-width scale.
             parts = detail::gemma4_attention_mma_d512_segments(count, q_heads, 0, 0);
         }
-        // Beyond the MMA threshold the grid only grows: once unsplit it stays unsplit.
-        if (count >= detail::kGemma4AttentionMmaMinTokens && parts == 1) { break; }
         const std::size_t rows =
             parts > 1 ? static_cast<std::size_t>(parts) * q_heads * count : 0;
         if (rows > 0) {
