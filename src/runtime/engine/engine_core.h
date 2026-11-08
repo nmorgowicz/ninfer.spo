@@ -1056,6 +1056,10 @@ private:
     // Program introspection can observe a partially cleared physical state.
     void fail_all_locked(std::exception_ptr error) noexcept;
 
+    // One stderr line with the failing step, the error, and every lane, before the state is cleared.
+    void report_engine_failure(const char* step, std::optional<std::uint32_t> lane,
+                               std::exception_ptr error) noexcept;
+
     void worker_loop() noexcept;
 
     Instance& instance_;

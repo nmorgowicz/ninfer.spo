@@ -1,6 +1,69 @@
 #pragma once
 
+#include <cstdio>
+
 namespace ninfer::runtime {
+
+inline const char* engine_request_state_name(EngineRequestState state) noexcept {
+    switch (state) {
+    case EngineRequestState::Waiting: return "waiting";
+    case EngineRequestState::Materializing: return "materializing";
+    case EngineRequestState::Prefill: return "prefill";
+    case EngineRequestState::Replay: return "replay";
+    case EngineRequestState::Pausing: return "pausing";
+    case EngineRequestState::Paused: return "paused";
+    case EngineRequestState::DecodeReady: return "decode";
+    case EngineRequestState::ControlReady: return "control";
+    case EngineRequestState::ModelFinished: return "finished";
+    }
+    return "unknown";
+}
+
+template <class Instance>
+void EngineCore<Instance>::report_engine_failure(const char* step,
+                                                 std::optional<std::uint32_t> lane,
+                                                 std::exception_ptr error) noexcept
+{
+    try {
+        std::string what = "non-standard exception";
+        try {
+            std::rethrow_exception(error);
+        } catch (const std::exception& caught) {
+            what = caught.what();
+        } catch (...) {
+        }
+        std::string out = std::string("engine failed during ") + step;
+        if (lane) { out += " on lane " + std::to_string(*lane); }
+        out += ": " + what;
+        for (std::uint32_t index = 0; index < max_concurrency_; ++index) {
+            const auto& request = slots_[index];
+            if (!request) { continue; }
+            out += " | lane " + std::to_string(index) + " req#" + std::to_string(request->id) +
+                   ' ' + engine_request_state_name(request->model_state);
+            if (request->admitted_begin) {
+                out += " prompt " + std::to_string(request->admitted_begin->prompt_tokens) +
+                       " reused " + std::to_string(request->admitted_begin->reused_prompt_tokens);
+            }
+            out += " computed " + std::to_string(request->computed_prompt_tokens);
+        }
+        if (materializing_ && materializing_->request) {
+            out += " | materializing req#" + std::to_string(materializing_->request->id);
+        }
+        if (admission_decision_ && admission_decision_->request) {
+            out += " | admitting req#" + std::to_string(admission_decision_->request->id) +
+                   (admission_decision_->restoring ? " (restore)" : "");
+        }
+        if (context_owner_) { out += " | context owner req#" + std::to_string(context_owner_->id); }
+        out += " | paused " + std::to_string(paused_.size());
+        {
+            std::lock_guard lock(queue_mutex_);
+            out += " | pending " + std::to_string(pending_.size());
+        }
+        std::fprintf(stderr, "%s\n", out.c_str());
+        std::fflush(stderr);
+    } catch (...) {
+    }
+}
 
 template <class Instance>
 void EngineCore<Instance>::fail_all_locked(std::exception_ptr error) noexcept
@@ -64,11 +127,16 @@ void EngineCore<Instance>::worker_loop() noexcept
         }
         std::unique_lock execution_lock(execution_mutex_);
         bool executed = false;
+        // The failure line names the step and lane that threw; a request error alone does not.
+        const char* step = "boundary";
+        std::optional<std::uint32_t> step_lane;
         try {
             set_host_work_class(HostWorkClass::Control);
             auto boundary = begin_host_phase();
             (void)expire_pending_requests();
+            step     = "context transaction";
             executed = progress_context_transaction(boundary);
+            step     = "boundary";
             if (!instance_.program->has_context_transaction()) {
                 for (const auto& request : slots_) {
                     if (request && request->capture_pending) {
@@ -101,9 +169,12 @@ void EngineCore<Instance>::worker_loop() noexcept
             if (!recovering &&
                 ((admission_decision_ && admission_decision_->restoring) ||
                  scheduler_.should_restore(!paused_.empty(), resident_empty()))) {
+                step = "restore admission";
                 (void)try_admit_one(true);
+                step = "context transaction";
                 executed |= progress_context_transaction(boundary);
             }
+            step = "unit reservation";
             reserve_resident_units();
             // A failed restore leaves spare resources available to fresh requests.
             // An in-flight restoration/reclaim keeps its own candidate until settled.
@@ -113,13 +184,16 @@ void EngineCore<Instance>::worker_loop() noexcept
                     scheduler_.begin_admission_scan();
                 }
                 if (admission_decision_ || scheduler_.admission_scan_pending()) {
+                    step = "admission";
                     (void)try_admit_one(false);
                 }
             }
             if (instance_.program->has_context_transaction()) {
+                step = "context transaction";
                 executed |= progress_context_transaction(boundary);
                 if (!instance_.program->has_context_transaction()) { reserve_resident_units(); }
             }
+            step = "boundary";
             const auto cancelled = snapshot_cancellations();
             auto controls = scheduler_.build_control_membership(slots_, max_concurrency_);
             ControlMembership selected_control;
@@ -139,6 +213,7 @@ void EngineCore<Instance>::worker_loop() noexcept
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             if (!controls.empty()) {
                 set_host_work_class(HostWorkClass::Control);
+                step = "control batch";
                 run_control_batch(controls);
                 executed = true;
             }
@@ -165,6 +240,7 @@ void EngineCore<Instance>::worker_loop() noexcept
             if (!decode.empty()) {
                 set_host_work_class(HostWorkClass::Decode, decode.lane_span());
                 const auto decode_started = Clock::now();
+                step                      = "decode round";
                 run_decode_round(decode, cancelled);
                 decode_ns = static_cast<std::int64_t>(elapsed_ns(decode_started, Clock::now()));
                 executed  = true;
@@ -172,6 +248,7 @@ void EngineCore<Instance>::worker_loop() noexcept
             if (instance_.program->has_context_transaction()) {
                 set_host_work_class(HostWorkClass::Control);
                 auto progress_boundary = begin_host_phase();
+                step                   = "context transaction";
                 executed |= progress_context_transaction(progress_boundary);
                 if (!instance_.program->has_context_transaction()) {
                     // Control/Decode permits were consumed. Only the still-unexecuted
@@ -195,6 +272,8 @@ void EngineCore<Instance>::worker_loop() noexcept
                 const auto request = slots_[*lane];
                 const auto unit_started = Clock::now();
                 set_host_work_class(HostWorkClass::Prefill);
+                step_lane = *lane;
+                step      = request->is_replaying() ? "replay" : "prefill";
                 if (request->is_replaying()) {
                     ProgramCallScope call(*this);
                     auto progress = instance_.program->advance_replay(*request->sequence,
@@ -227,6 +306,7 @@ void EngineCore<Instance>::worker_loop() noexcept
             publish_runtime_stats();
         } catch (...) {
             auto error = std::current_exception();
+            report_engine_failure(step, step_lane, error);
             fail_all_locked(error);
             return;
         }

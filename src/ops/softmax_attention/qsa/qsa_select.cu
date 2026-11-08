@@ -366,6 +366,21 @@ __global__ void expand_indices_batched_kernel(const int* selected_groups,
     }
 }
 
+// The dense route attends to every visible key without selecting, but MTP draft steps reuse the
+// selection of their verified column. Publish what selection yields when every group fits the
+// budget: each visible position in causal order, nothing for an invalid column.
+__global__ void dense_causal_indices_kernel(const int* cache_positions, const int* valid_columns,
+                                            int width, int* output) {
+    const int token = static_cast<int>(blockIdx.y);
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= kOutputWidth) { return; }
+    const int batch_lane = token / width;
+    const int column = token - batch_lane * width;
+    const int sequence_length = cache_positions[token] + 1;
+    output[index + static_cast<std::int64_t>(kOutputWidth) * token] =
+        column < valid_columns[batch_lane] && index < sequence_length ? index : -1;
+}
+
 // Match the collection order used by vLLM's short-row persistent top-k: its vectorized
 // histogram collector visits one element from each float4 before advancing to the next lane.
 // The selected set is unchanged; only the deterministic accumulation order is reproduced.

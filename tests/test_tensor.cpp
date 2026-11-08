@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -86,6 +87,16 @@ int main() {
         std::cerr << "viewed expected contiguous\n";
     }
     failures += expect_invalid([&] { (void)t.view({5, 5}); }, "mismatched view");
+    try {
+        (void)t.view({5, 5});
+    } catch (const std::invalid_argument& error) {
+        const std::string message = error.what();
+        if (message.find("[2,3,4,1] (24) to [5,5] (25)") == std::string::npos ||
+            message.find("test_tensor.cpp:") == std::string::npos) {
+            ++failures;
+            std::cerr << "view mismatch message lacks shapes or caller: " << message << '\n';
+        }
+    }
 
     ninfer::Tensor sliced = t.slice(1, 1, 2);
     if (sliced.data != base + 4) {

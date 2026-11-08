@@ -422,6 +422,39 @@ int run(int kPrefillTokens) {
             ++failures;
         }
     }
+
+    // More than 16 tokens over a short context take the dense route, which selects nothing. MTP
+    // draft steps still reuse its published indices, so they must name every visible position.
+    std::vector<int> dense_positions(kPrefillTokens);
+    for (int token = 0; token < kPrefillTokens; ++token) { dense_positions[token] = token; }
+    DeviceBuffer d_dense_positions = to_device_i32(dense_positions);
+    std::vector<int> dense_selected(2051 * kPrefillTokens, 12345);
+    DeviceBuffer d_dense_selected = to_device_i32(dense_selected);
+    Tensor dense_selected_tensor(d_dense_selected.p, DType::I32, {2051, kPrefillTokens});
+    prefill_workspace.reset();
+    ops::flash_next_qsa(
+        Tensor(d_prefill_input.p, DType::BF16, {kHidden, kPrefillTokens}),
+        Tensor(d_dense_positions.p, DType::I32, {kPrefillTokens, 1}),
+        Tensor(d_prefill_rope.p, DType::I32, {kPrefillTokens, 1, 3}),
+        Tensor(d_prefill_valid.p, DType::I32, {1}), Tensor(d_rows.p, DType::I32, {1}), weights,
+        cache,
+        {.min_visible_keys = 1, .max_visible_keys = static_cast<std::uint32_t>(kPrefillTokens)},
+        prefill_destination, prefill_workspace, nullptr, nullptr,
+        {.selected_indices = &dense_selected_tensor});
+    cuda_synchronize();
+    const auto published = from_device<int>(d_dense_selected, dense_selected.size());
+    for (int token = 0; token < kPrefillTokens; ++token) {
+        for (int index = 0; index < 2051; ++index) {
+            const int expected_index = token < active && index <= token ? index : -1;
+            if (published[static_cast<std::size_t>(2051) * token + index] != expected_index) {
+                std::cerr << "QSA dense route published index " << index << " of token " << token
+                          << " as " << published[static_cast<std::size_t>(2051) * token + index]
+                          << ", expected " << expected_index << '\n';
+                ++failures;
+                break;
+            }
+        }
+    }
     return failures;
 }
 

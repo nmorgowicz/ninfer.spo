@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <source_location>
 
 namespace ninfer {
 
@@ -21,9 +22,14 @@ struct Tensor {
     std::size_t bytes() const;
     bool is_contiguous() const;
 
-    Tensor view(std::initializer_list<std::int32_t> shape) const;
-    Tensor reshape(std::initializer_list<std::int32_t> shape) const;
-    Tensor slice(int dim, std::int32_t start, std::int32_t len) const;
+    // A failing view, reshape, or slice names its caller and both shapes: one bad shape fails
+    // the whole engine, and the message is all an operator gets back.
+    Tensor view(std::initializer_list<std::int32_t> shape,
+                std::source_location caller = std::source_location::current()) const;
+    Tensor reshape(std::initializer_list<std::int32_t> shape,
+                   std::source_location caller = std::source_location::current()) const;
+    Tensor slice(int dim, std::int32_t start, std::int32_t len,
+                 std::source_location caller = std::source_location::current()) const;
     Tensor permute(std::initializer_list<int> order) const;
 };
 

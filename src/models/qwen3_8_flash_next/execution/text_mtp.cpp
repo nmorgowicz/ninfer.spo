@@ -215,9 +215,14 @@ void TextContext::mtp_forward_flash_next(const Tensor& ids, const Tensor& hidden
 
     Tensor cache_positions = positions.view({width, batch});
     Tensor mrope_positions;
-    if (rope_positions.ne[2] == 3 || rope_positions.ne[1] == 3) {
+    // Text positions for three sequences are [width, 3], so the axis count must come from the
+    // element count, not from a dimension that happens to equal 3.
+    if (rope_positions.numel() == static_cast<std::int64_t>(tokens) * 3) {
         mrope_positions = rope_positions.view({width, batch, 3});
     } else {
+        if (rope_positions.numel() != tokens) {
+            throw std::logic_error("Flash-Next MTP has invalid RoPE geometry");
+        }
         mrope_positions = work_.alloc(DType::I32, {width, batch, 3});
         ops::flash_next_expand_text_positions(rope_positions.view({width, batch}), mrope_positions,
                                               stream);

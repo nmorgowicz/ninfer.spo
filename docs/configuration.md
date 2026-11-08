@@ -79,7 +79,7 @@ The engine does not read these. The scripts, tests, and probes that do are named
 | `--max-context` | 8192 | Per-request context ceiling. |
 | `--kv-capacity` | `--max-context` | KV pool in tokens, or `auto`. It must be at least `--max-context`. |
 | `--kv-headroom-mib` | | Device memory `auto` leaves free. Requires `--kv-capacity auto`. |
-| `--max-concurrency` | 1 | Resident lanes. The engine caps this at 8. |
+| `--max-concurrency` | 1 | Resident lanes. The engine caps this at 8. `scripts/serve.cmd` passes 3. |
 | `--max-pending-requests` | 16 | Queue length. |
 | `--pending-timeout-ms` | 30000 | How long a queued request waits. |
 | `--prefill-chunk` | 1024 | Prefill unit size, a multiple of 128. `scripts/serve.cmd` passes 8192. |
@@ -97,7 +97,7 @@ The engine does not read these. The scripts, tests, and probes that do are named
 | `--response-store-max-records` | 1024 | Stored responses. |
 | `--response-store-max-mib` | 256 | Stored response bytes. |
 | `--device` | 0 | CUDA device. |
-| `--kv-dtype` | bf16 | KV storage: `bf16`, `int8`, `fp8`, `nvfp4`, or `k8v4`. Flash-Next accepts `bf16`, `fp8`, and `int8`. Gemma 4 accepts `bf16`, experimental global-only `fp8`, and opt-in unqualified global-only `int8`; its sliding rings remain BF16. |
+| `--kv-dtype` | bf16 | KV storage: `bf16`, `int8`, `fp8`, `nvfp4`, or `k8v4`. Flash-Next accepts `bf16`, `fp8`, and `int8`; `scripts/serve.cmd` passes `int8`. Gemma 4 accepts `bf16`, experimental global-only `fp8`, and opt-in unqualified global-only `int8`; its sliding rings remain BF16. |
 | `--gemma4-qk` | bf16 | Gemma 4 global attention QK: `bf16` keeps Phase 1 cache expansion; experimental `fp8` uses FP8 tensor cores for D512 MMA widths ≥64 and requires `--kv-dtype fp8`. Small-width SIMT and sliding D256 remain unchanged. Also accepted by CLI and perplexity. |
 | `--spec` | | Speculative backend: `mtp`, `dflash`, or `dflash2`. Flash-Next accepts only `mtp`, which `scripts/serve.cmd` uses. |
 | `--draft-tokens` | | Draft length: `auto` or digits. Flash-Next MTP takes `auto` or 1..7. Gemma 4 MTP takes the same; its `auto` is a fixed 6 drafts per round. |

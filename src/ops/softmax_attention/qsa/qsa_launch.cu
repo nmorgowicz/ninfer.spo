@@ -393,6 +393,14 @@ void flash_next_qsa(const Tensor& input, const Tensor& cache_positions,
         dispatch_batched(dim3(tokens, kKvHeads), nullptr, 1, nullptr, nullptr, nullptr,
                          static_cast<__nv_bfloat16*>(attention.data));
         CUDA_CHECK(cudaGetLastError());
+        if (index_control.selected_indices != nullptr) {
+            dense_causal_indices_kernel<<<dim3((kOutputWidth + 255) / 256, tokens), 256, 0,
+                                          stream>>>(
+                static_cast<const int*>(cache_positions.data),
+                static_cast<const int*>(valid_columns.data), width,
+                static_cast<int*>(index_control.selected_indices->data));
+            CUDA_CHECK(cudaGetLastError());
+        }
     } else {
         // Decode keeps a fixed launch extent across graph profiles.  Prompt
         // work uses only the causally reachable group frontier.

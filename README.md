@@ -10,7 +10,9 @@ Every number below is from one RTX PRO 6000 Blackwell Max-Q (96 GB, 300 W cap, P
 
 ## Qwen3.8 Flash-Next, the Pi server
 
-`scripts/serve.cmd` starts the server from the release build beside this repo. It loads the artifact in `NINFER_MODEL`, listens on `NINFER_PORT` (8003 if unset), and serves 262,144 context, bf16 KV, MTP with `auto` drafts and the proposal head, vision, preserve-thinking, and 16 device state slots. Set `NINFER_MODEL` to `qwen3_8_flash_next_125b_a6b_nvfp4_fp8proj_nvfp4mtp.ninfer`. The Pi wiring is in `docs/pi.md`. The engine is ready in 45 to 60 s, with 70.5 GiB of weights on the GPU and the 47.7 GiB PLE table locked in host RAM. Quick perplexity is 3.554.
+`scripts/serve.cmd` starts the server from the release build beside this repo. It loads the artifact in `NINFER_MODEL`, listens on `NINFER_PORT` (8003 if unset), and serves 262,144 context, int8 KV, three concurrent requests, MTP with `auto` drafts and the proposal head, vision, preserve-thinking, and 16 device state slots. Set `NINFER_MODEL` to `qwen3_8_flash_next_125b_a6b_nvfp4_fp8proj_nvfp4mtp.ninfer`. The Pi wiring is in `docs/pi.md`. The engine is ready in 45 to 60 s, with 70.5 GiB of weights on the GPU and the 47.7 GiB PLE table locked in host RAM. Quick perplexity is 3.554.
+
+Point `NINFER_MODEL` at `qwen3_8_flash_next_125b_a6b_uncensored_nvfp4_fp8ple_fp8proj_nvfp4mtp.ninfer` instead to serve the same recipe with the refusal direction removed; no flag changes.
 
 ### Build the artifact
 
@@ -32,6 +34,37 @@ python -m tools.convert.qwen3_8_flash_next_125b_a6b.convert \
   --device cuda \
   --out qwen3_8_flash_next_125b_a6b_nvfp4_fp8proj_nvfp4mtp.ninfer
 ```
+
+#### The abliterated build
+
+The same converter builds the uncensored artifact from its unquantized BF16 parent,
+[orcarouter/Qwen3.8-Flash-Next-Uncensored](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored)
+(gated, 360 GB). That checkpoint carries no quantization and no `input_scale`, so two things move
+into the converter and nothing else changes. The fused routed-expert banks are quantized here with
+the round-to-nearest NVFP4 path `--mtp-expert-format nvfp4` already uses for the drafter (one FP32
+global scale per expert, E4M3FN group-of-16 scales, E2M1 codes, ties to even), and the activation
+divisors are the per-expert `input_scale` words of a calibrated NVFP4 checkpoint, named by
+`--input-scale-source`. The n-gram table is BF16 there, so `--ple-format fp8_e4m3fn` is required;
+its scale is amax/448 rounded up, one BF16 step above the published FP8 table's, so no element
+saturates. The result is the same 126,890,325,248 bytes and the same 1,635 objects, and the
+served model is the same except that the refusal direction is gone.
+
+```bash
+python -m tools.convert.qwen3_8_flash_next_125b_a6b.convert \
+  --model /path/to/Qwen3.8-Flash-Next-Uncensored \
+  --source-profile orcarouter \
+  --ple-format fp8_e4m3fn \
+  --projection-format fp8_e4m3fn_row_bf16 \
+  --mtp-expert-format nvfp4 \
+  --input-scale-source /path/to/Qwen3.8-Flash-Next-NVFP4 \
+  --device cuda \
+  --out qwen3_8_flash_next_125b_a6b_uncensored_nvfp4_fp8ple_fp8proj_nvfp4mtp.ninfer
+```
+
+Every tensor the abliteration leaves alone is bit-identical to the base checkpoint, and each of the
+149 residual-writing tensors differs by about 2 % RMS, which is the edit itself: `embed_tokens`,
+`ple.value_proj`, `self_attn.o_proj`, `linear_attn.out_proj`, `shared_expert.down_proj`, the fused
+routed `down_proj`, and the MTP copies of the first two.
 
 ### Speed
 

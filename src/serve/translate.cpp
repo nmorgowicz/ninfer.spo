@@ -157,7 +157,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         result.enable_thinking = enables;
         switch (*effort) {
         case RequestedReasoningEffort::None:
-            result.reasoning_effort = ninfer::ReasoningEffort::None;
+            // Disabled thinking carries no effort; templates reject an effort without thinking.
             break;
         case RequestedReasoningEffort::Minimal:
             result.reasoning_effort = ninfer::ReasoningEffort::Minimal;
@@ -184,6 +184,10 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         invalid_prompt_option("assistant prefill cannot be combined with enabled thinking",
                               "messages", "assistant_prefill_not_supported");
     }
+    // Disabled thinking has no reasoning channel to carry forward. Leaving
+    // preservation on makes the template open an empty think block, and the
+    // model narrates that there is nothing to continue.
+    if (result.enable_thinking == false) { result.preserve_thinking = false; }
     return result;
 }
 

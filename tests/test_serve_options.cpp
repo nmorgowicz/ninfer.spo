@@ -451,6 +451,17 @@ int main() {
     failures += check(explicit_effort.reasoning_effort == ninfer::ReasoningEffort::Low &&
                           explicit_effort.enable_thinking == true,
                       "explicit reasoning effort did not remain the effective effort");
+    request.reasoning_effort = RequestedReasoningEffort::None;
+    const auto none_effort   = resolve_prompt_semantics(request, defaults);
+    failures += check(none_effort.enable_thinking == false && !none_effort.reasoning_effort,
+                      "reasoning effort none did not resolve to disabled thinking without effort");
+    request.reasoning_effort.reset();
+    request.reasoning_effort = RequestedReasoningEffort::None;
+    request.enable_thinking.reset();
+    request.preserve_thinking.reset();
+    const auto thinking_off = resolve_prompt_semantics(request, configured);
+    failures += check(thinking_off.enable_thinking == false && thinking_off.preserve_thinking == false,
+                      "disabled thinking left preserve-thinking on");
     request.reasoning_effort.reset();
     failures += check(resolve_prompt_semantics(request, configured).preserve_thinking == true,
                       "server preserve-thinking default was not resolved");

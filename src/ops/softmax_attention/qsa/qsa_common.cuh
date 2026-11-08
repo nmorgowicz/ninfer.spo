@@ -154,6 +154,8 @@ __global__ void expand_indices_batched_kernel(const int* selected_groups,
                                               const int* cache_positions,
                                               const int* valid_columns, int width,
                                               int* output);
+__global__ void dense_causal_indices_kernel(const int* cache_positions, const int* valid_columns,
+                                            int width, int* output);
 __global__ void order_groups_like_persistent_topk_kernel(int* selected_groups,
                                                           const int* cache_positions,
                                                           int group_extent);

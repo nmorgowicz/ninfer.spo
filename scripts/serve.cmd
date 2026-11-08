@@ -33,6 +33,6 @@ rem Flash-Next has no host checkpoint tier, so every cached checkpoint needs a d
 rem The default (one extra slot per lane) keeps too few for agent sessions; 16 costs about 54k KV tokens.
 "%SERVE%" "%MODEL%" --host 127.0.0.1 --port %NINFER_PORT% --model-id Qwen/Qwen3.8-Flash-Next ^
   --device 0 --max-context 262144 --kv-capacity auto --kv-headroom-mib 4096 --kv-dtype bf16 ^
-  --max-concurrency 2 --spec mtp --draft-tokens auto %LM_HEAD_DRAFT% --vision --preserve-thinking ^
+  --kv-dtype int8 --max-concurrency 3 --spec mtp --draft-tokens auto %LM_HEAD_DRAFT% --vision --preserve-thinking ^
   --prefill-chunk 8192 --device-state-slots 16 --context-cost-presets "%PRESETS%" %*
 exit /b %ERRORLEVEL%
