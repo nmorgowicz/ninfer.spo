@@ -6,6 +6,7 @@
 #include "ops/op_tester.h"
 #include "ops/wrapper/gemma4_cache_validation.h"
 
+#include <cstdlib>
 #include <limits>
 
 using namespace ninfer;
@@ -583,10 +584,9 @@ __global__ void benchmark_cache_kernel(std::uint8_t* k, std::uint8_t* v,
     }
 }
 
-void attention_benchmark(int history) {
+void attention_benchmark(int history, int Chunk) {
     constexpr int QHeads = 32;
     constexpr int KvHeads = 4;
-    constexpr int Chunk = 128;
     constexpr int Warmups = 3;
     constexpr int Samples = 7;
     constexpr int Repetitions = 3;
@@ -661,12 +661,39 @@ void attention_benchmark(int history) {
     cuda_check(cudaEventDestroy(end), "cudaEventDestroy");
     cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");
 }
+
+// Comma-separated positive integers; empty or malformed lists are rejected.
+std::vector<int> parse_list(std::string_view text) {
+    std::vector<int> values;
+    while (!text.empty()) {
+        const std::size_t comma = text.find(',');
+        const std::string item(text.substr(0, comma));
+        char* end = nullptr;
+        const long value = std::strtol(item.c_str(), &end, 10);
+        if (item.empty() || *end != '\0' || value <= 0 || value > (1 << 22)) { return {}; }
+        values.push_back(static_cast<int>(value));
+        if (comma == std::string_view::npos) { break; }
+        text.remove_prefix(comma + 1);
+    }
+    return values;
+}
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc > 1) {
-        if (argc != 2 || std::string_view(argv[1]) != "--benchmark") {
-            std::cerr << "usage: test_gemma4_fp8_kv [--benchmark]\n";
+        std::vector<int> chunks{128};
+        std::vector<int> histories{32768, 131072};
+        bool valid = std::string_view(argv[1]) == "--benchmark" && argc % 2 == 0;
+        for (int i = 2; valid && i + 1 < argc; i += 2) {
+            const std::string_view key(argv[i]);
+            auto values = parse_list(argv[i + 1]);
+            if (values.empty()) { valid = false; }
+            else if (key == "--chunks") { chunks = std::move(values); }
+            else if (key == "--histories") { histories = std::move(values); }
+            else { valid = false; }
+        }
+        if (!valid) {
+            std::cerr << "usage: test_gemma4_fp8_kv [--benchmark [--chunks N,...] [--histories N,...]]\n";
             return 2;
         }
         if (cuda_unavailable()) { std::cout << "SKIP: no usable CUDA device\n"; return 77; }
@@ -677,7 +704,9 @@ int main(int argc, char** argv) {
         std::cout << "GEMMA4_QK_BENCHMARK gpu=" << properties.name
                   << " sm=" << properties.major << properties.minor
                   << " timing=cuda_events order=rotating_paired\n";
-        for (int history : {32768, 131072}) { attention_benchmark(history); }
+        for (int chunk : chunks) {
+            for (int history : histories) { attention_benchmark(history, chunk); }
+        }
         return 0; // Deliberately no performance assertions.
     }
     int failures = validation_test();
