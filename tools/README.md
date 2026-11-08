@@ -21,6 +21,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Build a Gemma 4 31B 4-bit `.ninfer` in one command (checks, calibration or GPTQ, convert, receipts, launcher) | [`convert/gemma4_build.py`](convert/gemma4_build.py), [`convert/gemma4_build_cli.py`](convert/gemma4_build_cli.py); [section below](#gemma-4-31b-one-command-build) |
 | Produce a GPTQ INT4 checkpoint of Gemma 4 31B for `gemma4_q4 convert --gptq-source` | [`gptq/`](gptq/README.md) (own pinned environment; about 17 minutes on an RTX 5090) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
+| Swap a chat template (or other resource) in an existing artifact, with backup and restore | [`artifact/set_resource.py`](artifact/set_resource.py); [guide](../docs/weight-conversion.md#change-the-chat-template-of-an-existing-artifact) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |

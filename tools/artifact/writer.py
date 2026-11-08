@@ -25,6 +25,9 @@ from .schema import (
 )
 
 DEFAULT_MAX_FILE_BYTES = 32_000_000_000
+# Spare directory space converters reserve so tools.artifact.set_resource can swap resources
+# (chat templates) in place for the artifact's lifetime. 64 KiB is negligible next to weights.
+RESOURCE_EDIT_SPARE_BYTES = 64 * 1024
 ZERO_CHUNK_BYTES = 1024 * 1024
 
 
@@ -34,14 +37,22 @@ def layout_directory(
     payload_bytes: int,
     *,
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+    directory_spare_bytes: int = 0,
 ) -> tuple[Directory, bytes, int]:
-    """Resolve JSON reserve and file segments before any payload is generated."""
+    """Resolve JSON reserve and file segments before any payload is generated.
+
+    ``directory_spare_bytes`` keeps at least that much trailing JSON whitespace free so the
+    directory can later be edited in place without moving the payload.
+    """
     integer(payload_bytes, "payload bytes", positive=True)
     integer(max_file_bytes, "maximum file bytes", positive=True)
+    spare = integer(directory_spare_bytes, "directory spare bytes")
+    if spare > max_file_bytes // 4:  # best effort: tiny (test) file limits keep no spare
+        spare = 0
     value = deepcopy(description)
     value["files"] = [{"path": None, "payload_bytes": payload_bytes}]
     reserve = (
-        align_up(HEADER.size + len(encode_directory(value)), PAYLOAD_ALIGNMENT)
+        align_up(HEADER.size + len(encode_directory(value)) + spare, PAYLOAD_ALIGNMENT)
         - HEADER.size
     )
     while True:
@@ -78,10 +89,12 @@ def layout_directory(
                 remaining -= count
         value["files"] = files
         encoded = encode_directory(value)
-        if len(encoded) <= reserve:
+        if len(encoded) + spare <= reserve:
             directory = parse_directory(value, entry_name=entry_name)
             return directory, encoded + b" " * (reserve - len(encoded)), entry_start
-        reserve = align_up(HEADER.size + len(encoded), PAYLOAD_ALIGNMENT) - HEADER.size
+        reserve = (
+            align_up(HEADER.size + len(encoded) + spare, PAYLOAD_ALIGNMENT) - HEADER.size
+        )
 
 
 class _Coverage:
@@ -120,6 +133,7 @@ class ArtifactWriter:
         metadata: dict | None = None,
         provenance: dict | None = None,
         max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+        directory_spare_bytes: int = 0,
     ) -> None:
         self.path = Path(path)
         self.objects = plan_objects(specs)
@@ -137,6 +151,7 @@ class ArtifactWriter:
             description,
             self.objects[-1].offset + self.objects[-1].bytes,
             max_file_bytes=max_file_bytes,
+            directory_spare_bytes=directory_spare_bytes,
         )
         self.artifact_id = uuid4().bytes
         self._coverage = {obj.id: _Coverage() for obj in self.objects}

@@ -12,7 +12,11 @@ import torch
 
 from tools.artifact.schema import ResourceSpec
 from tools.artifact.tensor_output import TensorOutput
-from tools.artifact.writer import ArtifactWriter, DEFAULT_MAX_FILE_BYTES
+from tools.artifact.writer import (
+    ArtifactWriter,
+    DEFAULT_MAX_FILE_BYTES,
+    RESOURCE_EDIT_SPARE_BYTES,
+)
 
 from .model import Model
 from .recipe import Recipe, WeightJob
@@ -96,6 +100,7 @@ def convert(
         metadata=metadata,
         provenance=provenance,
         max_file_bytes=max_file_bytes,
+        directory_spare_bytes=RESOURCE_EDIT_SPARE_BYTES,
     ) as writer:
         for object_id, data in model.resources.items():
             writer.write_object(object_id, data)

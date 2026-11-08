@@ -391,17 +391,54 @@ The official conversion examples select these maintained templates:
 |---|---|---|
 | Qwen3.6 Dense/MoE | [qwen3_6.jinja](../tools/chat_templates/qwen3_6.jinja) | thinking on; closed-turn reasoning omitted |
 | Qwen3.8 | [qwen3_8.jinja](../tools/chat_templates/qwen3_8.jinja) | thinking on; effort `xhigh`; closed-turn reasoning retained |
+| Gemma 4 | [gemma4_fixed.jinja](../tools/chat_templates/gemma4_fixed.jinja) | Google template plus HF PRs #142 (thought channel always pre-filled; correct turn reopening) and #154 (pre-tool content order); opt-in `drop_prior_thinking` kwarg |
 
 Use your own Jinja file to change the artifact's default template. A startup
 [`--chat-template FILE`](cli.md#text-input) overrides the stored template.
 
-To change the stored template of an existing artifact without reconverting, run
-`python -m tools.artifact.set_resource MODEL.ninfer --resource chat_template.jinja=FILE`.
-It edits the directory in place, appends the new bytes (weights do not move), verifies the
-read-back, records the change under `provenance.resource_overrides`, and writes a backup that
-`--restore BACKUP` undoes exactly. Use `--dry-run` to preview. Stop any engine using the artifact first.
 `generation_config.json` is preserved; sampling presets remain determined by the architecture
 and explicit application/request settings.
+
+### Change the chat template of an existing artifact
+
+Three ways to run a different template, from least to most permanent:
+
+| Need | Use |
+|---|---|
+| Try a template for one run or server | startup `--chat-template FILE` (CLI and `ninfer-spo-serve`; Qwen3.5/3.6/3.8 and Gemma 4) |
+| Make it the artifact's default without reconverting | `python -m tools.artifact.set_resource` (below) |
+| Bake it in while converting | `--resource chat_template.jinja=FILE` |
+
+```text
+python -m tools.artifact.set_resource MODEL.ninfer --resource chat_template.jinja=FILE --dry-run
+python -m tools.artifact.set_resource MODEL.ninfer --resource chat_template.jinja=FILE
+python -m tools.artifact.set_resource MODEL.ninfer --restore MODEL.ninfer.set_resource-<utc>.json
+```
+
+The tool works on Windows and Linux and on any raw resource role (`--resource ROLE=FILE`). Stop
+every engine or server using the artifact first. Behaviour:
+
+* **Weights never move.** The new bytes are appended to the last payload file; when the resource
+  already is the last object (any earlier swap) it is overwritten instead, so repeated swaps do
+  not grow the artifact. Old bytes stay as unreferenced space. Continuation files are untouched
+  unless the resource lives in the last one.
+* **Directory reserve.** The directory JSON is rewritten inside the space reserved for it at
+  conversion. Converters reserve 64 KiB of spare space; artifacts converted before that have
+  0–4 KiB. `--dry-run` prints the free reserve before and after. Each resource keeps one
+  fixed-size record under `provenance.resource_overrides` (original digest, latest digest,
+  source name, time, swap count), so the reserve does not shrink on later swaps.
+* **When it does not fit.** The tool stops before writing and names the shortfall. `--rewrite`
+  then copies the entry file once with a 64 KiB spare reserve - a file copy needing free disk for
+  one entry file, not a reconversion. Later swaps on that artifact are in place.
+* **Safety.** Inputs must be UTF-8 (JSON roles must parse) and 1 byte–16 MiB. A backup of the
+  directory head, file lengths and any overwritten bytes is written first, the payload is written
+  before the directory (a reader refuses a half-finished edit by its length check), and the
+  resource is read back afterwards. `--restore BACKUP` returns the files byte-for-byte, including
+  after `--rewrite`.
+* **Restrictions.** Qwen3.8 Flash-Next accepts only its official template digests and checks
+  `tokenizer_config.json.chat_template`, so the tool refuses template roles on it. When a
+  `tokenizer_config.json` also embeds a `chat_template`, the tool notes that the embedded copy is
+  now stale; NInfer renders `chat_template.jinja`, so this does not affect serving.
 
 The default maximum file size is 32,000,000,000 bytes, including framing. Smaller artifacts remain
 one file. Larger artifacts use an entry such as `models/my_qwen.ninfer` plus
