@@ -365,6 +365,7 @@ std::vector<double> fp8_attention_reference(
                 logits[key] = score;
                 maximum = std::max(maximum, score);
             }
+            if (!std::isfinite(maximum)) { continue; }
             double sum = 0.0;
             for (auto& logit : logits) { logit = std::exp(logit - maximum); sum += logit; }
             for (int key = 0; key <= positions[token]; ++key) {
@@ -380,9 +381,13 @@ std::vector<double> fp8_attention_reference(
     return expected;
 }
 
-int attention_test(int tokens, bool invalid_high_page = true, bool fp8_qk = false) {
-    // Sparse mapping exercises invalid pages, the page/row-half boundary and unused tail.
-    const std::vector<int> table{2, -1, 0, invalid_high_page ? Pages : 1};
+int attention_test(int tokens, bool invalid_high_page = true, bool fp8_qk = false,
+                   bool split_context = false, bool empty = false) {
+    // Extra unmapped logical pages request multiple segments even for an early query.
+    // Some segments and some per-row causal ranges are empty; no poisoned tail may leak.
+    std::vector<int> table{2, -1, 0, invalid_high_page ? Pages : 1};
+    if (split_context) { table.resize(16, -1); }
+    if (empty) { std::fill(table.begin(), table.end(), -1); }
     std::vector<int> positions(tokens);
     for (int i = 0; i < tokens; ++i) { positions[i] = 65 + i; }
     std::vector<float> query(D * 4 * tokens);
@@ -413,7 +418,8 @@ int attention_test(int tokens, bool invalid_high_page = true, bool fp8_qk = fals
     }
     auto dc = to_device(codes), ds = to_device(scales), de = to_device(expanded);
     GuardedDeviceBuffer out(query.size() * 2), reference(query.size() * 2);
-    Tensor qt(dq.p, DType::BF16, {D, 4, tokens}), pt(dp.p, DType::I32, {tokens}), tt(dt.p, DType::I32, {Pages});
+    Tensor qt(dq.p, DType::BF16, {D, 4, tokens}), pt(dp.p, DType::I32, {tokens}),
+        tt(dt.p, DType::I32, {static_cast<std::int32_t>(table.size())});
     Tensor ct(dc.p, DType::U8, {D, 64, Heads, Pages}), st(ds.p, DType::FP16, {2, 64, Heads, Pages});
     Tensor et(de.p, DType::BF16, {D, 64, Heads, Pages});
     Tensor ot(out.data(), DType::BF16, {D, 4, tokens}), rt(reference.data(), DType::BF16, {D, 4, tokens});
@@ -454,6 +460,17 @@ int attention_test(int tokens, bool invalid_high_page = true, bool fp8_qk = fals
     cuda_synchronize(stream);
     failures += verify_exact("FP8 eager versus graph replay",
                               from_device<std::uint16_t>(out.data(), query.size()), eager);
+    if (split_context) {
+        // Same captured grid/workspace, new device positions: every segment is now empty.
+        const std::vector<int> negative_positions(tokens, -1);
+        cuda_check(cudaMemcpy(dp.p, negative_positions.data(), tokens * sizeof(int),
+                              cudaMemcpyHostToDevice), "update captured positions");
+        cuda_check(cudaGraphLaunch(executable, stream), "cudaGraphLaunch empty partitions");
+        cuda_synchronize(stream);
+        failures += verify_exact("captured split context reads current positions",
+            from_device<std::uint16_t>(out.data(), query.size()),
+            std::vector<std::uint16_t>(query.size(), 0));
+    }
     cuda_check(cudaGraphExecDestroy(executable), "cudaGraphExecDestroy");
     cuda_check(cudaGraphDestroy(graph), "cudaGraphDestroy");
     cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");
@@ -674,6 +691,12 @@ int main(int argc, char** argv) {
         failures += attention_test(tokens, true, true);
     }
     failures += attention_test(129, false, true);
+    for (bool fp8_qk : {false, true}) {
+        for (int tokens : {64, 65, 128, 129}) {
+            failures += attention_test(tokens, false, fp8_qk, true);
+        }
+        failures += attention_test(65, true, fp8_qk, true, true);
+    }
     std::cout << (failures ? "FAIL" : "OK") << " gemma4_fp8_kv\n";
     return failures ? 1 : 0;
 }

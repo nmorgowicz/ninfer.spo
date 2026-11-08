@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Gemma 4 D512 tensor-core attention splits long contexts when the query/head grid underfills the GPU, with FP32 partial outputs and max/sum merging, including empty partitions. Workspace sizing covers future context lengths before graph capture. `NINFER_GEMMA4_ATTN_SPLIT_K=0` (or `off`) disables splitting for A/B measurement. FP8/INT8 KV staging asynchronously copies raw codes into the existing shared tile and expands with vector stores; represented values and QK precision are unchanged. Split reductions can round differently; BF16 QK remains the default and FP8 QK remains explicit opt-in.
 - An engine failure prints the step that threw and every live lane before the state is cleared. A tensor view, reshape, or slice that fails names its caller and both shapes.
 - Chat Completions accepts a per-request thinking cap as `thinking_token_budget` or `thinking_budget`. Disabled thinking no longer keeps an empty think block, which made the next turn narrate that there was nothing to continue.
 - Draft scoring ranks a NaN logit as the lowest value, so a NaN cannot become a candidate id. Dense QSA publishes the causal positions an MTP draft reuses. MTP reads RoPE geometry from the element count.

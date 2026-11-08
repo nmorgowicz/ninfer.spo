@@ -242,8 +242,11 @@ struct CacheFixture {
 // Attention over arbitrary-but-valid codes: the INT8 paths must consume exactly the BF16
 // values `expanded`, so the BF16 reference over `expanded` is bit-identical. The unwritten
 // tail of the last page carries NaN scales and nonzero codes that must never be read.
-int attention_test(int tokens, bool invalid_high_page = true) {
-    const std::vector<int> table{2, -1, 0, invalid_high_page ? Pages : 1};
+int attention_test(int tokens, bool invalid_high_page = true, bool split_context = false,
+                   bool empty = false) {
+    std::vector<int> table{2, -1, 0, invalid_high_page ? Pages : 1};
+    if (split_context) { table.resize(16, -1); }
+    if (empty) { std::fill(table.begin(), table.end(), -1); }
     std::vector<int> positions(tokens);
     for (int i = 0; i < tokens; ++i) { positions[i] = 65 + i; }
     std::vector<float> query(D * 4 * tokens);
@@ -270,7 +273,8 @@ int attention_test(int tokens, bool invalid_high_page = true) {
     }
     auto dc = to_device(cache_data.codes), ds = to_device(cache_data.scales), de = to_device(cache_data.expanded);
     GuardedDeviceBuffer out(query.size() * 2), reference(query.size() * 2);
-    Tensor qt(dq.p, DType::BF16, {D, 4, tokens}), pt(dp.p, DType::I32, {tokens}), tt(dt.p, DType::I32, {Pages});
+    Tensor qt(dq.p, DType::BF16, {D, 4, tokens}), pt(dp.p, DType::I32, {tokens}),
+        tt(dt.p, DType::I32, {static_cast<std::int32_t>(table.size())});
     Tensor ct(dc.p, DType::I8, {D, 64, Heads, Pages}), st(ds.p, DType::FP16, {G, 64, Heads, Pages});
     Tensor et(de.p, DType::BF16, {D, 64, Heads, Pages});
     Tensor ot(out.data(), DType::BF16, {D, 4, tokens}), rt(reference.data(), DType::BF16, {D, 4, tokens});
@@ -428,6 +432,8 @@ int main() {
     for (int tokens : {1, 2, 63, 64, 65, 127, 128, 129}) { failures += attention_test(tokens); }
     failures += attention_test(129, false);
     for (int tokens : {1, 63, 64, 129}) { failures += attention_vs_original_bf16_test(tokens); }
+    for (int tokens : {64, 65, 128, 129}) { failures += attention_test(tokens, false, true); }
+    failures += attention_test(65, true, true, true);
     std::cout << (failures ? "FAIL" : "OK") << " gemma4_int8_kv\n";
     return failures ? 1 : 0;
 }

@@ -48,6 +48,9 @@ struct RuntimeSwitches {
     bool expert_adapt = true;
     // Empty disables the route dump. A path appends one line per MoE call.
     std::string routing_dump;
+    // Context split-K for the D=512 attention tensor-core kernel; "0"/"off" restores the
+    // single-kernel walk for A/B measurement.
+    bool gemma4_attn_split_k = true;
 };
 
 struct RuntimeSwitchFlags {
@@ -62,6 +65,7 @@ struct RuntimeSwitchFlags {
     std::optional<bool> prefill_graphs_off;
     std::optional<int> expert_vram_gib;
     std::optional<std::string> expert_profile;
+    std::optional<bool> gemma4_attn_split_k;
 };
 
 [[nodiscard]] const RuntimeSwitches& runtime_switches();

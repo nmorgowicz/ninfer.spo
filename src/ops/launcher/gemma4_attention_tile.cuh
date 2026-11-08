@@ -6,9 +6,8 @@
 #include "ops/kernel/gemma4_int8_kv.cuh"
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
 
-#include <cuda_bf16.h>
+#include <type_traits>
 
-#include <cstdint>
 
 namespace ninfer::ops::detail {
 
@@ -36,56 +35,93 @@ __device__ __forceinline__ void gemma4_stage_keys(__nv_bfloat16* dst, const __nv
     }
 }
 
-// Direct vector code loads, expanded synchronously to the same BF16 shared tile.
-// Callers retain their existing block barriers before any cross-thread consumption.
+// Raw quantized codes share the destination BF16 tile's storage. cp.async fills its
+// compact first half while the other attention product computes; every thread then
+// reads its codes into registers before a block barrier permits in-place expansion.
 template <int Width, int Bc, int Threads>
-__device__ __forceinline__ void gemma4_stage_fp8_keys(
-    __nv_bfloat16* dst, const std::uint8_t* codes, const __half* scales,
-    int kv_heads, int kv_head, int physical, int k0, int last, int column, int tid) {
-    constexpr int VecPerRow = Width / 8;
+struct Gemma4QuantStage {
+    static constexpr int Chunks = Bc * (Width / 8) / Threads;
+    static_assert(Chunks * Threads == Bc * (Width / 8), "tile chunks must divide over threads");
+    static_assert(Chunks >= 1, "each thread must own at least one chunk");
+
+    uint2 codes[Chunks];
+    __half scale[Chunks];
+    bool valid[Chunks];
+};
+
+// One compact [Bc, Width] byte tile. Width is the full D512 quantized row.
+template <int Width, int Bc, int Threads, typename Code>
+__device__ __forceinline__ void gemma4_stage_quant_codes(
+    __nv_bfloat16* dst, const Code* pages, int kv_heads, int kv_head, int physical,
+    int k0, int last, int tid) {
+    static_assert(Width == 512);
+    auto* raw = reinterpret_cast<std::uint8_t*>(dst);
 #pragma unroll
-    for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
-        const int key = chunk / VecPerRow;
-        const int d = column + (chunk % VecPerRow) * 8;
-        __nv_bfloat16* p = dst + key * Width + causal_swizzle(key, d - column);
+    for (int chunk = tid; chunk < Bc * (Width / 16); chunk += Threads) {
+        const int key = chunk / (Width / 16);
+        const int d = (chunk % (Width / 16)) * 16;
         if (physical >= 0 && k0 + key <= last) {
             const auto row = gemma4_kv_row(physical, kv_heads, kv_head,
                                            (k0 & kPagedKVPageMask) + key);
-            const uint2 packed = *reinterpret_cast<const uint2*>(codes + row * 512 + d);
-            const auto* bytes = reinterpret_cast<const std::uint8_t*>(&packed);
-            const __half scale = scales[row * 2 + d / kGemma4KvFp8Group];
+            cp_async<16, Cache::cg>(raw + key * Width + d, pages + row * Width + d);
+        } else {
+            store_vec(raw + key * Width + d, make_int4(0, 0, 0, 0));
+        }
+    }
+}
+
+// Call after cp_wait and a block barrier; all threads must finish reading before
+// any thread overwrites the compact codes with the expanded BF16 tile.
+template <int Width, int Bc, int Threads, int GroupElems, int ScaleStride>
+__device__ __forceinline__ void gemma4_load_quant_stage(
+    Gemma4QuantStage<Width, Bc, Threads>& stage, const __nv_bfloat16* src,
+    const __half* scales, int kv_heads, int kv_head, int physical, int k0, int last, int tid) {
+    const auto* raw = reinterpret_cast<const std::uint8_t*>(src);
 #pragma unroll
-            for (int i = 0; i < 8; ++i) { p[i] = gemma4_fp8_expand(bytes[i], scale); }
+    for (int i = 0; i < Gemma4QuantStage<Width, Bc, Threads>::Chunks; ++i) {
+        const int chunk = tid + i * Threads;
+        const int key = chunk / (Width / 8);
+        const int d = (chunk % (Width / 8)) * 8;
+        stage.valid[i] = physical >= 0 && k0 + key <= last;
+        if (stage.valid[i]) {
+            const auto row = gemma4_kv_row(physical, kv_heads, kv_head,
+                                           (k0 & kPagedKVPageMask) + key);
+            stage.codes[i] = *reinterpret_cast<const uint2*>(raw + key * Width + d);
+            stage.scale[i] = scales[row * ScaleStride + d / GroupElems];
+        }
+    }
+}
+
+// Expand a prefetched tile into shared memory. Callers keep their existing block barriers:
+// the previous tile's reads of dst must have passed a barrier, and a barrier is needed after
+// this before any cross-thread consumption of dst.
+template <int Width, int Bc, int Threads, typename Code>
+__device__ __forceinline__ void gemma4_expand_quant_stage(
+    const Gemma4QuantStage<Width, Bc, Threads>& stage, __nv_bfloat16* dst, int column, int tid) {
+#pragma unroll
+    for (int i = 0; i < Gemma4QuantStage<Width, Bc, Threads>::Chunks; ++i) {
+        const int chunk = tid + i * Threads;
+        const int key   = chunk / (Width / 8);
+        const int d     = column + (chunk % (Width / 8)) * 8;
+        __nv_bfloat16* p = dst + key * Width + causal_swizzle(key, d - column);
+        if (stage.valid[i]) {
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(&stage.codes[i]);
+            alignas(16) __nv_bfloat16 values[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                if constexpr (std::is_same_v<Code, std::int8_t>) {
+                    values[j] = gemma4_int8_expand(
+                        reinterpret_cast<const std::int8_t*>(bytes)[j], stage.scale[i]);
+                } else {
+                    values[j] = gemma4_fp8_expand(bytes[j], stage.scale[i]);
+                }
+            }
+            store_vec(p, *reinterpret_cast<const int4*>(values));
         } else {
             store_vec(p, make_int4(0, 0, 0, 0));
         }
     }
 }
 
-// INT8-G64 twin of gemma4_stage_fp8_keys: eight codes never straddle a 64-element group, so
-// each vector uses one scale. Same zeroing and barrier contract.
-template <int Width, int Bc, int Threads>
-__device__ __forceinline__ void gemma4_stage_int8_keys(
-    __nv_bfloat16* dst, const std::int8_t* codes, const __half* scales,
-    int kv_heads, int kv_head, int physical, int k0, int last, int column, int tid) {
-    constexpr int VecPerRow = Width / 8;
-#pragma unroll
-    for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
-        const int key = chunk / VecPerRow;
-        const int d = column + (chunk % VecPerRow) * 8;
-        __nv_bfloat16* p = dst + key * Width + causal_swizzle(key, d - column);
-        if (physical >= 0 && k0 + key <= last) {
-            const auto row = gemma4_kv_row(physical, kv_heads, kv_head,
-                                           (k0 & kPagedKVPageMask) + key);
-            const uint2 packed = *reinterpret_cast<const uint2*>(codes + row * 512 + d);
-            const auto* bytes = reinterpret_cast<const std::int8_t*>(&packed);
-            const __half scale = scales[row * kGemma4Int8Groups + d / kGemma4KvInt8Group];
-#pragma unroll
-            for (int i = 0; i < 8; ++i) { p[i] = gemma4_int8_expand(bytes[i], scale); }
-        } else {
-            store_vec(p, make_int4(0, 0, 0, 0));
-        }
-    }
-}
 
 } // namespace ninfer::ops::detail

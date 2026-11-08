@@ -74,7 +74,7 @@ void log_if_set(const RuntimeSwitches& switches) {
                        !switches.wake_margin_us && switches.round_stats == 0 &&
                        switches.expert_vram_gib == 0 && switches.expert_profile.empty() &&
                        switches.expert_cpu_threads == 0 && switches.expert_adapt &&
-                       switches.routing_dump.empty();
+                       switches.gemma4_attn_split_k && switches.routing_dump.empty();
     if (quiet) { return; }
     std::fprintf(stderr, "ninfer switches:");
     if (switches.cuda_sync) { std::fprintf(stderr, " cuda_sync=%s", switches.cuda_sync->c_str()); }
@@ -125,6 +125,7 @@ void log_if_set(const RuntimeSwitches& switches) {
     if (!switches.routing_dump.empty()) {
         std::fprintf(stderr, " routing_dump=%s", switches.routing_dump.c_str());
     }
+    if (!switches.gemma4_attn_split_k) { std::fprintf(stderr, " gemma4_attn_split_k=off"); }
     std::fprintf(stderr, "\n");
 }
 
@@ -172,6 +173,8 @@ RuntimeSwitches& mutable_switches() {
             out.expert_cpu_threads = workers < 1 ? 8 : (workers > 32 ? 32 : workers);
         }
         if (env_string("NINFER_EXPERT_ADAPT") == "0") { out.expert_adapt = false; }
+        const std::string attn_split = env_string("NINFER_GEMMA4_ATTN_SPLIT_K");
+        out.gemma4_attn_split_k      = !(attn_split == "0" || attn_split == "off");
         out.routing_dump = env_string("NINFER_ROUTING_DUMP");
         return out;
     }();
@@ -208,6 +211,7 @@ void apply_runtime_switch_flags(const RuntimeSwitchFlags& flags) {
     if (flags.prefill_graphs_off) { out.prefill_graphs_forced_off = *flags.prefill_graphs_off; }
     if (flags.expert_vram_gib) { out.expert_vram_gib = *flags.expert_vram_gib; }
     if (flags.expert_profile) { out.expert_profile = *flags.expert_profile; }
+    if (flags.gemma4_attn_split_k) { out.gemma4_attn_split_k = *flags.gemma4_attn_split_k; }
 }
 
 } // namespace ninfer

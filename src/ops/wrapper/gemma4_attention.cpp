@@ -33,13 +33,23 @@ std::size_t aligned(std::size_t bytes) {
 std::size_t gemma4_attention_workspace_capacity_bytes(std::int32_t head_dim, std::int32_t q_heads,
                                                       std::int32_t kv_heads, std::int32_t tokens) {
     std::size_t widest = 0;
-    if (head_dim <= 0 || q_heads <= 0 || kv_heads <= 0) { return widest; }
+    if (head_dim <= 0 || q_heads <= 0 || kv_heads <= 0 || tokens <= 0) { return widest; }
     for (std::int32_t count = 1; count <= tokens; ++count) {
-        const int chunks = detail::gemma4_attention_chunks(count, kv_heads);
-        if (chunks == 1) { break; }
-        const auto rows = static_cast<std::size_t>(chunks) * q_heads * count;
-        widest          = std::max(widest, aligned(rows * head_dim * sizeof(float)) +
-                                               aligned(rows * 2 * sizeof(float)));
+        int parts = 1;
+        if (count < detail::kGemma4AttentionMmaMinTokens) {
+            parts = detail::gemma4_attention_chunks(count, kv_heads);
+        } else if (head_dim == 512) {
+            // Unclamped bound covers every context length a graph bucket can reach.
+            parts = detail::gemma4_attention_mma_d512_segments(count, q_heads, 0, 0);
+        }
+        // Beyond the MMA threshold the grid only grows: once unsplit it stays unsplit.
+        if (count >= detail::kGemma4AttentionMmaMinTokens && parts == 1) { break; }
+        const std::size_t rows =
+            parts > 1 ? static_cast<std::size_t>(parts) * q_heads * count : 0;
+        if (rows > 0) {
+            widest = std::max(widest, aligned(rows * head_dim * sizeof(float)) +
+                                          aligned(rows * 2 * sizeof(float)));
+        }
     }
     return widest;
 }
@@ -89,12 +99,25 @@ void gemma4_attention(const Tensor& q, const Gemma4CacheView& cache,
     auto scope       = workspace.scope();
     float* partial   = nullptr;
     float* stats     = nullptr;
-    const int chunks = detail::gemma4_attention_chunks(tokens, kv_heads);
-    if (chunks > 1) {
-        partial = static_cast<float*>(
-            workspace.alloc(DType::FP32, {head_dim, chunks, q_heads, tokens}).data);
-        stats =
-            static_cast<float*>(workspace.alloc(DType::FP32, {2, chunks, q_heads, tokens}).data);
+    if (head_dim == 512 && tokens >= detail::kGemma4AttentionMmaMinTokens) {
+        // The D=512 tensor-core kernel splits the context; the stride must match the
+        // segments the launcher computes for this exact context.
+        const int segments = detail::gemma4_attention_mma_d512_segments(
+            tokens, q_heads, block_table.ne[0], window);
+        if (segments > 1) {
+            partial = static_cast<float*>(
+                workspace.alloc(DType::FP32, {head_dim, segments, q_heads, tokens}).data);
+            stats = static_cast<float*>(
+                workspace.alloc(DType::FP32, {2, segments, q_heads, tokens}).data);
+        }
+    } else if (tokens < detail::kGemma4AttentionMmaMinTokens) {
+        const int chunks = detail::gemma4_attention_chunks(tokens, kv_heads);
+        if (chunks > 1) {
+            partial = static_cast<float*>(
+                workspace.alloc(DType::FP32, {head_dim, chunks, q_heads, tokens}).data);
+            stats =
+                static_cast<float*>(workspace.alloc(DType::FP32, {2, chunks, q_heads, tokens}).data);
+        }
     }
     detail::gemma4_attention_launch(q, cache, positions, window, scale, out,
                                     partial, stats, stream);

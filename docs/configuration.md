@@ -17,6 +17,7 @@ Serve flags win over the environment for the switches in `src/core/runtime_optio
 | `NINFER_FLASH_NEXT_PREFILL_GRAPH_CACHE` | How many prefill graphs to keep, at least 1. Default 64. |
 | `NINFER_FLASH_NEXT_PREFILL_GRAPHS` | `0` turns prefill graphs off. |
 | `NINFER_Q4_EXACT` | Present means `q4_g32_fp16` trunk projections never round their codes to E4M3: 128 tokens and more take the exact W4A8 GEMM (one FP32 scale per group), shorter prefills the A16 routes. Lower KL, slower prefill. |
+| `NINFER_GEMMA4_ATTN_SPLIT_K` | D512 tensor-core attention context splitting (query widths >=64). Enabled by default; `0` or `off` disables it for A/B measurements. Underfilled query/head grids split the visible context across CTAs and merge FP32 partials/maxima/sums. Short contexts keep one segment. This does not enable FP8 QK or change the KV format. |
 | `NINFER_EXPERT_VRAM_GIB` | Flash-Next only. GiB of VRAM for the hottest routed experts. Decode computes a miss on the CPU. Prefill copies the misses a layer needs into a VRAM scratch, then runs the GPU kernels. `0` or unset keeps every expert in VRAM. The cold copy is pinned and counts toward `NINFER_PIN_CEILING_GIB`. |
 | `NINFER_EXPERT_PROFILE` | Path of a JSON file whose integers are `[layer, expert]` pairs, hottest first. Used only with `NINFER_EXPERT_VRAM_GIB`. Missing or empty falls back to expert-id order. |
 | `NINFER_EXPERT_CPU_THREADS` | Workers for the CPU experts. Default 8. |
@@ -143,6 +144,18 @@ the hi/lo BF16 probability products. Short decode/MTP widths below 64 keep
 the existing SIMT arithmetic; sliding D256 is unchanged. No artifact
 reconversion is needed. FP8 QK is rejected for non-Gemma models or non-FP8 KV.
 BF16 KV and BF16 QK remain defaults. NVFP4/K8V4 remain unsupported for Gemma.
+
+Global D512 tensor-core attention can split a long context across CTAs when
+the query/head grid alone cannot fill the GPU. The combine keeps partial
+outputs, maxima and sums in FP32; empty/masked partitions contribute zero.
+The workspace capacity covers every context length for each query-width
+bucket before graph capture, and replay reads the current positions and
+page mappings. This changes floating-point reduction order, not QK precision;
+bit-identical outputs or identical greedy tokens are not guaranteed.
+`NINFER_GEMMA4_ATTN_SPLIT_K=0` restores the unsplit context walk for paired
+measurements. FP8/INT8 staging uses asynchronous raw-code copies followed
+by the same FP32-product/BF16 expansion and vectorized shared-memory stores.
+BF16 QK remains the default; FP8 QK remains a separate explicit quality tradeoff.
 
 The finite-row domain is supported. Any NaN or infinity in a final normalized
 BF16 K/V row-half poisons that complete 256-element half with NaN codes and

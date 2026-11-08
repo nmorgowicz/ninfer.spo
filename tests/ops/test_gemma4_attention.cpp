@@ -1,3 +1,4 @@
+#include "core/runtime_options.h"
 #include "ninfer/ops/gemma4_attention.h"
 #include "ops/op_tester.h"
 
@@ -26,7 +27,7 @@ std::size_t kv_index(int head_dim, int kv_heads, int pages, int head, int positi
 
 // Queries sit at the last `tokens` of `kv_len` cached positions.
 int run_case(const char* label, int head_dim, int q_heads, int kv_heads, int tokens, int kv_len,
-             int window) {
+             int window, float scale = 1.0f) {
     const int pages            = (kv_len + kPage - 1) / kPage;
     const int first_query      = kv_len - tokens;
     const std::size_t q_count  = static_cast<std::size_t>(head_dim) * q_heads * tokens;
@@ -61,7 +62,7 @@ int run_case(const char* label, int head_dim, int q_heads, int kv_heads, int tok
                        q[(static_cast<std::size_t>(token) * q_heads + qh) * head_dim + dim]) *
                    k_logical[(static_cast<std::size_t>(key) * kv_heads + kvh) * head_dim + dim];
         }
-        return dot;
+        return dot * scale;
     };
     for (int token = 0; token < tokens; ++token) {
         const int position = first_query + token;
@@ -122,20 +123,35 @@ int run_case(const char* label, int head_dim, int q_heads, int kv_heads, int tok
     WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
     const ops::Gemma4CacheView cache{ops::Gemma4KvFormat::BFloat16, &k_tensor, &v_tensor,
                                     nullptr, nullptr, &table_tensor};
-    ops::gemma4_attention(q_tensor, cache, pos_tensor, window, 1.0f,
+    ops::gemma4_attention(q_tensor, cache, pos_tensor, window, scale,
                           out_tensor, workspace, nullptr);
     cuda_synchronize();
     std::vector<std::uint16_t> first_bits(q_count), second_bits(q_count);
     dout.copy_to_host(first_bits.data(), dout.bytes());
     int failures =
         verify_pointwise(label, from_device_bf16(dout.data(), q_count), expected, kCriterion);
-    ops::gemma4_attention(q_tensor, cache, pos_tensor, window, 1.0f,
+    ops::gemma4_attention(q_tensor, cache, pos_tensor, window, scale,
                           out_tensor, workspace, nullptr);
     cuda_synchronize();
     dout.copy_to_host(second_bits.data(), dout.bytes());
     if (second_bits != first_bits) {
         std::cerr << label << ": a second run changed the output\n";
         ++failures;
+    }
+    if (head_dim == 512 && tokens >= 64 && runtime_switches().gemma4_attn_split_k) {
+        RuntimeSwitchFlags flags;
+        flags.gemma4_attn_split_k = false;
+        apply_runtime_switch_flags(flags);
+        ops::gemma4_attention(q_tensor, cache, pos_tensor, window, scale,
+                              out_tensor, workspace, nullptr);
+        cuda_synchronize();
+        const auto unsplit = from_device_bf16(dout.data(), q_count);
+        flags.gemma4_attn_split_k = true;
+        apply_runtime_switch_flags(flags);
+        std::vector<double> split(q_count);
+        for (std::size_t i = 0; i < q_count; ++i) { split[i] = bf16_to_f32(first_bits[i]); }
+        failures += verify_pointwise("split-K off versus CPU oracle", unsplit, expected, kCriterion);
+        failures += verify_pointwise("split-K off versus on", unsplit, split, kCriterion);
     }
     failures += dq.verify_guards("q");
     failures += dout.verify_guards("out");
@@ -168,6 +184,8 @@ int main() {
     failures += run_case("sliding chunk narrow window", 256, 32, 16, 129, 400, 70);
     failures += run_case("global one tile", 512, 32, 4, 64, 64, 0);
     failures += run_case("global chunk after prefix", 512, 32, 4, 193, 700, 0);
+    failures += run_case("global split context scaled", 512, 4, 2, 65, 769, 0, 0.125f);
+    failures += run_case("global split context sharp", 512, 4, 2, 64, 1025, 0);
     std::cout << (failures ? "FAIL" : "OK") << " gemma4_attention\n";
     return failures ? 1 : 0;
 }

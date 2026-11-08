@@ -25,7 +25,7 @@ constexpr int kMaxChunks    = 128;
 constexpr int kMinKeysPerWarp = 4;
 constexpr int kCombineThreads = 128;
 // From one full 64-row query tile on, prefill goes through the tensor-core kernel.
-constexpr int kMmaMinTokens = 64;
+constexpr int kMmaMinTokens = kGemma4AttentionMmaMinTokens;
 
 template <int E>
 __device__ __forceinline__ void load_row(const __nv_bfloat16* row, float (&out)[E]) {
@@ -300,7 +300,8 @@ void gemma4_attention_launch(const Tensor& q, const Gemma4CacheView& cache,
         throw std::invalid_argument("gemma4_attention: at most 32 query heads per KV head");
     }
     if (q.ne[2] >= kMmaMinTokens) {
-        gemma4_attention_mma_launch(q, cache, positions, window, scale, out, stream);
+        gemma4_attention_mma_launch(q, cache, positions, window, scale, out, partial, stats,
+                                    stream);
         return;
     }
     if (q.ne[0] == 256) {

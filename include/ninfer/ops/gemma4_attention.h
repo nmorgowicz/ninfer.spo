@@ -13,6 +13,8 @@ namespace ninfer::ops {
 
 // Workspace gemma4_attention takes from the arena for any call with at most T query tokens.
 // Nonzero only when the grid is too small to fill the device and keys are split across blocks.
+// D512 tensor-core splits reserve the context-independent bound before graph capture.
+// The active device and runtime switches must be selected before sizing/capture.
 [[nodiscard]] std::size_t gemma4_attention_workspace_capacity_bytes(std::int32_t head_dim,
                                                                     std::int32_t q_heads,
                                                                     std::int32_t kv_heads,
@@ -36,8 +38,10 @@ namespace ninfer::ops {
  * accepted only for D512/global: the same expansion applies with one FP16 scale per 64
  * elements ([8,64,Hkv,pages] scale planes); FP8 QK never combines with INT8.
  * block_table maps absolute position p to physical page block_table[p/64], slot p%64.
- * The Op writes all of out. Small grids split each query's visible keys into chunks
- * whose partial results are merged in a fixed order.
+ * The Op writes all of out. Small SIMT grids and underfilled D512 tensor-core grids
+ * split visible keys; FP32 partial outputs and maxima/sums merge in a fixed order.
+ * Splitting changes FP32 reduction order, not QK precision, and is not bit-exact to
+ * the unsplit walk. FP8 QK still requires its explicit cache descriptor selection.
  */
 void gemma4_attention(const Tensor& q, const Gemma4CacheView& cache,
                       const Tensor& positions, int window, float scale,
