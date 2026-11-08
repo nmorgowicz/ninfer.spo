@@ -17,7 +17,8 @@ Serve flags win over the environment for the switches in `src/core/runtime_optio
 | `NINFER_FLASH_NEXT_PREFILL_GRAPH_CACHE` | How many prefill graphs to keep, at least 1. Default 64. |
 | `NINFER_FLASH_NEXT_PREFILL_GRAPHS` | `0` turns prefill graphs off. |
 | `NINFER_Q4_EXACT` | Present means `q4_g32_fp16` trunk projections never round their codes to E4M3: 128 tokens and more take the exact W4A8 GEMM (one FP32 scale per group), shorter prefills the A16 routes. Lower KL, slower prefill. |
-| `NINFER_GEMMA4_ATTN_SPLIT_K` | D512 tensor-core attention context splitting (query widths >=64). Enabled by default; `0` or `off` disables it for A/B measurements. Underfilled query/head grids split the visible context across CTAs and merge FP32 partials/maxima/sums. Short contexts keep one segment. This does not enable FP8 QK or change the KV format. |
+| `NINFER_GEMMA4_ATTN_SPLIT_K` | D512 tensor-core attention context splitting (query widths >=64). Enabled by default; `0` or `off` disables it for A/B measurements. The automatic policy minimizes CTA waves per segment over counts 1..8, preferring fewer on ties, then clamps to the descriptor's context/window bound. FP32 partials/maxima/sums are merged without changing the KV format or enabling FP8 QK. |
+| `NINFER_GEMMA4_ATTN_SEGMENTS` | Diagnostic D512 segment override: `1`..`32` pins `grid.z` and bypasses the automatic context/window clamp; `1` means unsplit. Unset, empty, zero, or negative selects automatic policy. Valid integers above 32 clamp to 32; malformed/out-of-int-range values warn and select automatic policy. Ignored when split-K is disabled or query width is below 64. Set before process startup/capture, not during graph replay. |
 | `NINFER_EXPERT_VRAM_GIB` | Flash-Next only. GiB of VRAM for the hottest routed experts. Decode computes a miss on the CPU. Prefill copies the misses a layer needs into a VRAM scratch, then runs the GPU kernels. `0` or unset keeps every expert in VRAM. The cold copy is pinned and counts toward `NINFER_PIN_CEILING_GIB`. |
 | `NINFER_EXPERT_PROFILE` | Path of a JSON file whose integers are `[layer, expert]` pairs, hottest first. Used only with `NINFER_EXPERT_VRAM_GIB`. Missing or empty falls back to expert-id order. |
 | `NINFER_EXPERT_CPU_THREADS` | Workers for the CPU experts. Default 8. |
@@ -145,17 +146,76 @@ the existing SIMT arithmetic; sliding D256 is unchanged. No artifact
 reconversion is needed. FP8 QK is rejected for non-Gemma models or non-FP8 KV.
 BF16 KV and BF16 QK remain defaults. NVFP4/K8V4 remain unsupported for Gemma.
 
-Global D512 tensor-core attention can split a long context across CTAs when
-the query/head grid alone cannot fill the GPU. The combine keeps partial
-outputs, maxima and sums in FP32; empty/masked partitions contribute zero.
-The workspace capacity covers every context length for each query-width
-bucket before graph capture, and replay reads the current positions and
-page mappings. This changes floating-point reduction order, not QK precision;
-bit-identical outputs or identical greedy tokens are not guaranteed.
-`NINFER_GEMMA4_ATTN_SPLIT_K=0` restores the unsplit context walk for paired
-measurements. FP8/INT8 staging uses asynchronous raw-code copies followed
-by the same FP32-product/BF16 expansion and vectorized shared-memory stores.
-BF16 QK remains the default; FP8 QK remains a separate explicit quality tradeoff.
+Global D512 tensor-core attention splits the context across CTAs using a
+wave-aware policy: minimize `ceil(query_tiles * query_heads * segments / SMs) / segments`
+over segment counts 1..8, choosing fewer segments on ties. On a 170-SM GPU with
+32 query heads, widths 128/512/640/1024 choose 5/7/1/7 before the context clamp.
+Automatic splitting allows at most one segment per 256 keys in the descriptor's
+logical-page bound (also limited by a nonzero window), with at least one segment.
+This bound is not the live sequence length. Short live sequences can therefore
+launch empty segments when the descriptor covers a much larger context.
+`NINFER_GEMMA4_ATTN_SEGMENTS=1..32` pins the count without that clamp;
+`NINFER_GEMMA4_ATTN_SPLIT_K=0` restores the unsplit walk even with a pin set.
+
+The combine keeps partial outputs, maxima and sums in FP32; empty/masked
+partitions contribute zero. Workspace capacity scans every query width in the
+bucket using the context-unclamped segment bound, covering future context
+lengths before graph capture. Launch geometry depends on host descriptor
+metadata and the startup switches, never on the live device positions.
+A captured graph retains its grid while replay reads current positions and
+page mappings; it does not shrink or enlarge the grid as the live context grows.
+
+Paired output-half warps compute disjoint 256-element QK contractions and exchange
+their FP32 partial scores instead of duplicating the full contraction.
+FP8/INT8 staging still uses asynchronous raw-code copies followed by the same
+FP32-product/BF16 expansion and vectorized shared-memory stores; PV retains
+hi/lo BF16 probabilities. These changes alter floating-point reduction order,
+not the selected QK precision; bit-identical outputs or identical greedy tokens
+are not guaranteed. BF16 KV and BF16 QK remain defaults, and FP8 QK remains a
+separate explicit quality tradeoff.
+
+On 2026-11-08, RTX 5090/CUDA 13.5 development snapshots of wave splitting
+(`dbd4dc8`, A) and QK deduplication (`b160d71`, B) each passed the BF16-attention,
+FP8-KV and INT8-KV suites with split-K both enabled and disabled, without
+changing tolerances. The suites include eager/graph replay and empty partitions.
+Synthetic eager CUDA-event microbenchmarks covered widths 128/512/640/1024
+at histories 8192/32768/131072, three cache/QK modes, and pinned segment sweeps
+1..13. With FP8 KV and BF16 QK at width 128/history 131072, median attention
+time was 18.1222 ms for A and 15.5802 ms for B; the earlier `7080990` receipt
+was 30.1703 ms (a historical, not interleaved comparison). B's FP8-KV/BF16-QK
+medians improved over A in all 12 matrix cells; FP8-QK timings were mixed,
+including small regressions, so this is not an across-mode performance guarantee.
+Receipts are in the workstation's
+`D:/AI/CONVERSION/ReadyArt__Wicked-Stuff-31B-Final/convert/pp-bench-20261108/d512dev/RESULTS.md`
+and `validation-summary-recovery.json`. Those kernel measurements are distinct
+from the subsequent fixed-path serving and matched-quality checks below.
+
+The subsequent canonical rebuild of
+`D:/AI/loaders/build-spo-splitk-cuda13.5` succeeded; all six attention/KV
+split-on/off suite invocations on the new fixed-path executables exited zero.
+On the same artifact with speculation disabled, controlled serving medians were:
+
+| Prefill chunk | Prompt tokens | Old PP tok/s | New PP tok/s | Old TG tok/s | New TG tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 32000 | 1699.284 | 2221.480 | 48.454 | 48.710 |
+| 128 | 100000 | 829.291 | 1279.966 | 31.822 | 31.859 |
+| 2048 | 32000 | 2897.654 | 3238.863 | 48.702 | 48.821 |
+| 2048 | 100000 | 1324.312 | 1682.564 | 31.893 | 31.645 |
+
+These are served prompt-processing (PP) and token-generation (TG) rates, not
+the attention-event timings above. Existing G launchers and precision defaults
+were not changed. The comparison establishes improvement over the measured
+ninfer baseline for these cells, not superiority to llama.cpp.
+
+A matched context-512/chunk-128 quality comparison (47 windows, 13,728 positions)
+gave baseline/candidate mean KL 0.127134968/0.126281209. The candidate/baseline
+KL ratio's 95% CI was [0.96614161, 1.01888304]; candidate-minus-baseline NLL was
+-0.00225588, with 95% CI [-0.00992962, 0.00530373]. Neither resolves degradation
+in this matched check; neither establishes long-context or chunk-2048 quality.
+Receipts in the same `pp-bench-20261108` evidence root are
+`recovery-serving-summary.json`, `quality-recovery-paired.json`, and
+`fixed-final-tests.json`. Validation included the six kernel suites and the
+runtime-options CPU regression check, not a new full 544-test run.
 
 The finite-row domain is supported. Any NaN or infinity in a final normalized
 BF16 K/V row-half poisons that complete 256-element half with NaN codes and

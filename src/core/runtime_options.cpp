@@ -74,7 +74,8 @@ void log_if_set(const RuntimeSwitches& switches) {
                        !switches.wake_margin_us && switches.round_stats == 0 &&
                        switches.expert_vram_gib == 0 && switches.expert_profile.empty() &&
                        switches.expert_cpu_threads == 0 && switches.expert_adapt &&
-                       switches.gemma4_attn_split_k && switches.routing_dump.empty();
+                       switches.gemma4_attn_split_k && switches.gemma4_attn_segments == 0 &&
+                       switches.routing_dump.empty();
     if (quiet) { return; }
     std::fprintf(stderr, "ninfer switches:");
     if (switches.cuda_sync) { std::fprintf(stderr, " cuda_sync=%s", switches.cuda_sync->c_str()); }
@@ -182,6 +183,7 @@ RuntimeSwitches& mutable_switches() {
             const int segments = env_int("NINFER_GEMMA4_ATTN_SEGMENTS", 0);
             out.gemma4_attn_segments = segments < 1 ? 0 : (segments > 32 ? 32 : segments);
         }
+        out.routing_dump = env_string("NINFER_ROUTING_DUMP");
         return out;
     }();
     return switches;
