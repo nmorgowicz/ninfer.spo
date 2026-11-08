@@ -394,6 +394,12 @@ The official conversion examples select these maintained templates:
 
 Use your own Jinja file to change the artifact's default template. A startup
 [`--chat-template FILE`](cli.md#text-input) overrides the stored template.
+
+To change the stored template of an existing artifact without reconverting, run
+`python -m tools.artifact.set_resource MODEL.ninfer --resource chat_template.jinja=FILE`.
+It edits the directory in place, appends the new bytes (weights do not move), verifies the
+read-back, records the change under `provenance.resource_overrides`, and writes a backup that
+`--restore BACKUP` undoes exactly. Use `--dry-run` to preview. Stop any engine using the artifact first.
 `generation_config.json` is preserved; sampling presets remain determined by the architecture
 and explicit application/request settings.
 
