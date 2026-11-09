@@ -138,7 +138,14 @@ python -m tools.convert.gemma4_build launcher --artifact D:\ninfer\my-31b-best-s
 ```
 
 `--host 0.0.0.0` lets other machines on your network connect; the server has no login, so restrict it with your
-firewall. The launcher runs this:
+firewall. Two opt-in settings change what the launcher runs (both are explained in the settings table below):
+
+```powershell
+python -m tools.convert.gemma4_build launcher --artifact D:\ninfer\my-31b-best-small\my-31b-best-small.ninfer `
+  --out serve-rp.cmd --gemma4-qk fp8 --prefill-chunk auto
+```
+
+The launcher runs this:
 
 ```text
 ninfer-spo-serve <file>.ninfer --host 127.0.0.1 --port 8080 --model-id 131k --model-match any
@@ -180,14 +187,32 @@ What the launcher sets when it serves:
 | Serving setting | Value | Why |
 |---|---|---|
 | Context | `--max-context 131072` | The target: 131,072 tokens on one 5090 |
-| KV storage | `--kv-dtype fp8` | Stores the global layers' memory in FP8, half the size of BF16; the setting all the long-context runs used |
-| Attention precision | not set (`--gemma4-qk bf16`) | The engine default. `--gemma4-qk fp8` is optional: +13-22% prompt speed at 32k-100k, measurably less faithful (top-1 disagreement about 4% against 1% run-to-run noise). Reasonable for roleplay and prose; keep the default for code, tools and structured output. The launcher does not emit it, so add it to the server command by hand; see [Choosing --gemma4-qk](configuration.md#choosing---gemma4-qk) |
+| KV storage | `--kv-dtype fp8` | Stores the global layers' memory in FP8, half the size of BF16 (5.04 GiB instead of 10 GiB at 131,072 tokens); the setting all the long-context runs used and what lets 131,072 tokens fit with room to spare. `--kv-dtype bf16` is the engine's own default for a hand-written `ninfer-spo-serve` command and the launcher's explicit alternative; see [FP8 KV and smaller cards](#fp8-kv-and-smaller-cards) |
+| Attention precision | not set (`--gemma4-qk bf16`) | The engine default, so the launcher emits no flag. `--gemma4-qk fp8` is optional: +13-22% prompt speed at 32k-100k, measurably less faithful (top-1 disagreement about 4% against 1% run-to-run noise). Reasonable for roleplay and prose; keep the default for code, tools and structured output. Add it with `launcher --gemma4-qk fp8` (it needs `--kv-dtype fp8`; the launcher refuses it with `bf16`); see [Choosing --gemma4-qk](configuration.md#choosing---gemma4-qk) |
 | KV size | `--kv-capacity auto --kv-headroom-mib 1024` | Uses what fits and leaves 1 GiB free |
 | Concurrency | `--max-concurrency 1` | One request at a time, so all spare memory goes to context |
-| Prefill chunk | `--prefill-chunk 128` | The size all the measurements used |
+| Prefill chunk | `--prefill-chunk 128` | The size all the measurements used. `launcher --prefill-chunk <multiple of 128 up to 16384>` or `auto` changes it: on one g256 artifact at 131,072 context, no speculation, BF16 QK, 32k/100k prompts processed at 2,221/1,280 tok/s at chunk 128 and 3,239/1,683 tok/s at chunk 2048 (serving medians, [configuration.md](configuration.md#gemma-4-automatic-prefill-width) and the changelog). Larger chunks need more memory; `auto` picks the largest of 2048/1024/512/256/128 that fits after the weights load and needs a server build that has it |
 | Speculative decoding | `--spec mtp --draft-tokens auto` | About 165 tokens/s against about 70 without it, in our test runs |
 | Checkpoints | `--device-state-slots 0 --host-context-mib 8192` | No GPU checkpoint slots, 8 GiB of system memory for them |
 | Address and name | `--host`, `--port`, `--model-id`, `--model-match any` | Defaults `127.0.0.1`, `8080`, `131k`, any request model name accepted; change them with the launcher command above |
+
+### FP8 KV and smaller cards
+
+`--kv-dtype` is the setting that decides whether the long context fits. The engine's default is `bf16` (for a
+hand-written `ninfer-spo-serve` or `ninfer-spo-cli` command, for every model family); this launcher writes `fp8`.
+At 131,072 tokens the global layers' KV is 5.04 GiB in FP8 and about double (10 GiB) in BF16; the sliding layers'
+rings (0.88 GiB at chunk 128) are BF16 either way. On the 32 GiB RTX 5090 with one artifact, FP8 held all 131,072
+tokens with more than 5 GiB free, while BF16 plus MTP reached only 124,224 on the run that sized automatically. FP8
+costs prefill speed against BF16 (32k prompt with MTP: 1,245 against 1,722 tok/s in that older measurement) and
+changes about 5% of top-1 token choices against the BF16 cache with no resolvable perplexity change; the numbers and
+their limits are in [Experimental Gemma 4 FP8 KV](configuration.md#experimental-gemma-4-fp8-kv) and
+[KV-format evaluation](kv-evaluation.md). Use `--kv-dtype bf16` only when the card holds the larger pool at the
+context you need.
+
+Cards below 32 GiB: a 24 GiB card cannot host 131,072 tokens of this model at group 256 by arithmetic (the weights
+plus 5.04 GiB of FP8 KV, the ring, workspace and headroom exceed it; not measured on such a card). Generate the launcher
+with a smaller `--context` (the global KV scales linearly with it, 40.3125 KiB per token in FP8) and read the
+`capacity | KV` startup line to see what was reserved. Do not copy the 32 GiB figures above to another card.
 
 More about serving is in [serving.md](serving.md).
 

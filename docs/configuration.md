@@ -172,7 +172,27 @@ default, in consumer registers with `NINFER_GEMMA4_ATTN_RAW_V=1`), and PV retain
 the hi/lo BF16 probability products. Short decode/MTP widths below 64 keep
 the existing SIMT arithmetic; sliding D256 is unchanged. No artifact
 reconversion is needed. FP8 QK is rejected for non-Gemma models or non-FP8 KV.
-BF16 KV and BF16 QK remain defaults. NVFP4/K8V4 remain unsupported for Gemma.
+
+The defaults are set per tool, not per model family. The engine default is `--kv-dtype bf16` in `ninfer-spo-serve`
+and `ninfer-spo-cli` for every family, Gemma 4 included (`src/serve/serve_options.h`, `apps/cli/options.h`); only
+`ninfer-spo-perplexity` defaults to `fp8` (`apps/perplexity/main.cpp`). So a hand-typed Gemma 4 `ninfer-spo-serve` or
+`ninfer-spo-cli` command without `--kv-dtype` runs BF16 KV, while a launcher made by `python -m
+tools.convert.gemma4_build` writes `--kv-dtype fp8` explicitly. `--gemma4-qk` defaults to `bf16` everywhere.
+NVFP4/K8V4 remain unsupported for Gemma.
+
+**Which KV format for which card.** FP8 KV is what makes the long Gemma context fit on smaller cards: at 131,072 tokens
+the global KV is 5.04 GiB in FP8 against 10 GiB in BF16, and the sliding rings (0.88 GiB at chunk 128) are BF16 either
+way. Measured on one RTX 5090 (32 GiB) and one artifact ([KV-format evaluation](kv-evaluation.md), `--kv-capacity
+auto`, chunk 128): the BF16 KV payload was 10.88 GiB without MTP, but with MTP automatic sizing reached only 124,224 of
+the 131,072 requested tokens (10.36 GiB), and the BF16 capacity varied between starts with the desktop's idle memory.
+FP8 held the full 131,072 in 5.92 GiB with more than 5 GiB free, with or without MTP. The cost of FP8 KV on that
+instrument was about 5.4% of top-1 choices differing from BF16 KV (BF16 against its own repeat: 0.003%), no resolvable
+perplexity change, and slower prefill (32k with MTP: 1244.6 against 1722.0 tok/s; chunk 128, before the later prefill
+work). BF16 KV costs twice the global memory and buys prefill speed and the exact BF16 cache; use it when the card holds
+the pool at the context you need. A 24 GiB card is below the measured range: by arithmetic (not measured on such a card)
+the g256 weights plus 5.04 GiB of FP8 global KV, the 0.88 GiB ring, workspace and headroom exceed 24 GiB, so such a card
+needs a shorter `--max-context` (with FP8 KV). The global layers cost 40.3125 KiB per token in FP8 and 80 KiB in BF16.
+Check the startup line `capacity | KV` for what was really reserved.
 
 Global D512 tensor-core attention splits the context across CTAs using a
 wave-aware policy: minimize `ceil(query_tiles * query_heads * segments / SMs) / segments`
@@ -346,8 +366,9 @@ interaction with MTP.
 | Anything not measured here, or where an exact token matters | Keep `bf16` |
 
 Enable it by adding `--gemma4-qk fp8` next to `--kv-dtype fp8` on the server, CLI or perplexity command; startup
-reports the requested and resolved mode and scope. The `gemma4_build` launcher generator does not emit the flag, so
-add it to a generated launcher's server command by hand.
+reports the requested and resolved mode and scope. For a launcher, `python -m tools.convert.gemma4_build launcher
+--artifact F.ninfer --out serve.cmd --gemma4-qk fp8` appends it to the `--kv-dtype fp8` line and adds a `rem` note
+(the default emits no flag; with `--kv-dtype bf16` generation is refused, as the server rejects FP8 QK without FP8 KV).
 
 **Measure it on your own model and text.** The [KV evaluation kit](kv-evaluation.md#running-it) isolates the QK change
 when `fp8` (`--kv-dtype fp8 --gemma4-qk bf16`) is the reference and `fp8-qk` is the compared arm; both are in

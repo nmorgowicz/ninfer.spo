@@ -838,6 +838,40 @@ def test_serve_argv_matches_the_launcher_flags():
     assert "--model-match" not in exact
 
 
+def test_gemma4_qk_flag_is_emitted_only_when_requested():
+    default = "\n".join(launcher.launcher_lines("S", "A", mtp=False, vision=False))
+    assert "--gemma4-qk" not in default
+    explicit_default = launcher.launcher_lines("S", "A", mtp=True, vision=True, gemma4_qk="bf16")
+    assert explicit_default == launcher.launcher_lines("S", "A", mtp=True, vision=True)
+    lines = launcher.launcher_lines("S", "A", mtp=False, vision=False, gemma4_qk="fp8")
+    assert lines[4].startswith("rem Gemma attention QK in FP8") and lines[5] == '"S" "A" ^'
+    assert lines[7] == ("  --max-context 131072 --kv-capacity auto --kv-headroom-mib 1024 --kv-dtype fp8 "
+                        "--gemma4-qk fp8 ^")
+    argv = launcher.serve_argv(Path("S"), Path("A"), host="h", port=1, alias="a", context=2, kv_dtype="fp8",
+                               mtp=False, vision=False, gemma4_qk="fp8")
+    assert argv[argv.index("--kv-dtype") + 1:argv.index("--kv-dtype") + 4] == ["fp8", "--gemma4-qk", "fp8"]
+
+
+def test_gemma4_qk_fp8_is_refused_without_fp8_kv_and_bad_values_are_named():
+    with pytest.raises(ValueError, match=r"--gemma4-qk fp8 needs --kv-dtype fp8 .*bf16 KV"):
+        launcher.launcher_lines("S", "A", mtp=False, vision=False, kv_dtype="bf16", gemma4_qk="fp8")
+    assert "--gemma4-qk" not in "\n".join(launcher.launcher_lines("S", "A", mtp=False, vision=False, kv_dtype="bf16"))
+    with pytest.raises(ValueError, match="--gemma4-qk must be bf16 or fp8"):
+        launcher.launcher_lines("S", "A", mtp=False, vision=False, gemma4_qk="int8")
+
+
+@pytest.mark.parametrize("chunk", ["128", "256", "2048", "16384", "auto"])
+def test_prefill_chunk_accepts_multiples_of_128_and_auto(chunk):
+    lines = launcher.launcher_lines("S", "A", mtp=False, vision=False, prefill_chunk=chunk)
+    assert f"  --max-concurrency 1 --prefill-chunk {chunk} ^" in lines
+
+
+@pytest.mark.parametrize("chunk", ["", "0", "64", "100", "129", "16512", "-128", "Auto", "2048k"])
+def test_prefill_chunk_refuses_everything_else(chunk):
+    with pytest.raises(ValueError, match="--prefill-chunk must be 'auto' or a multiple of 128 in 128..16384"):
+        launcher.launcher_lines("S", "A", mtp=False, vision=False, prefill_chunk=chunk)
+
+
 def test_launcher_refuses_quotes_and_neutralizes_percent():
     with pytest.raises(ValueError, match="quotes"):
         launcher.cmd_path(Path('C:/a"b'))
@@ -897,6 +931,26 @@ def test_launcher_subcommand_model_match_choices(tmp_path, monkeypatch):
     assert "--model-match" not in (tmp_path / "exact.cmd").read_text()
     with pytest.raises(SystemExit):
         cli.main(base + ["--out", str(tmp_path / "bad.cmd"), "--model-match", "some"])
+
+
+def test_launcher_subcommand_qk_and_prefill_chunk(tmp_path, monkeypatch, capsys):
+    server, artifact = tmp_path / "s.exe", tmp_path / "a.ninfer"
+    server.write_bytes(b"x")
+    artifact.write_bytes(b"x")
+    monkeypatch.setattr(launcher, "artifact_info", lambda path: launcher.ArtifactInfo(False, False, 262144))
+    base = ["launcher", "--artifact", str(artifact), "--server-exe", str(server)]
+    default = tmp_path / "default.cmd"
+    assert cli.main(base + ["--out", str(default)]) == 0
+    assert "--gemma4-qk" not in default.read_text() and "--prefill-chunk 128 ^" in default.read_text()
+    fast = tmp_path / "fast.cmd"
+    assert cli.main(base + ["--out", str(fast), "--gemma4-qk", "fp8", "--prefill-chunk", "auto"]) == 0
+    assert "--kv-dtype fp8 --gemma4-qk fp8 ^" in fast.read_text() and "--prefill-chunk auto ^" in fast.read_text()
+    refused = tmp_path / "refused.cmd"
+    capsys.readouterr()
+    assert cli.main(base + ["--out", str(refused), "--gemma4-qk", "fp8", "--kv-dtype", "bf16"]) == 1
+    assert "--gemma4-qk fp8 needs --kv-dtype fp8" in capsys.readouterr().err and not refused.exists()
+    assert cli.main(base + ["--out", str(refused), "--prefill-chunk", "100"]) == 1
+    assert "multiple of 128" in capsys.readouterr().err and not refused.exists()
 
 
 def test_build_summary_serve_command_carries_the_model_match_setting(env):

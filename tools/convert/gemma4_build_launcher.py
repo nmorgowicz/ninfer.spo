@@ -1,8 +1,10 @@
 """Windows launcher for the Gemma 4 31B server, the server binary search, and binary checks.
 
 The serve flags are the qualified ones from the conversion guide: 131,072 context, FP8 global KV, one lane,
-prefill chunk 128, MTP when the artifact carries the assistant, vision only when it carries the tower. This
-module imports nothing from the other `gemma4_build*` modules.
+prefill chunk 128, MTP when the artifact carries the assistant, vision only when it carries the tower. Two
+opt-in settings change them: `--gemma4-qk fp8` (FP8 QK, needs FP8 KV; the default emits no flag so the engine
+default, BF16 QK, applies) and `--prefill-chunk` (a multiple of 128 or `auto`). This module imports nothing from
+the other `gemma4_build*` modules.
 """
 
 from __future__ import annotations
@@ -23,6 +25,9 @@ DEFAULT_PORT = 8080
 KV_DTYPES = ("fp8", "bf16")
 MODEL_MATCHES = ("any", "exact")
 DEFAULT_MODEL_MATCH = "any"
+GEMMA4_QKS = ("bf16", "fp8")
+DEFAULT_GEMMA4_QK = "bf16"
+DEFAULT_PREFILL_CHUNK = "128"
 # Libraries the fork's binaries load from their own directory (docs/building.md): FFmpeg and the CUDA runtime.
 REQUIRED_DLLS = (
     "avcodec-*.dll",
@@ -64,7 +69,8 @@ def default_alias(context: int) -> str:
 
 
 def check_serve_settings(
-    *, host: str, port: int, alias: str, context: int, kv_dtype: str, model_match: str = DEFAULT_MODEL_MATCH
+    *, host: str, port: int, alias: str, context: int, kv_dtype: str, model_match: str = DEFAULT_MODEL_MATCH,
+    gemma4_qk: str = DEFAULT_GEMMA4_QK, prefill_chunk: str = DEFAULT_PREFILL_CHUNK,
 ) -> None:
     if not _HOST.fullmatch(host):
         raise ValueError(f"--host {host!r}: use an IPv4/IPv6 address or host name (letters, digits, '.', ':', '-')")
@@ -78,18 +84,29 @@ def check_serve_settings(
         raise ValueError(f"--kv-dtype must be one of {KV_DTYPES} (fp8 is the qualified setting)")
     if model_match not in MODEL_MATCHES:
         raise ValueError(f"--model-match must be one of {MODEL_MATCHES}")
+    if gemma4_qk not in GEMMA4_QKS:
+        raise ValueError(f"--gemma4-qk must be bf16 or fp8, got {gemma4_qk!r}")
+    if gemma4_qk == "fp8" and kv_dtype != "fp8":
+        raise ValueError("--gemma4-qk fp8 needs --kv-dtype fp8 (the server rejects it with "
+                         f"{kv_dtype} KV); drop --gemma4-qk or use --kv-dtype fp8")
+    if prefill_chunk != "auto" and not (
+        prefill_chunk.isdigit() and 128 <= int(prefill_chunk) <= 16384 and int(prefill_chunk) % 128 == 0
+    ):
+        raise ValueError(f"--prefill-chunk must be 'auto' or a multiple of 128 in 128..16384, got {prefill_chunk!r}")
 
 
 def serve_groups(
     *, host: str, port: int, alias: str, context: int, kv_dtype: str, mtp: bool, vision: bool,
-    model_match: str = DEFAULT_MODEL_MATCH,
+    model_match: str = DEFAULT_MODEL_MATCH, gemma4_qk: str = DEFAULT_GEMMA4_QK,
+    prefill_chunk: str = DEFAULT_PREFILL_CHUNK,
 ) -> list[list[str]]:
     """The recommended `ninfer-spo-serve` flags (after the artifact path), grouped one launcher line each."""
     groups = [
         ["--host", host, "--port", str(port), "--model-id", alias]
         + (["--model-match", "any"] if model_match == "any" else []),
-        ["--max-context", str(context), "--kv-capacity", "auto", "--kv-headroom-mib", "1024", "--kv-dtype", kv_dtype],
-        ["--max-concurrency", "1", "--prefill-chunk", "128"],
+        ["--max-context", str(context), "--kv-capacity", "auto", "--kv-headroom-mib", "1024", "--kv-dtype", kv_dtype]
+        + (["--gemma4-qk", "fp8"] if gemma4_qk == "fp8" else []),
+        ["--max-concurrency", "1", "--prefill-chunk", prefill_chunk],
     ]
     if mtp:
         groups.append(["--spec", "mtp", "--draft-tokens", "auto"])
@@ -112,6 +129,8 @@ def launcher_lines(
     context: int = DEFAULT_CONTEXT,
     kv_dtype: str = "fp8",
     model_match: str = DEFAULT_MODEL_MATCH,
+    gemma4_qk: str = DEFAULT_GEMMA4_QK,
+    prefill_chunk: str = DEFAULT_PREFILL_CHUNK,
     mtp: bool,
     vision: bool,
     cuda_bin: str | None = None,
@@ -119,11 +138,12 @@ def launcher_lines(
     """CMD lines; `server`, `artifact` and `cuda_bin` are already `cmd_path` strings."""
     alias = alias or default_alias(context)
     check_serve_settings(
-        host=host, port=port, alias=alias, context=context, kv_dtype=kv_dtype, model_match=model_match
+        host=host, port=port, alias=alias, context=context, kv_dtype=kv_dtype, model_match=model_match,
+        gemma4_qk=gemma4_qk, prefill_chunk=prefill_chunk,
     )
     groups = serve_groups(
         host=host, port=port, alias=alias, context=context, kv_dtype=kv_dtype, mtp=mtp, vision=vision,
-        model_match=model_match,
+        model_match=model_match, gemma4_qk=gemma4_qk, prefill_chunk=prefill_chunk,
     )
     lines = [
         "@echo off",
@@ -137,6 +157,9 @@ def launcher_lines(
             else "OpenAI endpoints answer only to --model-id."
         ),
     ]
+    if gemma4_qk == "fp8":
+        lines.append("rem Gemma attention QK in FP8: opt-in, faster long prompts, measurably lower fidelity "
+                     "(ninfer.spo docs/configuration.md, Choosing --gemma4-qk).")
     if cuda_bin:
         lines.append(f'set "PATH={cuda_bin};%PATH%"')
     lines.append(f'"{server}" "{artifact}" ^')
@@ -174,6 +197,8 @@ def write_launcher(
     context: int = DEFAULT_CONTEXT,
     kv_dtype: str = "fp8",
     model_match: str = DEFAULT_MODEL_MATCH,
+    gemma4_qk: str = DEFAULT_GEMMA4_QK,
+    prefill_chunk: str = DEFAULT_PREFILL_CHUNK,
     no_mtp: bool = False,
     cuda_bin: Path | None = None,
     info: ArtifactInfo | None = None,
@@ -198,6 +223,8 @@ def write_launcher(
         context=context,
         kv_dtype=kv_dtype,
         model_match=model_match,
+        gemma4_qk=gemma4_qk,
+        prefill_chunk=prefill_chunk,
         mtp=info.mtp and not no_mtp,
         vision=info.vision,
         cuda_bin=cmd_path(cuda_bin) if cuda_bin else None,

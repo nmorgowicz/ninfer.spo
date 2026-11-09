@@ -515,12 +515,21 @@ OpenAI-style requests may send any `model` name, `/v1/models` still reports the 
 than the alias. The flag needs a `ninfer-spo-serve` build that includes `--model-match`. No API key is required: the
 server ignores any key a client sends unless `--api-key` is set.
 
+Two opt-in launcher settings change the command: `launcher --gemma4-qk fp8` appends `--gemma4-qk fp8` to the
+`--kv-dtype fp8` line and adds a `rem` note (the default emits no flag; with `--kv-dtype bf16` generation is refused,
+because the server rejects FP8 QK without FP8 KV), and `launcher --prefill-chunk N|auto` replaces the `128` (a multiple
+of 128 up to 16384, or `auto`, which needs a server build that has it). Both are validated before anything is written;
+the one-command build always writes the defaults.
+
 The quality scores in section 4 were produced with `ninfer-spo-perplexity` (context 512, FP8 global KV, prefill
 chunk 128). The MTP and long-context runs in section 4.7 used 131,072 context, FP8 KV and MTP; the no-speculation speed
 comparison in section 4.7 also used prefill chunk 128.
 
 `--kv-dtype fp8` stores global-layer KV in FP8 (sliding layers stay BF16) and is what the numbers above were
-run with; `bf16` is the conservative default of the server. Check the startup log for the actual KV capacity: the model
+run with. The engine's own default is `bf16` (`ninfer-spo-serve` and `ninfer-spo-cli`, every family), so a hand-written
+server command without `--kv-dtype` runs BF16 KV; the launcher writes `fp8` explicitly. At 131,072 tokens the global KV is
+5.04 GiB in FP8 and 10 GiB in BF16, which is why FP8 is what fits the long context on smaller cards
+([guide](gemma4-31b-conversion.md#fp8-kv-and-smaller-cards)). Check the startup log for the actual KV capacity: the model
 list can overstate an auto-sized pool. See [serving.md](serving.md).
 
 ## 8. When something goes wrong

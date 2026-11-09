@@ -150,7 +150,8 @@ def launcher_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m tools.convert.gemma4_build launcher",
         description="Write a Windows .cmd that starts ninfer-spo-serve on a .ninfer with the qualified settings. "
-        "MTP and vision are detected from the artifact.",
+        "MTP and vision are detected from the artifact. --gemma4-qk and --prefill-chunk are opt-in changes to "
+        "those settings.",
     )
     parser.add_argument("--artifact", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path, help="new .cmd file (never overwritten)")
@@ -160,6 +161,13 @@ def launcher_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default=launcher_tools.DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=launcher_tools.DEFAULT_PORT)
     parser.add_argument("--kv-dtype", choices=launcher_tools.KV_DTYPES, default="fp8")
+    parser.add_argument("--gemma4-qk", choices=launcher_tools.GEMMA4_QKS, default=launcher_tools.DEFAULT_GEMMA4_QK,
+                        help="Gemma attention QK precision: bf16 (default; no flag, the engine default) or fp8 "
+                        "(opt-in: faster long-prompt prefill, measurably lower fidelity; needs --kv-dtype fp8; see "
+                        "docs/configuration.md, Choosing --gemma4-qk)")
+    parser.add_argument("--prefill-chunk", default=launcher_tools.DEFAULT_PREFILL_CHUNK,
+                        help="prefill chunk: 128 (default), a multiple of 128 up to 16384, or auto (the server picks "
+                        "the largest of 2048/1024/512/256/128 that fits the full context after the weights load)")
     parser.add_argument("--model-match", choices=launcher_tools.MODEL_MATCHES, default=launcher_tools.DEFAULT_MODEL_MATCH,
                         help="any (default): OpenAI requests may send any model name; exact: only --alias, no flag")
     parser.add_argument("--cuda-bin", type=Path)
@@ -335,7 +343,8 @@ def run_launcher(args: argparse.Namespace) -> int:
     alias = args.alias or launcher_tools.default_alias(args.context)
     info = launcher_tools.write_launcher(
         args.out.resolve(), args.artifact.resolve(), server, host=args.host, port=args.port, alias=alias,
-        context=args.context, kv_dtype=args.kv_dtype, model_match=args.model_match, no_mtp=args.no_mtp,
+        context=args.context, kv_dtype=args.kv_dtype, model_match=args.model_match, gemma4_qk=args.gemma4_qk,
+        prefill_chunk=args.prefill_chunk, no_mtp=args.no_mtp,
         cuda_bin=args.cuda_bin,
     )
     print(f"Wrote {args.out}: server {server}; MTP {'on' if info.mtp and not args.no_mtp else 'off'}; "
