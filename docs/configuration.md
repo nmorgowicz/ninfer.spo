@@ -129,6 +129,11 @@ The engine does not read these. The scripts, tests, and probes that do are named
 | `--numa-node` | `NINFER_NUMA_NODE`, else the GPU's node | `N` or `off`. |
 | `--host-ram-budget-gib` | 200 | `0` skips the host RAM check. |
 
+The Gemma launcher generators default to explicit `--draft-tokens 1`, not engine `auto`.
+Use launcher `--draft-tokens auto|1..7` to override. Gemma `auto` is fixed at six drafts and can reduce
+long-context roleplay throughput; it is not adaptive selection.
+
+
 `ninfer-spo`, `ninfer-spo-perplexity`, and `ninfer_bench` resolve the NUMA node the same way and tune the process before loading. `ninfer-spo` and `ninfer_bench` also take the four host flags above.
 
 ### Gemma 4 automatic prefill width

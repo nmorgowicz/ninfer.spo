@@ -174,6 +174,8 @@ def launcher_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefill-chunk", default=launcher_tools.DEFAULT_PREFILL_CHUNK,
                         help="prefill chunk: 128 (default), a multiple of 128 up to 16384, or auto (the server picks "
                         "the largest of 2048/1024/512/256/128 that fits the full context after the weights load)")
+    parser.add_argument("--draft-tokens", default="1",
+                        help="MTP drafts: 1 (default), 2..7, or auto (6 for Gemma; can hurt long-context speed)")
     parser.add_argument("--model-match", choices=launcher_tools.MODEL_MATCHES, default=launcher_tools.DEFAULT_MODEL_MATCH,
                         help="any (default): OpenAI requests may send any model name; exact: only --alias, no flag")
     parser.add_argument("--cuda-bin", type=Path)
@@ -352,7 +354,7 @@ def run_launcher(args: argparse.Namespace) -> int:
     info = launcher_tools.write_launcher(
         args.out.resolve(), args.artifact.resolve(), server, host=args.host, port=args.port, alias=alias,
         context=args.context, kv_dtype=args.kv_dtype, model_match=args.model_match, gemma4_qk=args.gemma4_qk,
-        prefill_chunk=args.prefill_chunk, no_mtp=args.no_mtp,
+        prefill_chunk=args.prefill_chunk, draft_tokens=args.draft_tokens, no_mtp=args.no_mtp,
         cuda_bin=args.cuda_bin,
     )
     print(f"Wrote {args.out}: server {server}; MTP {'on' if info.mtp and not args.no_mtp else 'off'}; "

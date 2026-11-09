@@ -155,11 +155,12 @@ The launcher runs this:
 ninfer-spo-serve <file>.ninfer --host 127.0.0.1 --port 8080 --model-id 131k --model-match any
   --max-context 131072 --kv-capacity auto --kv-headroom-mib 1024 --kv-dtype fp8
   --max-concurrency 1 --prefill-chunk 128
-  --spec mtp --draft-tokens auto --device-state-slots 0 --host-context-mib 8192
+  --spec mtp --draft-tokens 1 --device-state-slots 0 --host-context-mib 8192
 ```
 
-`--spec mtp --draft-tokens auto` appears only when the file has the MTP helper, and `--vision` only when it has the
-vision tower.
+`--spec mtp --draft-tokens 1` appears only when the file has the MTP helper, and `--vision` only when it has the
+vision tower. The launcher command accepts `--draft-tokens auto|1..7`, default `1`. Explicit `auto` uses six
+drafts for Gemma and can hurt long-context speed; one draft is the conservative roleplay default.
 
 After it starts, read the startup log: the line that begins `capacity | KV` shows how many tokens of context really fit.
 The model list can show more than the pool actually holds.
@@ -196,7 +197,7 @@ What the launcher sets when it serves:
 | KV size | `--kv-capacity auto --kv-headroom-mib 1024` | Uses what fits and leaves 1 GiB free |
 | Concurrency | `--max-concurrency 1` | One request at a time, so all spare memory goes to context |
 | Prefill chunk | `--prefill-chunk 128` | The size all the measurements used. `launcher --prefill-chunk <multiple of 128 up to 16384>` or `auto` changes it: on one g256 artifact at 131,072 context, no speculation, BF16 QK, 32k/100k prompts processed at 2,221/1,280 tok/s at chunk 128 and 3,239/1,683 tok/s at chunk 2048 (serving medians, [configuration.md](configuration.md#gemma-4-automatic-prefill-width) and the changelog). Larger chunks need more memory; `auto` picks the largest of 2048/1024/512/256/128 that fits after the weights load and needs a server build that has it |
-| Speculative decoding | `--spec mtp --draft-tokens auto` | About 165 tokens/s against about 70 without it, in our test runs |
+| Speculative decoding | `--spec mtp --draft-tokens 1` | Conservative default for growing roleplay context; explicit `auto` uses six drafts, not adaptive selection |
 | Checkpoints | `--device-state-slots 0 --host-context-mib 8192` | No GPU checkpoint slots, 8 GiB of system memory for them |
 | Address and name | `--host`, `--port`, `--model-id`, `--model-match any` | Defaults `127.0.0.1`, `8080`, `131k`, any request model name accepted; change them with the launcher command above |
 

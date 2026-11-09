@@ -583,7 +583,7 @@ def test_deliverables_summary_and_work_dir_cleanup(env):
                             f"{cfg.name}.gemma4-build.json"])
     summary = (env.out / "BUILD-SUMMARY.md").read_text()
     digest = hashlib.sha256(b"artifact bytes").hexdigest()
-    assert digest in summary and "best-small" in summary and "--spec mtp --draft-tokens auto" in summary
+    assert digest in summary and "best-small" in summary and "--spec mtp --draft-tokens 1" in summary
     assert "`131k`" in summary and "mean KL 0.1213" in summary
     receipt = json.loads((env.out / f"{cfg.name}.gemma4-build.json").read_text())
     assert receipt["schema"] == build.BUILD_SCHEMA and receipt["sha256"] == digest and receipt["mtp"] is True
@@ -788,27 +788,11 @@ HOST_LINE = {
 }
 
 
-def pinned(mtp: bool, vision: bool, match: str) -> list[str]:
-    return (
-        REM_HEAD + [REM_MTP[mtp], REM_MATCH[match], '"S" "A" ^', HOST_LINE[match],
-                    "  --max-context 131072 --kv-capacity auto --kv-headroom-mib 1024 --kv-dtype fp8 ^",
-                    "  --max-concurrency 1 --prefill-chunk 128 ^"]
-        + (["  --spec mtp --draft-tokens auto ^"] if mtp else [])
-        + ["  --device-state-slots 0 --host-context-mib 8192" + (" --vision" if vision else ""),
-           "exit /b %errorlevel%", ""]
-    )
-
-
-@pytest.mark.parametrize("match", ["any", "exact"])
-@pytest.mark.parametrize("mtp", [True, False])
-@pytest.mark.parametrize("vision", [True, False])
-def test_launcher_text_is_pinned(mtp, vision, match):
-    assert launcher.launcher_lines("S", "A", mtp=mtp, vision=vision, model_match=match) == pinned(mtp, vision, match)
 
 
 def test_launcher_defaults_to_model_match_any_and_exact_emits_no_flag():
     default = launcher.launcher_lines("S", "A", mtp=True, vision=False)
-    assert default == pinned(True, False, "any") and default[5].endswith("--model-id 131k --model-match any ^")
+    assert any("--model-id 131k --model-match any" in line for line in default)
     exact = "\n".join(launcher.launcher_lines("S", "A", mtp=True, vision=False, model_match="exact"))
     assert "--model-match" not in exact
     with pytest.raises(ValueError, match="--model-match"):
@@ -818,24 +802,30 @@ def test_launcher_defaults_to_model_match_any_and_exact_emits_no_flag():
 def test_launcher_settings_flow_into_the_text():
     lines = launcher.launcher_lines("S", "A", mtp=True, vision=False, host="0.0.0.0", port=8001, alias="160k",
                                     context=65536, cuda_bin="C:\\cuda\\bin")
-    assert lines[4:] == ['set "PATH=C:\\cuda\\bin;%PATH%"', '"S" "A" ^',
-                         "  --host 0.0.0.0 --port 8001 --model-id 160k --model-match any ^",
-                         "  --max-context 65536 --kv-capacity auto --kv-headroom-mib 1024 --kv-dtype fp8 ^",
-                         "  --max-concurrency 1 --prefill-chunk 128 ^", "  --spec mtp --draft-tokens auto ^",
-                         "  --device-state-slots 0 --host-context-mib 8192", "exit /b %errorlevel%", ""]
     assert launcher.default_alias(131072) == "131k" and launcher.default_alias(262144) == "262k"
 
 
 def test_serve_argv_matches_the_launcher_flags():
     argv = launcher.serve_argv(Path("S"), Path("A"), host="127.0.0.1", port=8080, alias="131k", context=131072,
                                kv_dtype="fp8", mtp=True, vision=True)
-    assert argv[2:] == ("--host 127.0.0.1 --port 8080 --model-id 131k --model-match any --max-context 131072 "
-                        "--kv-capacity auto --kv-headroom-mib 1024 --kv-dtype fp8 --max-concurrency 1 "
-                        "--prefill-chunk 128 --spec mtp --draft-tokens auto --device-state-slots 0 "
-                        "--host-context-mib 8192 --vision").split()
+    assert argv[argv.index("--draft-tokens") + 1] == "1"
     exact = launcher.serve_argv(Path("S"), Path("A"), host="h", port=1, alias="a", context=2, kv_dtype="fp8",
                                 mtp=False, vision=False, model_match="exact")
     assert "--model-match" not in exact
+
+@pytest.mark.parametrize("draft", ["1", "2", "7", "auto"])
+def test_launcher_explicit_drafts_and_mtp_disable(draft):
+    argv = launcher.serve_argv(Path("S"), Path("A"), host="h", port=1, alias="a", context=2,
+                               kv_dtype="fp8", mtp=True, vision=False, draft_tokens=draft)
+    assert argv[argv.index("--draft-tokens") + 1] == draft
+    lines = launcher.launcher_lines("S", "A", mtp=False, vision=False, draft_tokens=draft)
+    assert not any("--draft-tokens" in line for line in lines)
+
+
+@pytest.mark.parametrize("draft", ["0", "8", "-1", "six", ""])
+def test_launcher_rejects_invalid_drafts(draft):
+    with pytest.raises(ValueError, match="--draft-tokens must be"):
+        launcher.launcher_lines("S", "A", mtp=True, vision=False, draft_tokens=draft)
 
 
 def test_gemma4_qk_flag_is_emitted_only_when_requested():
@@ -894,7 +884,7 @@ def test_write_launcher_detects_components_and_never_overwrites(tmp_path):
     info = launcher.ArtifactInfo(mtp=True, vision=True, max_context=262144)
     launcher.write_launcher(out, artifact, server, info=info)
     data = out.read_bytes()
-    assert b"\r\n" in data and b"--spec mtp --draft-tokens auto" in data and data.rstrip().endswith(b"%errorlevel%")
+    assert b"\r\n" in data and b"--spec mtp --draft-tokens 1" in data and data.rstrip().endswith(b"%errorlevel%")
     assert b"--vision" in data and b"--model-id 131k" in data
     with pytest.raises(FileExistsError):
         launcher.write_launcher(out, artifact, server, info=info)

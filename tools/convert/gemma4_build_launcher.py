@@ -99,6 +99,7 @@ def serve_groups(
     *, host: str, port: int, alias: str, context: int, kv_dtype: str, mtp: bool, vision: bool,
     model_match: str = DEFAULT_MODEL_MATCH, gemma4_qk: str = DEFAULT_GEMMA4_QK,
     prefill_chunk: str = DEFAULT_PREFILL_CHUNK,
+    draft_tokens: str = "1",
 ) -> list[list[str]]:
     """The recommended `ninfer-spo-serve` flags (after the artifact path), grouped one launcher line each."""
     groups = [
@@ -109,7 +110,7 @@ def serve_groups(
         ["--max-concurrency", "1", "--prefill-chunk", prefill_chunk],
     ]
     if mtp:
-        groups.append(["--spec", "mtp", "--draft-tokens", "auto"])
+        groups.append(["--spec", "mtp", "--draft-tokens", draft_tokens])
     groups.append(["--device-state-slots", "0", "--host-context-mib", "8192"] + (["--vision"] if vision else []))
     return groups
 
@@ -131,12 +132,15 @@ def launcher_lines(
     model_match: str = DEFAULT_MODEL_MATCH,
     gemma4_qk: str = DEFAULT_GEMMA4_QK,
     prefill_chunk: str = DEFAULT_PREFILL_CHUNK,
+    draft_tokens: str = "1",
     mtp: bool,
     vision: bool,
     cuda_bin: str | None = None,
 ) -> list[str]:
     """CMD lines; `server`, `artifact` and `cuda_bin` are already `cmd_path` strings."""
     alias = alias or default_alias(context)
+    if draft_tokens != "auto" and draft_tokens not in tuple(str(n) for n in range(1, 8)):
+        raise ValueError(f"--draft-tokens must be 'auto' or 1..7, got {draft_tokens!r}")
     check_serve_settings(
         host=host, port=port, alias=alias, context=context, kv_dtype=kv_dtype, model_match=model_match,
         gemma4_qk=gemma4_qk, prefill_chunk=prefill_chunk,
@@ -144,6 +148,7 @@ def launcher_lines(
     groups = serve_groups(
         host=host, port=port, alias=alias, context=context, kv_dtype=kv_dtype, mtp=mtp, vision=vision,
         model_match=model_match, gemma4_qk=gemma4_qk, prefill_chunk=prefill_chunk,
+        draft_tokens=draft_tokens,
     )
     lines = [
         "@echo off",
@@ -199,6 +204,7 @@ def write_launcher(
     model_match: str = DEFAULT_MODEL_MATCH,
     gemma4_qk: str = DEFAULT_GEMMA4_QK,
     prefill_chunk: str = DEFAULT_PREFILL_CHUNK,
+    draft_tokens: str = "1",
     no_mtp: bool = False,
     cuda_bin: Path | None = None,
     info: ArtifactInfo | None = None,
@@ -225,6 +231,7 @@ def write_launcher(
         model_match=model_match,
         gemma4_qk=gemma4_qk,
         prefill_chunk=prefill_chunk,
+        draft_tokens=draft_tokens,
         mtp=info.mtp and not no_mtp,
         vision=info.vision,
         cuda_bin=cmd_path(cuda_bin) if cuda_bin else None,
