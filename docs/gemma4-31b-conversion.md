@@ -181,6 +181,7 @@ What the launcher sets when it serves:
 |---|---|---|
 | Context | `--max-context 131072` | The target: 131,072 tokens on one 5090 |
 | KV storage | `--kv-dtype fp8` | Stores the global layers' memory in FP8, half the size of BF16; the setting all the long-context runs used |
+| Attention precision | not set (`--gemma4-qk bf16`) | The engine default. `--gemma4-qk fp8` is optional: +13-22% prompt speed at 32k-100k, measurably less faithful (top-1 disagreement about 4% against 1% run-to-run noise). Reasonable for roleplay and prose; keep the default for code, tools and structured output. The launcher does not emit it, so add it to the server command by hand; see [Choosing --gemma4-qk](configuration.md#choosing---gemma4-qk) |
 | KV size | `--kv-capacity auto --kv-headroom-mib 1024` | Uses what fits and leaves 1 GiB free |
 | Concurrency | `--max-concurrency 1` | One request at a time, so all spare memory goes to context |
 | Prefill chunk | `--prefill-chunk 128` | The size all the measurements used |

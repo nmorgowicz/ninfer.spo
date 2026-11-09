@@ -973,6 +973,8 @@ FP8 changes cache storage, not artifact quantization, Q precision or the
 BF16 attention products. MTP reads the same global code/scale planes.
 BF16 remains the serving default; vision and model quality require separate
 qualification. See [FP8 format and memory details](configuration.md#experimental-gemma-4-fp8-kv).
+The separate opt-in `--gemma4-qk fp8` does change Q precision and the QK product (faster long-prompt prefill, measurably
+less faithful; default `bf16`); [Choosing --gemma4-qk](configuration.md#choosing---gemma4-qk) says when to use it.
 
 Opt-in `--kv-dtype int8` (global layers only, unqualified for quality) stores
 42,240 B/token (41.25 KiB) including FP16 group-64 scales; ring snapshots stay

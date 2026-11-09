@@ -101,7 +101,7 @@ The engine does not read these. The scripts, tests, and probes that do are named
 | `--response-store-max-mib` | 256 | Stored response bytes. |
 | `--device` | 0 | CUDA device. |
 | `--kv-dtype` | bf16 | KV storage: `bf16`, `int8`, `fp8`, `nvfp4`, or `k8v4`. Flash-Next accepts `bf16`, `fp8`, and `int8`; `scripts/serve.cmd` passes `int8`. Gemma 4 accepts `bf16`, experimental global-only `fp8`, and opt-in unqualified global-only `int8`; its sliding rings remain BF16. |
-| `--gemma4-qk` | bf16 | Gemma 4 global attention QK: `bf16` keeps Phase 1 cache expansion; experimental `fp8` uses FP8 tensor cores for D512 MMA widths ≥64 and requires `--kv-dtype fp8`. Small-width SIMT and sliding D256 remain unchanged. Also accepted by CLI and perplexity. |
+| `--gemma4-qk` | bf16 | Gemma 4 global attention QK: `bf16` keeps Phase 1 cache expansion; experimental `fp8` uses FP8 tensor cores for D512 MMA widths ≥64 and requires `--kv-dtype fp8`. Small-width SIMT and sliding D256 remain unchanged. Also accepted by CLI and perplexity. `fp8` is faster on long prompts and measurably less faithful than `bf16`; see [Choosing --gemma4-qk](#choosing---gemma4-qk). |
 | `--spec` | | Speculative backend: `mtp`, `dflash`, or `dflash2`. Flash-Next accepts only `mtp`, which `scripts/serve.cmd` uses. |
 | `--draft-tokens` | | Draft length: `auto` or digits. Flash-Next MTP takes `auto` or 1..7. Gemma 4 MTP takes the same; its `auto` is a fixed 6 drafts per round. |
 | `--default-max-tokens` | 8192 | Used when the client omits `max_tokens`. |
@@ -275,7 +275,96 @@ FP8 and FP8+QK were compared with BF16 and INT8 on one artifact and corpus (teac
 needle retrieval, speed). FP8 halved the global KV payload with a per-position fidelity cost far above the
 run-to-run noise floor and no resolvable perplexity change; `--gemma4-qk fp8` recovered most of the long-context
 prefill speed at a small extra divergence. The reproducible method, the instruments, the evidence a comparison
-must carry and the results are in [KV-format evaluation](kv-evaluation.md).
+must carry and the results are in [KV-format evaluation](kv-evaluation.md). When to enable `--gemma4-qk fp8`, with the
+speed and fidelity numbers for that flag alone, is in [Choosing --gemma4-qk](#choosing---gemma4-qk).
+
+### Choosing --gemma4-qk
+
+The engine default is `--gemma4-qk bf16` and stays that way. FP8 QK is a precision-for-speed trade with a measured
+fidelity cost above the run-to-run noise floor, and its fidelity has not been measured on generated text, at deep
+context, or with MTP. The flag is chosen per launch, so pick it per workload.
+
+**What it changes.** Only the Q·K^T matmul of the global D512 layers, in calls with at least 64 query tokens (prefill,
+wide verify): FP8-quantized Q times the cached FP8 K codes on FP8 tensor cores, with scales. It does not change KV
+storage (`--kv-dtype fp8`), the Q4 weights, W4A8 prefill activations, V, the softmax probabilities P, the sliding D256
+layers, or decode and MTP calls below 64 tokens. It needs Gemma with global FP8 KV and is rejected otherwise (and with
+`--kv-dtype int8`). Decode speed does not change: no-speculation TG stayed at 47.5-48.8 tok/s (32k) and 31.4-31.5
+tok/s (100k) across the BF16-QK and FP8-QK arms.
+
+**Speed.** Prompt-processing (PP) tok/s on the g256 GPTQ artifact, FP8 KV, prefill chunk 2048, no speculation, one
+session, three timed reps. Compare only within one session; absolute PP varies about 3% between sessions.
+
+| Prompt | BF16 QK | FP8 QK | Change |
+|---|---:|---:|---:|
+| ~32k fresh | 3,215-3,239 | 3,640 | +13% |
+| ~100k fresh | 1,664-1,683 | 2,036 | +22% |
+| ~100k cached tail | 709 | 819-827 | +16% |
+
+Evidence: `pp-bench-20261108/wide-chunk-new/` and `rollout-arms-summary.json` under the workstation evidence root
+named above. Speed was measured at long prompts only (~32k and ~100k); short prompts were not measured.
+
+**Fidelity.** Teacher-forced, so no text is sampled. Reference: the same artifact and `--kv-dtype fp8`, with
+`--gemma4-qk bf16`; the only difference between arms is the QK precision. The noise floor is a same-flags repeat of the
+reference. 13,728 scored positions over three domains (English long-form, English reference text, code); KL is the
+truncated top-64 diagnostic, not full-vocabulary KL.
+
+| Metric | Noise, ctx 512 | FP8 QK, ctx 512 | Noise, ctx 4096 | FP8 QK, ctx 4096 |
+|---|---:|---:|---:|---:|
+| dPPL vs reference | +0.03% | +0.77% | -0.01% | +0.51% |
+| Top-1 agreement | 99.0% | 95.7% | 98.3% | 95.8% |
+| Truncated KL, mean | 3.4e-3 | 2.25e-2 | 7.2e-3 | 2.04e-2 |
+| Top-1 flips | 139 | 591 | 228 | 574 |
+| Flips at reference p1 >= 0.9 (of about 6.6k) | 1 | 12 | 6 | 12 |
+
+Reading it:
+
+- About half of the excess flips are near-ties (reference top-1/top-2 margin under 0.25 nats) and about three quarters
+  are under 0.5 nats. The reference's token is FP8 QK's second choice in 83% of flips.
+- A small share is not a near-tie: roughly 0.1-0.2% of confident positions (reference p1 >= 0.9) flip, against 1 and 6
+  for noise.
+- Code carries the most: 10 of the 12 confident flips at ctx 512 and the largest ratio over noise (145 flips against
+  14, about 10x).
+- The dPPL shift is small: the paired window t is +2.11 (ctx 512) and +1.29 (ctx 4096), so the per-position disagreement
+  is the clearer signal.
+- Six needle-retrieval cases at 32k and 100k (5/50/95% depth) were 6/6, and the answers were byte-identical to BF16 QK.
+  That is a smoke test, not a task-quality suite.
+
+Evidence: `pp-bench-20261108/fp8qk-gate/ctx512/`, `ctx4096/` (`analysis/tables.md`) and
+`margin-analysis/margin-analysis.md` under the same root.
+
+**Not shown.** Generated text (a flipped top-1 does not imply a different sampled continuation, nor that errors
+compound); fidelity at 32k-100k context (the corpus streams are about 1k tokens, so the ctx-4096 run is not deeper than
+that); other domains and languages; temperature and sampling effects; noise variance beyond one repeat run; the
+interaction with MTP.
+
+**Guidance.** This is a recommendation from the numbers above, not a quality qualification.
+
+| Workload | `--gemma4-qk` |
+|---|---|
+| Roleplay, creative prose, long chat history | `fp8` is reasonable: long prompts process 13-22% faster and the extra disagreement is mostly between near-equal tokens |
+| Coding, tool calling, agentic loops, JSON or other structured output | Keep `bf16`: the code domain showed the largest disagreement over noise and a confident token can flip |
+| Anything not measured here, or where an exact token matters | Keep `bf16` |
+
+Enable it by adding `--gemma4-qk fp8` next to `--kv-dtype fp8` on the server, CLI or perplexity command; startup
+reports the requested and resolved mode and scope. The `gemma4_build` launcher generator does not emit the flag, so
+add it to a generated launcher's server command by hand.
+
+**Measure it on your own model and text.** The [KV evaluation kit](kv-evaluation.md#running-it) isolates the QK change
+when `fp8` (`--kv-dtype fp8 --gemma4-qk bf16`) is the reference and `fp8-qk` is the compared arm; both are in
+[`arms.example.json`](../tools/bench/kv_eval/arms.example.json). Copy it to `<out-dir>/arms.json`, make `fp8` the
+reference, and add a same-flags repeat as the noise arm:
+
+```json
+{"arms": [
+  {"name": "fp8",        "role": "reference", "flags": ["--kv-dtype", "fp8", "--gemma4-qk", "bf16"]},
+  {"name": "fp8-repeat", "role": "noise",     "flags": ["--kv-dtype", "fp8", "--gemma4-qk", "bf16"]},
+  {"name": "fp8-qk",     "role": "quant",     "flags": ["--kv-dtype", "fp8", "--gemma4-qk", "fp8"]}
+]}
+```
+
+Run `run_ppl` once per arm (the perplexity tool writes the `--dump-topk` file), then `analyze`, as in
+[Running it](kv-evaluation.md#running-it); `--context 512 --stride 256` and `--context 4096 --stride 2048` gave the
+tables above. Judge the result against the noise arm, not against zero.
 
 ### Opt-in Gemma 4 INT8 KV (unqualified)
 
