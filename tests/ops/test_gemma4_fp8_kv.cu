@@ -1,13 +1,16 @@
+#include "core/runtime_options.h"
 #include "ninfer/ops/gemma4_attention.h"
 #include "ninfer/ops/gemma4_kv_append.h"
 #include "ninfer/ops/gemma4_qkv_prep.h"
 #include "ops/kernel/gemma4_fp8_kv.cuh"
+#include "ops/launcher/gemma4_attention.h"
 #include "ops/launcher/gemma4_attention_fp8_qk.cuh"
 #include "ops/op_tester.h"
 #include "ops/wrapper/gemma4_cache_validation.h"
 
 #include <cstdlib>
 #include <limits>
+#include <utility>
 
 using namespace ninfer;
 using namespace ninfer::test;
@@ -126,9 +129,8 @@ int codec_test() {
     return failures;
 }
 
-int expansion_boundary_test() {
-    // Find an actual double-rounding boundary: FP32 product -> BF16 must differ
-    // from FP16 product -> BF16, so a regression to the shared FP16 helper fails.
+std::pair<std::uint8_t, std::uint16_t> expansion_boundary() {
+    // FP32 product -> BF16 must differ from FP16 product -> BF16.
     std::uint16_t chosen_scale = 0;
     std::uint8_t chosen_code = 0;
     for (int scale = 0x1001; scale < 0x3c00 && !chosen_scale; ++scale) {
@@ -142,6 +144,11 @@ int expansion_boundary_test() {
             }
         }
     }
+    return {chosen_code, chosen_scale};
+}
+
+int expansion_boundary_test() {
+    const auto [chosen_code, chosen_scale] = expansion_boundary();
     if (!chosen_scale) { std::cerr << "no expansion boundary found\n"; return 1; }
     auto codes = to_device(std::vector<std::uint8_t>(256, chosen_code));
     auto scales = to_device(std::vector<std::uint16_t>{chosen_scale});
@@ -333,16 +340,19 @@ int qkv_test() {
     return failures;
 }
 
-// Independent CPU softmax/PV reference: Q and K use FP8 code*FP16-scale
-// without an intermediate BF16 rounding; V retains Phase1 BF16 expansion.
+// Independent FP64 softmax/PV reference. BF16 QK uses the represented K values;
+// opt-in FP8 QK contracts codes/scales without an intermediate BF16 rounding.
+// Both modes consume V rounded once from the FP32 product to BF16.
 std::vector<double> fp8_attention_reference(
     const std::vector<std::uint16_t>& query, const std::vector<std::uint8_t>& codes,
     const std::vector<std::uint16_t>& scales, const std::vector<std::uint16_t>& values,
-    const std::vector<int>& positions, const std::vector<int>& table) {
+    const std::vector<int>& positions, const std::vector<int>& table, bool fp8_qk) {
     std::vector<std::uint8_t> qc(query.size());
     std::vector<std::uint16_t> qs(query.size() / 256);
-    for (std::size_t row = 0; row < query.size() / D; ++row) {
-        quantize(query.data() + row * D, qc.data() + row * D, qs.data() + row * 2);
+    if (fp8_qk) {
+        for (std::size_t row = 0; row < query.size() / D; ++row) {
+            quantize(query.data() + row * D, qc.data() + row * D, qs.data() + row * 2);
+        }
     }
     std::vector<double> expected(query.size(), 0.0);
     for (std::size_t token = 0; token < positions.size(); ++token) {
@@ -359,9 +369,16 @@ std::vector<double> fp8_attention_reference(
                 for (int group = 0; group < 2; ++group) {
                     double partial = 0.0;
                     for (int d = group * 256; d < (group + 1) * 256; ++d) {
-                        partial += double(code_value(qc[qr * D + d])) * code_value(codes[kr * D + d]);
+                        if (fp8_qk) {
+                            partial += double(code_value(qc[qr * D + d])) * code_value(codes[kr * D + d]);
+                        } else {
+                            const float represented = bf16_to_f32(f32_to_bf16(
+                                code_value(codes[kr * D + d]) * half_value(scales[kr * 2 + group])));
+                            partial += double(bf16_to_f32(query[qr * D + d])) * represented;
+                        }
                     }
-                    score += partial * double(half_value(qs[qr * 2 + group])) * half_value(scales[kr * 2 + group]);
+                    score += fp8_qk ? partial * double(half_value(qs[qr * 2 + group])) *
+                                                   half_value(scales[kr * 2 + group]) : partial;
                 }
                 logits[key] = score;
                 maximum = std::max(maximum, score);
@@ -417,32 +434,62 @@ int attention_test(int tokens, bool invalid_high_page = true, bool fp8_qk = fals
             expanded[row * D + d] = f32_to_bf16(code_value(codes[row * D + d]) * half_value(scales[row * 2 + d / 256]));
         }
     }
+    // Keep V distinct from K and inject the FP32-vs-FP16 double-rounding witness
+    // into every live row. The oracle and raw-off comparison both see the BF16 value.
+    static const auto boundary = expansion_boundary();
+    auto value_codes = codes;
+    auto value_scales = scales;
+    std::vector<std::uint16_t> value_expanded(Rows * D);
+    for (int row = 0; row < Rows; ++row) {
+        const bool unwritten = std::isnan(half_value(scales[row * 2]));
+        if (!unwritten) { value_scales[row * 2] = boundary.second; }
+        for (int d = 0; d < D; ++d) {
+            if (!unwritten && d < 256 && d % 7 == 0) { value_codes[row * D + d] = boundary.first; }
+            value_expanded[row * D + d] = f32_to_bf16(
+                code_value(value_codes[row * D + d]) * half_value(value_scales[row * 2 + d / 256]));
+        }
+    }
     auto dc = to_device(codes), ds = to_device(scales), de = to_device(expanded);
+    auto dvc = to_device(value_codes), dvs = to_device(value_scales), dve = to_device(value_expanded);
     GuardedDeviceBuffer out(query.size() * 2), reference(query.size() * 2);
     Tensor qt(dq.p, DType::BF16, {D, 4, tokens}), pt(dp.p, DType::I32, {tokens}),
         tt(dt.p, DType::I32, {static_cast<std::int32_t>(table.size())});
     Tensor ct(dc.p, DType::U8, {D, 64, Heads, Pages}), st(ds.p, DType::FP16, {2, 64, Heads, Pages});
     Tensor et(de.p, DType::BF16, {D, 64, Heads, Pages});
+    Tensor vct(dvc.p, DType::U8, {D, 64, Heads, Pages});
+    Tensor vst(dvs.p, DType::FP16, {2, 64, Heads, Pages});
+    Tensor vet(dve.p, DType::BF16, {D, 64, Heads, Pages});
     Tensor ot(out.data(), DType::BF16, {D, 4, tokens}), rt(reference.data(), DType::BF16, {D, 4, tokens});
-    ops::Gemma4CacheView cache{ops::Gemma4KvFormat::Fp8E4m3Row256, &ct, &ct, &st, &st, &tt};
+    ops::Gemma4CacheView cache{ops::Gemma4KvFormat::Fp8E4m3Row256, &ct, &vct, &st, &vst, &tt};
     if (fp8_qk) { cache.qk_mode = ops::Gemma4QkMode::Fp8; }
-    ops::Gemma4CacheView bf16{ops::Gemma4KvFormat::BFloat16, &et, &et, nullptr, nullptr, &tt};
+    ops::Gemma4CacheView bf16{ops::Gemma4KvFormat::BFloat16, &et, &vet, nullptr, nullptr, &tt};
     WorkspaceArena workspace(std::max<std::size_t>(256, ops::gemma4_attention_workspace_capacity_bytes(D, 4, Heads, tokens)));
     ops::gemma4_attention(qt, cache, pt, 0, 1.0f, ot, workspace, nullptr);
     ops::gemma4_attention(qt, bf16, pt, 0, 1.0f, rt, workspace, nullptr);
     cuda_synchronize();
     const auto eager = from_device<std::uint16_t>(out.data(), query.size());
     int failures = 0;
-    if (fp8_qk && tokens >= 64) {
-        const auto expected = fp8_attention_reference(from_device<std::uint16_t>(dq, query.size()),
-                                                      codes, scales, expanded, positions, table);
-        // BF16 output rounding plus FP32 tensor-core/online-softmax accumulation.
-        failures += verify_pointwise("FP8 QK represented attention",
-            from_device_bf16(out.data(), query.size()), expected, PointwiseCriterion{0.002, 0.006});
-    } else {
+    const bool tensor_fp8_qk = fp8_qk && tokens >= 64;
+    const auto expected = fp8_attention_reference(from_device<std::uint16_t>(dq, query.size()),
+        codes, scales, value_expanded, positions, table, tensor_fp8_qk);
+    // Existing tolerances: do not relax either the BF16 or FP8-QK oracle.
+    failures += verify_pointwise("represented attention versus FP64 CPU",
+        from_device_bf16(out.data(), query.size()), expected,
+        tensor_fp8_qk ? PointwiseCriterion{0.002, 0.006} : PointwiseCriterion{2.0e-5, 8.0e-3});
+    if (!tensor_fp8_qk) {
         failures += verify_exact("attention same represented BF16 values", eager,
                                   from_device<std::uint16_t>(reference.data(), query.size()));
     }
+    const bool raw_v = runtime_switches().gemma4_attn_raw_v;
+    RuntimeSwitchFlags flags;
+    flags.gemma4_attn_raw_v = !raw_v;
+    apply_runtime_switch_flags(flags);
+    ops::gemma4_attention(qt, cache, pt, 0, 1.0f, rt, workspace, nullptr);
+    cuda_synchronize();
+    failures += verify_exact("raw V on versus off", eager,
+                              from_device<std::uint16_t>(reference.data(), query.size()));
+    flags.gemma4_attn_raw_v = raw_v;
+    apply_runtime_switch_flags(flags);
     for (auto bits : from_device<std::uint16_t>(out.data(), query.size())) {
         if (!std::isfinite(bf16_to_f32(bits))) {
             std::cerr << "attention consumed poisoned unused tail\n"; ++failures; break;
@@ -584,7 +631,59 @@ __global__ void benchmark_cache_kernel(std::uint8_t* k, std::uint8_t* v,
     }
 }
 
-void attention_benchmark(int history, int Chunk) {
+// Bounded independent long-context oracle: two query/head rows and four output
+// columns, but every visible key and all 512 QK dimensions. Query width stays 128
+// as history grows; no full T*Hq*L*D host reference allocation is needed.
+std::vector<double> benchmark_sample_reference(
+    const std::vector<float>& query, int history, bool fp8_qk) {
+    constexpr int columns[]{0, 255, 256, 511};
+    std::vector<double> result;
+    for (int sample = 0; sample < 2; ++sample) {
+        const int token = sample == 0 ? 0 : 127;
+        const int head = sample == 0 ? 0 : 31;
+        std::uint16_t qb[D], qs[2]{};
+        std::uint8_t qc[D]{};
+        for (int d = 0; d < D; ++d) { qb[d] = f32_to_bf16(query[(token * 32 + head) * D + d]); }
+        if (fp8_qk) { quantize(qb, qc, qs); }
+        std::vector<double> logits(history + token + 1);
+        double maximum = -std::numeric_limits<double>::infinity();
+        for (int key = 0; key <= history + token; ++key) {
+            const auto row = (static_cast<std::int64_t>(key / 64) * 4 + head / 8) * 64 + key % 64;
+            double score = 0.0;
+            for (int group = 0; group < 2; ++group) {
+                double dot = 0.0;
+                const double ks = group == 0 ? 0x1p-6 : 0x1p-4;
+                for (int d = group * 256; d < (group + 1) * 256; ++d) {
+                    const auto i = row * D + d;
+                    const auto code = static_cast<std::uint8_t>((16 + (i * 17 + row * 13) % 96) |
+                                                               ((i + row) & 1 ? 128 : 0));
+                    dot += fp8_qk ? double(code_value(qc[d])) * code_value(code) :
+                                    double(bf16_to_f32(qb[d])) * code_value(code) * ks;
+                }
+                score += fp8_qk ? dot * half_value(qs[group]) * ks : dot;
+            }
+            logits[key] = score;
+            maximum = std::max(maximum, score);
+        }
+        double sum = 0.0;
+        for (auto& score : logits) { score = std::exp(score - maximum); sum += score; }
+        for (int d : columns) {
+            double value = 0.0;
+            for (int key = 0; key <= history + token; ++key) {
+                const auto row = (static_cast<std::int64_t>(key / 64) * 4 + head / 8) * 64 + key % 64;
+                const auto i = row * D + d;
+                const auto code = static_cast<std::uint8_t>((8 + (i * 23 + row * 7) % 104) |
+                                                           ((i / 3 + row) & 1 ? 128 : 0));
+                const double vs = d < 256 ? 0x1p-5 : 0x1p-3;
+                value += logits[key] * code_value(code) * vs;
+            }
+            result.push_back(value / sum);
+        }
+    }
+    return result;
+}
+
+int attention_benchmark(int history, int Chunk) {
     constexpr int QHeads = 32;
     constexpr int KvHeads = 4;
     constexpr int Warmups = 3;
@@ -614,9 +713,13 @@ void attention_benchmark(int history, int Chunk) {
     ops::Gemma4CacheView modes[]{
         {ops::Gemma4KvFormat::BFloat16, &kbt, &vbt, nullptr, nullptr, &tt},
         {ops::Gemma4KvFormat::Fp8E4m3Row256, &kt, &vt, &kst, &vst, &tt},
+        {ops::Gemma4KvFormat::Fp8E4m3Row256, &kt, &vt, &kst, &vst, &tt},
+        {ops::Gemma4KvFormat::Fp8E4m3Row256, &kt, &vt, &kst, &vst, &tt},
         {ops::Gemma4KvFormat::Fp8E4m3Row256, &kt, &vt, &kst, &vst, &tt}};
     modes[2].qk_mode = ops::Gemma4QkMode::Fp8;
-    const char* labels[]{"bf16", "fp8_phase1", "fp8_phase2"};
+    modes[4].qk_mode = ops::Gemma4QkMode::Fp8;
+    constexpr int ModeCount = 5;
+    const char* labels[]{"bf16", "fp8_phase1", "fp8_phase2", "fp8_raw_v", "fp8_qk_raw_v"};
     WorkspaceArena workspace(std::max<std::size_t>(256,
         ops::gemma4_attention_workspace_capacity_bytes(D, QHeads, KvHeads, Chunk)));
     cudaStream_t stream;
@@ -624,18 +727,43 @@ void attention_benchmark(int history, int Chunk) {
     cuda_check(cudaStreamCreate(&stream), "cudaStreamCreate");
     cuda_check(cudaEventCreate(&begin), "cudaEventCreate");
     cuda_check(cudaEventCreate(&end), "cudaEventCreate");
+    const bool saved_raw_v = runtime_switches().gemma4_attn_raw_v;
     const auto launch = [&](int mode) {
+        RuntimeSwitchFlags flags;
+        flags.gemma4_attn_raw_v = mode >= 3;
+        apply_runtime_switch_flags(flags);
         ops::gemma4_attention(qt, modes[mode], pt, 0, 1.0f, ot, workspace, stream);
     };
     cuda_synchronize();
     for (int warmup = 0; warmup < Warmups; ++warmup) {
-        for (int mode = 0; mode < 3; ++mode) { launch(mode); }
+        for (int mode = 0; mode < ModeCount; ++mode) { launch(mode); }
     }
     cuda_synchronize(stream);
-    std::vector<float> timings[3];
+    for (int mode = 0; mode < ModeCount && Chunk >= 64; ++mode) {
+        RuntimeSwitchFlags flags;
+        flags.gemma4_attn_raw_v = mode >= 3;
+        apply_runtime_switch_flags(flags);
+        const auto resources = ops::detail::gemma4_attention_mma_d512_resources(modes[mode]);
+        int device = 0, max_threads = 0;
+        cuda_check(cudaGetDevice(&device), "cudaGetDevice");
+        cuda_check(cudaDeviceGetAttribute(&max_threads, cudaDevAttrMaxThreadsPerMultiProcessor, device),
+                   "cudaDeviceGetAttribute max threads");
+        std::cout << "GEMMA4_D512_RESOURCES history=" << history << " chunk=" << Chunk
+                  << " mode=" << labels[mode] << " registers_per_thread=" << resources.attributes.numRegs
+                  << " static_shared_bytes=" << resources.attributes.sharedSizeBytes
+                  << " dynamic_shared_bytes=" << resources.dynamic_shared_bytes
+                  << " local_bytes_per_thread=" << resources.attributes.localSizeBytes
+                  << " threads=" << resources.threads
+                  << " api_max_active_blocks_per_sm=" << resources.active_blocks_per_sm
+                  << " api_max_active_warps_per_sm=" << resources.active_blocks_per_sm * resources.threads / 32
+                  << " api_occupancy_pct="
+                  << 100.0 * resources.active_blocks_per_sm * resources.threads / max_threads
+                  << " occupancy_source=cuda_runtime_limit_not_measured\n";
+    }
+    std::vector<float> timings[ModeCount];
     for (int sample = 0; sample < Samples; ++sample) {
-        for (int order = 0; order < 3; ++order) {
-            const int mode = (sample + order) % 3;
+        for (int order = 0; order < ModeCount; ++order) {
+            const int mode = (sample + order) % ModeCount;
             cuda_check(cudaEventRecord(begin, stream), "cudaEventRecord");
             for (int repeat = 0; repeat < Repetitions; ++repeat) { launch(mode); }
             cuda_check(cudaEventRecord(end, stream), "cudaEventRecord");
@@ -648,7 +776,7 @@ void attention_benchmark(int history, int Chunk) {
                       << " repetitions=" << Repetitions << " ms_per_op=" << ms / Repetitions << '\n';
         }
     }
-    for (int mode = 0; mode < 3; ++mode) {
+    for (int mode = 0; mode < ModeCount; ++mode) {
         std::sort(timings[mode].begin(), timings[mode].end());
         std::cout << "GEMMA4_QK_EVENT_MEDIAN history=" << history << " chunk=" << Chunk
                   << " q_heads=" << QHeads << " kv_heads=" << KvHeads << " mode=" << labels[mode]
@@ -657,9 +785,49 @@ void attention_benchmark(int history, int Chunk) {
                   << " min_ms=" << timings[mode].front() << " max_ms=" << timings[mode].back()
                   << " execution=eager data=synthetic_represented_equal\n";
     }
+    int failures = 0;
+    if (Chunk == 128) {
+        const auto expected_bf16 = benchmark_sample_reference(query, history, false);
+        const auto expected_fp8 = benchmark_sample_reference(query, history, true);
+        std::vector<std::uint16_t> baseline[2];
+        constexpr int columns[]{0, 255, 256, 511};
+        for (int mode = 0; mode < ModeCount; ++mode) {
+            launch(mode);
+            cuda_synchronize(stream);
+            const auto got = from_device<std::uint16_t>(output.p, query.size());
+            if (mode == 1 || mode == 2) { baseline[mode - 1] = got; }
+            if (mode >= 3) {
+                failures += verify_exact("long fixed-width raw V on versus off", got, baseline[mode - 3]);
+            }
+            std::vector<double> sampled;
+            for (int sample = 0; sample < 2; ++sample) {
+                const int token = sample == 0 ? 0 : 127;
+                const int head = sample == 0 ? 0 : 31;
+                for (int d : columns) { sampled.push_back(bf16_to_f32(got[(token * 32 + head) * D + d])); }
+            }
+            const bool fp8_qk = mode == 2 || mode == 4;
+            const auto& expected = fp8_qk ? expected_fp8 : expected_bf16;
+            double max_abs = 0.0, squared = 0.0;
+            for (std::size_t i = 0; i < sampled.size(); ++i) {
+                const double error = double(sampled[i]) - expected[i];
+                max_abs = std::max(max_abs, std::fabs(error));
+                squared += error * error;
+            }
+            failures += verify_pointwise("long fixed-width sampled FP64 CPU", sampled, expected,
+                fp8_qk ? PointwiseCriterion{0.002, 0.006} : PointwiseCriterion{2.0e-5, 8.0e-3});
+            std::cout << "GEMMA4_LONG_ERROR history=" << history << " chunk=" << Chunk
+                      << " mode=" << labels[mode] << " sampled_rows=2 sampled_columns=4"
+                      << " all_visible_keys=true qk_dimensions=512 max_abs_error=" << max_abs
+                      << " rms_error=" << std::sqrt(squared / sampled.size()) << '\n';
+        }
+    }
+    RuntimeSwitchFlags restore;
+    restore.gemma4_attn_raw_v = saved_raw_v;
+    apply_runtime_switch_flags(restore);
     cuda_check(cudaEventDestroy(begin), "cudaEventDestroy");
     cuda_check(cudaEventDestroy(end), "cudaEventDestroy");
     cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");
+    return failures;
 }
 
 // Comma-separated positive integers; empty or malformed lists are rejected.
@@ -681,8 +849,8 @@ std::vector<int> parse_list(std::string_view text) {
 
 int main(int argc, char** argv) {
     if (argc > 1) {
-        std::vector<int> chunks{128};
-        std::vector<int> histories{32768, 131072};
+        std::vector<int> chunks{128, 512, 1024, 2048};
+        std::vector<int> histories{8192, 32768, 131072};
         bool valid = std::string_view(argv[1]) == "--benchmark" && argc % 2 == 0;
         for (int i = 2; valid && i + 1 < argc; i += 2) {
             const std::string_view key(argv[i]);
@@ -704,28 +872,38 @@ int main(int argc, char** argv) {
         std::cout << "GEMMA4_QK_BENCHMARK gpu=" << properties.name
                   << " sm=" << properties.major << properties.minor
                   << " timing=cuda_events order=rotating_paired\n";
+        int failures = 0;
         for (int chunk : chunks) {
-            for (int history : histories) { attention_benchmark(history, chunk); }
+            for (int history : histories) { failures += attention_benchmark(history, chunk); }
         }
-        return 0; // Deliberately no performance assertions.
+        return failures ? 1 : 0; // Numerical assertions only, never performance thresholds.
     }
     int failures = validation_test();
     if (cuda_unavailable()) { std::cout << "SKIP: no usable CUDA device\n"; return failures ? 1 : 77; }
     failures += codec_test() + expansion_boundary_test() + qkv_test() + append_test();
     failures += qk_probe_test(2, 63) + qk_probe_test(0, 52) + qk_probe_test(-1, 63);
     failures += qk_probe_test(2, 63, true);
-    for (int tokens : {1, 63, 64, 65, 129}) { failures += attention_test(tokens); }
-    failures += attention_test(129, false);
-    for (int tokens : {1, 63, 64, 65, 127, 128, 129}) {
-        failures += attention_test(tokens, true, true);
-    }
-    failures += attention_test(129, false, true);
-    for (bool fp8_qk : {false, true}) {
-        for (int tokens : {64, 65, 128, 129}) {
-            failures += attention_test(tokens, false, fp8_qk, true);
+    const bool saved_raw_v = runtime_switches().gemma4_attn_raw_v;
+    for (bool raw_v : {false, true}) {
+        RuntimeSwitchFlags flags;
+        flags.gemma4_attn_raw_v = raw_v;
+        apply_runtime_switch_flags(flags);
+        for (int tokens : {1, 63, 64, 65, 129}) { failures += attention_test(tokens); }
+        failures += attention_test(129, false);
+        for (int tokens : {1, 63, 64, 65, 127, 128, 129}) {
+            failures += attention_test(tokens, true, true);
         }
-        failures += attention_test(65, true, fp8_qk, true, true);
+        failures += attention_test(129, false, true);
+        for (bool fp8_qk : {false, true}) {
+            for (int tokens : {64, 65, 128, 129}) {
+                failures += attention_test(tokens, false, fp8_qk, true);
+            }
+            failures += attention_test(65, true, fp8_qk, true, true);
+        }
     }
+    RuntimeSwitchFlags restore;
+    restore.gemma4_attn_raw_v = saved_raw_v;
+    apply_runtime_switch_flags(restore);
     std::cout << (failures ? "FAIL" : "OK") << " gemma4_fp8_kv\n";
     return failures ? 1 : 0;
 }

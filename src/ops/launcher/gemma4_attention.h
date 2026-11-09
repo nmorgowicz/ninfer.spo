@@ -42,4 +42,15 @@ void gemma4_attention_mma_d512_launch(const Tensor& q, const Gemma4CacheView& ca
                                       Tensor& out, float* partial, float* partial_stats,
                                       cudaStream_t stream);
 
+// Diagnostic query for the exact D512 specialization selected by the cache and
+// runtime switches. Call outside capture/timing; occupancy is the CUDA API limit,
+// not a measured resident-warp guarantee.
+struct Gemma4AttentionD512Resources {
+    cudaFuncAttributes attributes{};
+    std::size_t dynamic_shared_bytes = 0;
+    int threads = 0;
+    int active_blocks_per_sm = 0;
+};
+Gemma4AttentionD512Resources gemma4_attention_mma_d512_resources(const Gemma4CacheView& cache);
+
 } // namespace ninfer::ops::detail

@@ -19,6 +19,7 @@ Serve flags win over the environment for the switches in `src/core/runtime_optio
 | `NINFER_Q4_EXACT` | Present means `q4_g32_fp16` trunk projections never round their codes to E4M3: 128 tokens and more take the exact W4A8 GEMM (one FP32 scale per group), shorter prefills the A16 routes. Lower KL, slower prefill. |
 | `NINFER_GEMMA4_ATTN_SPLIT_K` | D512 tensor-core attention context splitting (query widths >=64). Enabled by default; `0` or `off` disables it for A/B measurements. The automatic policy minimizes CTA waves per segment over counts 1..8, preferring fewer on ties, then clamps to the descriptor's context/window bound. FP32 partials/maxima/sums are merged without changing the KV format or enabling FP8 QK. |
 | `NINFER_GEMMA4_ATTN_SEGMENTS` | Diagnostic D512 segment override: `1`..`32` pins `grid.z` and bypasses the automatic context/window clamp; `1` means unsplit. Unset, empty, zero, or negative selects automatic policy. Valid integers above 32 clamp to 32; malformed/out-of-int-range values warn and select automatic policy. Ignored when split-K is disabled or query width is below 64. Set before process startup/capture, not during graph replay. |
+| `NINFER_GEMMA4_ATTN_RAW_V` | `1` opts into compact FP8 V staging in global D512 MMA attention (widths >=64). Converts code × FP16 scale in FP32 and rounds to BF16 directly in the consumer registers, preserving the existing V representation and FP32 PV arithmetic while removing the expanded V shared tile (8 KiB less dynamic shared memory). Default off; BF16/INT8 KV, short SIMT and sliding D256 are unchanged. Does not enable FP8 QK. Set before graph capture. Resource diagnostics report CUDA occupancy limits, not guaranteed resident CTAs. |
 | `NINFER_EXPERT_VRAM_GIB` | Flash-Next only. GiB of VRAM for the hottest routed experts. Decode computes a miss on the CPU. Prefill copies the misses a layer needs into a VRAM scratch, then runs the GPU kernels. `0` or unset keeps every expert in VRAM. The cold copy is pinned and counts toward `NINFER_PIN_CEILING_GIB`. |
 | `NINFER_EXPERT_PROFILE` | Path of a JSON file whose integers are `[layer, expert]` pairs, hottest first. Used only with `NINFER_EXPERT_VRAM_GIB`. Missing or empty falls back to expert-id order. |
 | `NINFER_EXPERT_CPU_THREADS` | Workers for the CPU experts. Default 8. |
@@ -140,7 +141,8 @@ products (Phase 1). Explicit `--gemma4-qk fp8` selects Phase 2 for global
 D512 MMA calls with at least 64 query tokens: quantize Q once per tile with
 two FP16-rounded row-half scales, multiply Q/K E4M3 codes on FP8 tensor
 cores, independently correct each 256-element partial, then sum the scores.
-K codes come directly from the cache. V still expands to BF16, and PV retains
+K codes come directly from the cache. V expands to BF16 (in shared memory by
+default, in consumer registers with `NINFER_GEMMA4_ATTN_RAW_V=1`), and PV retains
 the hi/lo BF16 probability products. Short decode/MTP widths below 64 keep
 the existing SIMT arithmetic; sliding D256 is unchanged. No artifact
 reconversion is needed. FP8 QK is rejected for non-Gemma models or non-FP8 KV.
@@ -173,6 +175,21 @@ hi/lo BF16 probabilities. These changes alter floating-point reduction order,
 not the selected QK precision; bit-identical outputs or identical greedy tokens
 are not guaranteed. BF16 KV and BF16 QK remain defaults, and FP8 QK remains a
 separate explicit quality tradeoff.
+
+The subsequent opt-in raw-V experiment passed the same six split-on/off
+attention/KV suite invocations at unchanged tolerances, including direct
+raw-on/off exact-output checks, page/tail cases and graph replay. On RTX 5090,
+CUDA resource APIs report 255 registers/thread, zero local bytes/thread and
+one maximum active 256-thread CTA/SM for raw V, even with FP8 QK's 49,152-byte
+dynamic shared tile; saving shared memory does not establish two-CTA occupancy.
+Synthetic paired medians at width 128/history 131072 were 16.0286 ms with
+expanded V and 15.4036 ms with raw V (BF16 QK), or 11.8188/11.3282 ms
+(FP8 QK). The full 128/512/1024/2048 by 8192/32768/131072 matrix includes
+regressions, so raw V remains opt-in. Sampled FP64 checks cover two query/head
+rows and four output columns across all keys, not full-output or model fidelity.
+Receipts: `d512dev/next-B-microbench-resources-oracle.log`,
+`next-B-long-errors.json`, `next-B-summary.json`, and
+`next-validation-receipts.json` under the workstation evidence root above.
 
 On 2026-11-08, RTX 5090/CUDA 13.5 development snapshots of wave splitting
 (`dbd4dc8`, A) and QK deduplication (`b160d71`, B) each passed the BF16-attention,

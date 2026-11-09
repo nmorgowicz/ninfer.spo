@@ -54,6 +54,8 @@ struct RuntimeSwitches {
     // 0 keeps the wave-aware automatic choice for the D=512 context split. 1..32 pins the
     // grid.z segment count for NINFER_GEMMA4_ATTN_SEGMENTS sweeps (diagnostics).
     int gemma4_attn_segments = 0;
+    // Opt-in compact FP8 V staging with the same FP32-product/BF16 rounding in registers.
+    bool gemma4_attn_raw_v = false;
 };
 
 struct RuntimeSwitchFlags {
@@ -69,6 +71,7 @@ struct RuntimeSwitchFlags {
     std::optional<int> expert_vram_gib;
     std::optional<std::string> expert_profile;
     std::optional<bool> gemma4_attn_split_k;
+    std::optional<bool> gemma4_attn_raw_v;
 };
 
 [[nodiscard]] const RuntimeSwitches& runtime_switches();

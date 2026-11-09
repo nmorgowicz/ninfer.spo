@@ -39,9 +39,11 @@ constexpr std::size_t kSharedBytes = sizeof(__nv_bfloat16) * (kRows + 2 * kBc) *
 static_assert(kSharedBytes <= 99 * 1024);
 static_assert(kPagedKVPageSize % kBc == 0);
 
-template <bool Fp8Qk>
+template <bool Fp8Qk, bool RawV>
 constexpr std::size_t shared_bytes() {
-    return Fp8Qk ? (kRows + kBc) * kD + sizeof(__nv_bfloat16) * kBc * kD : kSharedBytes;
+    constexpr std::size_t qk = Fp8Qk ? (kRows + kBc) * kD :
+                                                     sizeof(__nv_bfloat16) * (kRows + kBc) * kD;
+    return qk + (RawV ? 1 : sizeof(__nv_bfloat16)) * kBc * kD;
 }
 
 // grid (query tiles, Hq, segments); CTA (tile, h, seg) covers query rows [64 tile, 64 tile +
@@ -51,7 +53,7 @@ constexpr std::size_t shared_bytes() {
 // halves. The arithmetic per row and column is the same as a 4-warp CTA per output half, so
 // the result does not depend on the split. With segments > 1 each CTA writes FP32 partials
 // and (max, sum) stats for gemma4_attention_d512_combine_kernel instead of the final rows.
-template <Gemma4KvFormat Fmt, bool Fp8Qk = false>
+template <Gemma4KvFormat Fmt, bool Fp8Qk = false, bool RawV = false>
 __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
     const __nv_bfloat16* __restrict__ q, const void* __restrict__ k_pages,
     const void* __restrict__ v_pages, const __half* __restrict__ k_scales,
@@ -64,6 +66,7 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
 
     extern __shared__ __align__(16) __nv_bfloat16 gemma4_d512_smem[];
     static_assert(!Fp8Qk || Fmt == Gemma4KvFormat::Fp8E4m3Row256);
+    static_assert(!RawV || Fmt == Gemma4KvFormat::Fp8E4m3Row256);
     __nv_bfloat16* q_s = gemma4_d512_smem;
     auto* q_fp8 = reinterpret_cast<std::uint8_t*>(q_s);
     auto* k_fp8 = q_fp8 + kRows * kD;
@@ -71,6 +74,7 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
     __nv_bfloat16* v_s = Fp8Qk ? reinterpret_cast<__nv_bfloat16*>(k_fp8 + kBc * kD) : k_s + kBc * kD;
     __shared__ __align__(4) __half q_scale_s[Fp8Qk ? kRows * 2 : 1];
     __shared__ __align__(4) __half k_scale_s[Fp8Qk ? kBc * 2 : 1];
+    __shared__ __align__(4) __half v_scale_s[RawV ? kBc * 2 : 1];
     __shared__ int range[3]; // first visible key, highest position, lowest position
 
     // Later tiles see more keys; start them first.
@@ -250,6 +254,20 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
             __syncthreads();
         }
         stage(v_s, v_pages, v_scales, physical, k0);
+        if constexpr (RawV) {
+            // Codes stay compact until each warp builds its BF16 B fragments. Scales
+            // are staged once per key/group, not reloaded for every output column.
+            if (tid < kBc * 2) {
+                const int key = tid / 2;
+                __half value = __float2half_rn(0.0f);
+                if (mapped && k0 + key <= last_key) {
+                    const auto row = gemma4_kv_row(
+                        physical, kv_heads, kvh, (k0 & kPagedKVPageMask) + key);
+                    value = v_scales[row * 2 + tid % 2];
+                }
+                v_scale_s[tid] = value;
+            }
+        }
         cp_commit();
 
         float score[kQkNt][4];
@@ -314,7 +332,7 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
             score[1][3] += hi.w;
             __syncthreads();
         }
-        if constexpr (kQuantKv) {
+        if constexpr (kQuantKv && !RawV) {
             expand(v_s, v_scales, physical, k0);
             __syncthreads();
         }
@@ -396,13 +414,42 @@ __launch_bounds__(kThreads, 1) __global__ void gemma4_attention_d512_kernel(
 
         constexpr int PvHalf   = kPvNt / 2;
         constexpr int PvLoads  = kPvKs * PvHalf;
+        __half raw_scale[RawV ? 4 : 1];
+        if constexpr (RawV) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int key = 2 * lid + (i & 1) + (i >> 1) * 8;
+                raw_scale[i] = v_scale_s[key * 2 + half];
+            }
+        }
         const auto load_values = [&](unsigned(&dst)[4], int li) {
             const int k  = li / PvHalf;
             const int n2 = (li % PvHalf) * 2;
-            ldmatrix_x4_t(dst[0], dst[1], dst[2], dst[3],
-                          causal_swizzle_address(
-                              v_lane_base + static_cast<unsigned>(k * (16 * kD * 2)),
-                              static_cast<unsigned>((half * (kHalf / 8) + n2) << 4), v_as, v_r));
+            if constexpr (RawV) {
+                // m16n8k16 B is column-major: a lane owns column gid, key
+                // pairs 2*lid and 2*lid+8. Registers 2/3 belong to the next
+                // eight-column MMA. This matches ldmatrix.x4.trans exactly.
+                const auto* raw = reinterpret_cast<const std::uint8_t*>(v_s);
+#pragma unroll
+                for (int n = 0; n < 2; ++n) {
+                    const int d = half * kHalf + (n2 + n) * 8 + gid;
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        const int key = k * 16 + 2 * lid + i * 8;
+                        const __nv_bfloat16 lo =
+                            gemma4_fp8_expand(raw[key * kD + d], raw_scale[i * 2]);
+                        const __nv_bfloat16 hi =
+                            gemma4_fp8_expand(raw[(key + 1) * kD + d], raw_scale[i * 2 + 1]);
+                        const __nv_bfloat162 packed = __halves2bfloat162(lo, hi);
+                        dst[n * 2 + i] = *reinterpret_cast<const unsigned*>(&packed);
+                    }
+                }
+            } else {
+                ldmatrix_x4_t(dst[0], dst[1], dst[2], dst[3],
+                              causal_swizzle_address(
+                                  v_lane_base + static_cast<unsigned>(k * (16 * kD * 2)),
+                                  static_cast<unsigned>((half * (kHalf / 8) + n2) << 4), v_as, v_r));
+            }
         };
         unsigned vf[2][4];
         load_values(vf[0], 0);
@@ -584,7 +631,7 @@ int d512_segment_count(std::int32_t tokens, std::int32_t q_heads, std::int32_t p
     return static_cast<int>(std::max<std::int64_t>(segments, 1));
 }
 
-template <Gemma4KvFormat Fmt, bool Fp8Qk = false>
+template <Gemma4KvFormat Fmt, bool Fp8Qk = false, bool RawV = false>
 void launch_d512(const Tensor& q, const Gemma4CacheView& cache, const Tensor& positions,
                   int window, float scale, Tensor& out, float* partial, float* partial_stats,
                   cudaStream_t stream) {
@@ -593,9 +640,9 @@ void launch_d512(const Tensor& q, const Gemma4CacheView& cache, const Tensor& po
     const Tensor& block_table = *cache.block_table;
     static bool configured = false;
     if (!configured) {
-        CUDA_CHECK(cudaFuncSetAttribute(gemma4_attention_d512_kernel<Fmt, Fp8Qk>,
+        CUDA_CHECK(cudaFuncSetAttribute(gemma4_attention_d512_kernel<Fmt, Fp8Qk, RawV>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(shared_bytes<Fp8Qk>())));
+                                        static_cast<int>(shared_bytes<Fp8Qk, RawV>())));
         configured = true;
     }
     const int tokens   = q.ne[2];
@@ -605,7 +652,8 @@ void launch_d512(const Tensor& q, const Gemma4CacheView& cache, const Tensor& po
     }
     const dim3 grid(static_cast<unsigned>((tokens + kRows - 1) / kRows),
                     static_cast<unsigned>(q.ne[1]), static_cast<unsigned>(segments));
-    gemma4_attention_d512_kernel<Fmt, Fp8Qk><<<grid, kThreads, shared_bytes<Fp8Qk>(), stream>>>(
+    gemma4_attention_d512_kernel<Fmt, Fp8Qk, RawV>
+        <<<grid, kThreads, shared_bytes<Fp8Qk, RawV>(), stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), k_pages.data, cache.v_pages->data,
         Quantized ? static_cast<const __half*>(cache.k_scales->data) : nullptr,
         Quantized ? static_cast<const __half*>(cache.v_scales->data) : nullptr,
@@ -621,6 +669,27 @@ void launch_d512(const Tensor& q, const Gemma4CacheView& cache, const Tensor& po
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Keep diagnostics and real dispatch on the same specialization selector.
+template <typename Visitor>
+decltype(auto) visit_d512(const Gemma4CacheView& cache, Visitor&& visitor) {
+    if (cache.format == Gemma4KvFormat::Fp8E4m3Row256) {
+        if (runtime_switches().gemma4_attn_raw_v) {
+            if (cache.qk_mode == Gemma4QkMode::Fp8) {
+                return visitor.template operator()<Gemma4KvFormat::Fp8E4m3Row256, true, true>();
+            }
+            return visitor.template operator()<Gemma4KvFormat::Fp8E4m3Row256, false, true>();
+        }
+        if (cache.qk_mode == Gemma4QkMode::Fp8) {
+            return visitor.template operator()<Gemma4KvFormat::Fp8E4m3Row256, true, false>();
+        }
+        return visitor.template operator()<Gemma4KvFormat::Fp8E4m3Row256, false, false>();
+    }
+    if (cache.format == Gemma4KvFormat::Int8Group64) {
+        return visitor.template operator()<Gemma4KvFormat::Int8Group64, false, false>();
+    }
+    return visitor.template operator()<Gemma4KvFormat::BFloat16, false, false>();
+}
+
 } // namespace
 
 int gemma4_attention_mma_d512_segments(std::int32_t tokens, std::int32_t q_heads,
@@ -628,25 +697,30 @@ int gemma4_attention_mma_d512_segments(std::int32_t tokens, std::int32_t q_heads
     return d512_segment_count(tokens, q_heads, pages, window);
 }
 
+Gemma4AttentionD512Resources gemma4_attention_mma_d512_resources(const Gemma4CacheView& cache) {
+    return visit_d512(cache, []<Gemma4KvFormat Fmt, bool Fp8Qk, bool RawV>() {
+        Gemma4AttentionD512Resources result;
+        result.dynamic_shared_bytes = shared_bytes<Fp8Qk, RawV>();
+        result.threads = kThreads;
+        CUDA_CHECK(cudaFuncSetAttribute(gemma4_attention_d512_kernel<Fmt, Fp8Qk, RawV>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(result.dynamic_shared_bytes)));
+        CUDA_CHECK(cudaFuncGetAttributes(
+            &result.attributes, gemma4_attention_d512_kernel<Fmt, Fp8Qk, RawV>));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &result.active_blocks_per_sm, gemma4_attention_d512_kernel<Fmt, Fp8Qk, RawV>,
+            kThreads, result.dynamic_shared_bytes));
+        return result;
+    });
+}
+
 void gemma4_attention_mma_d512_launch(const Tensor& q, const Gemma4CacheView& cache,
                                       const Tensor& positions, int window, float scale,
                                       Tensor& out, float* partial, float* partial_stats,
                                       cudaStream_t stream) {
-    if (cache.format == Gemma4KvFormat::Fp8E4m3Row256) {
-        if (cache.qk_mode == Gemma4QkMode::Fp8) {
-            launch_d512<Gemma4KvFormat::Fp8E4m3Row256, true>(q, cache, positions, window, scale,
-                                                             out, partial, partial_stats, stream);
-        } else {
-            launch_d512<Gemma4KvFormat::Fp8E4m3Row256>(q, cache, positions, window, scale, out,
-                                                       partial, partial_stats, stream);
-        }
-    } else if (cache.format == Gemma4KvFormat::Int8Group64) {
-        launch_d512<Gemma4KvFormat::Int8Group64>(q, cache, positions, window, scale, out,
-                                                 partial, partial_stats, stream);
-    } else {
-        launch_d512<Gemma4KvFormat::BFloat16>(q, cache, positions, window, scale, out, partial,
-                                              partial_stats, stream);
-    }
+    visit_d512(cache, [&]<Gemma4KvFormat Fmt, bool Fp8Qk, bool RawV>() {
+        launch_d512<Fmt, Fp8Qk, RawV>(
+            q, cache, positions, window, scale, out, partial, partial_stats, stream);
+    });
 }
 
 } // namespace ninfer::ops::detail
