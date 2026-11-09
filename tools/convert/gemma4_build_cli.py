@@ -119,6 +119,12 @@ def build_parser() -> argparse.ArgumentParser:
     add("--model-match", choices=launcher_tools.MODEL_MATCHES, default=launcher_tools.DEFAULT_MODEL_MATCH,
         help="launcher --model-match: any (default) lets OpenAI requests send any model name, as a gateway that "
         "forwards several names needs; exact accepts only --alias and emits no flag")
+    add("--gemma4-qk", choices=launcher_tools.GEMMA4_QKS, default=launcher_tools.DEFAULT_GEMMA4_QK,
+        help="launcher Gemma attention QK precision: bf16 (default; no flag) or fp8 (opt-in: faster long-prompt "
+        "prefill, measurably lower fidelity; needs --kv-dtype fp8)")
+    add("--prefill-chunk", default=launcher_tools.DEFAULT_PREFILL_CHUNK,
+        help="launcher prefill chunk: 128 (default), a multiple of 128 up to 16384, or auto (needs a server build "
+        "that has it)")
     add("--server-exe", type=Path, help="ninfer-spo-serve executable (default: newest build*/apps of the checkout "
         "or ../build-spo-*/apps that knows the preset's format)")
     add("--cuda-bin", type=Path, help="CUDA bin directory the launcher puts on PATH (if the DLLs are not beside the exe)")
@@ -213,7 +219,8 @@ def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings
         raise ValueError("--work-dir must not be the output directory itself")
     alias = args.alias or launcher_tools.default_alias(args.context)
     launcher_tools.check_serve_settings(host=args.host, port=args.port, alias=alias, context=args.context,
-                                        kv_dtype=args.kv_dtype, model_match=args.model_match)
+                                        kv_dtype=args.kv_dtype, model_match=args.model_match,
+                                        gemma4_qk=args.gemma4_qk, prefill_chunk=args.prefill_chunk)
     if args.score and args.no_launcher and args.server_exe is None:
         raise ValueError("--score needs ninfer-spo-perplexity beside the server: pass --server-exe")
     server = args.server_exe.resolve() if args.server_exe else (
@@ -236,7 +243,8 @@ def resolve_config(args: argparse.Namespace) -> tuple[BuildConfig, ServeSettings
         if args.score and server else None, keep_work=args.keep_work,
     )
     serve = ServeSettings(host=args.host, port=args.port, alias=args.alias, context=args.context,
-                          kv_dtype=args.kv_dtype, model_match=args.model_match, server_exe=server,
+                          kv_dtype=args.kv_dtype, model_match=args.model_match, gemma4_qk=args.gemma4_qk,
+                          prefill_chunk=args.prefill_chunk, server_exe=server,
                           cuda_bin=args.cuda_bin,
                           launcher=not args.no_launcher)
     return cfg, serve, server

@@ -145,6 +145,10 @@ python -m tools.convert.gemma4_build launcher --artifact D:\ninfer\my-31b-best-s
   --out serve-rp.cmd --gemma4-qk fp8 --prefill-chunk auto
 ```
 
+The one-command build takes the same two options (`--gemma4-qk bf16|fp8`, `--prefill-chunk 128|<multiple of 128>|auto`)
+and writes them into `serve-<name>.cmd` and the `BUILD-SUMMARY.md` serve command, with the same defaults and refusals;
+without them the launcher is unchanged.
+
 The launcher runs this:
 
 ```text

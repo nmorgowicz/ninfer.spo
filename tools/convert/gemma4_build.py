@@ -157,6 +157,8 @@ class ServeSettings:
     context: int = launcher_tools.DEFAULT_CONTEXT
     kv_dtype: str = "fp8"
     model_match: str = launcher_tools.DEFAULT_MODEL_MATCH
+    gemma4_qk: str = launcher_tools.DEFAULT_GEMMA4_QK
+    prefill_chunk: str = launcher_tools.DEFAULT_PREFILL_CHUNK
     server_exe: Path | None = None
     cuda_bin: Path | None = None
     launcher: bool = True
@@ -563,7 +565,7 @@ def build_info(builder: "Builder") -> dict:
             launcher_tools.serve_argv(
                 server, cfg.artifact, host=settings.host, port=settings.port, alias=alias, context=settings.context,
                 kv_dtype=settings.kv_dtype, mtp=info_artifact.mtp, vision=info_artifact.vision,
-                model_match=settings.model_match,
+                model_match=settings.model_match, gemma4_qk=settings.gemma4_qk, prefill_chunk=settings.prefill_chunk,
             )
         )
     return {
@@ -594,7 +596,7 @@ def finalize(builder: "Builder") -> None:
         launcher_tools.write_launcher(
             cfg.out_dir / f"serve-{cfg.name}.cmd", cfg.artifact, builder.server_exe, host=settings.host,
             port=settings.port, alias=settings.alias, context=settings.context, kv_dtype=settings.kv_dtype,
-            model_match=settings.model_match,
+            model_match=settings.model_match, gemma4_qk=settings.gemma4_qk, prefill_chunk=settings.prefill_chunk,
             cuda_bin=settings.cuda_bin, info=builder.read_artifact_info(), overwrite=True,
         )
     write_summary(builder)

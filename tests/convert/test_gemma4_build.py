@@ -971,6 +971,30 @@ def test_build_summary_serve_command_carries_the_model_match_setting(env):
     assert "--model-match" not in (env.root / "o2" / "serve-ex.cmd").read_text()
 
 
+def test_one_command_build_passes_qk_and_prefill_chunk_to_launcher_and_summary(env, capsys):
+    cfg = env.config("draft")
+    builder, _, _ = make_builder(env, cfg)
+    builder.run()
+    default = (env.out / f"serve-{cfg.name}.cmd").read_bytes()
+    assert b"--gemma4-qk" not in default and b"--prefill-chunk 128 ^" in default
+    fast_cfg = env.config("draft", out_dir=env.root / "o3", work_dir=env.root / "o3" / "w", name="fast")
+    steps = build.build_plan(fast_cfg)
+    build.Builder(
+        fast_cfg, steps, build.build_identity(fast_cfg),
+        serve_settings(env, gemma4_qk="fp8", prefill_chunk="auto"),
+        server_exe=env.server, runner=FakeRunner(fast_cfg, steps), out=lambda line: None,
+        artifact_info=launcher.ArtifactInfo(True, False, 262144),
+    ).run()
+    for text in ((env.root / "o3" / "serve-fast.cmd").read_text(), (env.root / "o3" / "BUILD-SUMMARY.md").read_text()):
+        assert "--kv-dtype fp8 --gemma4-qk fp8" in text and "--prefill-chunk auto" in text
+    args = cli.build_parser().parse_args(env.argv("draft", "--gemma4-qk", "fp8", "--prefill-chunk", "2048"))
+    assert cli.resolve_config(args)[1].gemma4_qk == "fp8"
+    for extra, message in ((("--gemma4-qk", "fp8", "--kv-dtype", "bf16"), "--gemma4-qk fp8 needs --kv-dtype fp8"),
+                           (("--prefill-chunk", "100"), "--prefill-chunk must be")):
+        assert cli.main(env.argv("draft", *extra, "--dry-run", "--yes"), probes=FakeProbes()) == 1
+        assert message in capsys.readouterr().err
+
+
 def test_find_server_exe_prefers_a_build_that_knows_the_format(tmp_path):
     fork = tmp_path / "fork"
     fork.mkdir()
