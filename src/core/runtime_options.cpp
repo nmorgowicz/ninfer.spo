@@ -76,7 +76,7 @@ void log_if_set(const RuntimeSwitches& switches) {
                        switches.expert_cpu_threads == 0 && switches.expert_adapt &&
                        switches.gemma4_attn_split_k && switches.gemma4_attn_segments == 0 &&
                        switches.routing_dump.empty() && !switches.gemma4_attn_raw_v &&
-                       !switches.gemma4_decode_attn_new;
+                       !switches.gemma4_decode_attn_new && !env_present("NINFER_GEMMA4_DECODE_ATTN");
     if (quiet) { return; }
     std::fprintf(stderr, "ninfer switches:");
     if (switches.cuda_sync) { std::fprintf(stderr, " cuda_sync=%s", switches.cuda_sync->c_str()); }
@@ -132,7 +132,7 @@ void log_if_set(const RuntimeSwitches& switches) {
         std::fprintf(stderr, " gemma4_attn_segments=%d", switches.gemma4_attn_segments);
     }
     if (switches.gemma4_attn_raw_v) { std::fprintf(stderr, " gemma4_attn_raw_v=1"); }
-    if (switches.gemma4_decode_attn_new) { std::fprintf(stderr, " gemma4_decode_attn=new"); }
+    std::fprintf(stderr, " gemma4_decode_attn=%s", switches.gemma4_decode_attn_new ? "new" : "old");
     std::fprintf(stderr, "\n");
 }
 
@@ -188,9 +188,9 @@ RuntimeSwitches& mutable_switches() {
         }
         out.gemma4_attn_raw_v = env_flag("NINFER_GEMMA4_ATTN_RAW_V");
         const std::string decode_attn = env_string("NINFER_GEMMA4_DECODE_ATTN");
-        if (decode_attn == "new") {
-            out.gemma4_decode_attn_new = true;
-        } else if (!decode_attn.empty() && decode_attn != "old") {
+        if (decode_attn == "new" || decode_attn == "old") {
+            out.gemma4_decode_attn_new = decode_attn == "new";
+        } else if (!decode_attn.empty()) {
             warn_ignored("NINFER_GEMMA4_DECODE_ATTN", decode_attn.c_str());
         }
         out.routing_dump = env_string("NINFER_ROUTING_DUMP");

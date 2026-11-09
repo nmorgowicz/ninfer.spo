@@ -20,7 +20,7 @@ Serve flags win over the environment for the switches in `src/core/runtime_optio
 | `NINFER_GEMMA4_ATTN_SPLIT_K` | D512 tensor-core attention context splitting (query widths >=64). Enabled by default; `0` or `off` disables it for A/B measurements. The automatic policy minimizes CTA waves per segment over counts 1..8, preferring fewer on ties, then clamps to the descriptor's context/window bound. FP32 partials/maxima/sums are merged without changing the KV format or enabling FP8 QK. |
 | `NINFER_GEMMA4_ATTN_SEGMENTS` | Diagnostic D512 segment override: `1`..`32` pins `grid.z` and bypasses the automatic context/window clamp; `1` means unsplit. Unset, empty, zero, or negative selects automatic policy. Valid integers above 32 clamp to 32; malformed/out-of-int-range values warn and select automatic policy. Ignored when split-K is disabled or query width is below 64. Set before process startup/capture, not during graph replay. |
 | `NINFER_GEMMA4_ATTN_RAW_V` | `1` opts into compact FP8 V staging in global D512 MMA attention (widths >=64). Converts code × FP16 scale in FP32 and rounds to BF16 directly in the consumer registers, preserving the existing V representation and FP32 PV arithmetic while removing the expanded V shared tile (8 KiB less dynamic shared memory). Default off; BF16/INT8 KV, short SIMT and sliding D256 are unchanged. Does not enable FP8 QK. Set before graph capture. Resource diagnostics report CUDA occupancy limits, not guaranteed resident CTAs. |
-| `NINFER_GEMMA4_DECODE_ATTN` | `old` (default) or `new`. Selects the SIMT attention kernel for Gemma 4 decode and MTP-verify widths below 64 on the global D=512 layers (FP8, INT8 and BF16 KV). `new` loads and expands each K/V row once per KV head into shared memory for all query heads of the group (groups up to 8), uses 16-byte loads, prefetches the next 8-key tile before reducing the current one, and picks the key-chunk count so the (token x KV head x chunk) grid fills one wave of 2 CTAs per SM, independent of the live context (capture-safe). Same represented K/V values, same partial/stat contract and workspace rules; scores and the softmax reduce in a different FP32 order, so outputs match `old` to FP32 rounding, not bitwise. Sliding D256 layers, widths >=64, and groups wider than 8 keep the original kernel. Unrecognized values warn and select `old`. Set before graph capture. Not yet measured on a GPU. |
+| `NINFER_GEMMA4_DECODE_ATTN` | `new` (default) or explicit `old` for comparison. Selects SIMT attention for Gemma 4 global D512 query widths below 64 (FP8, INT8 and BF16 KV, groups up to 8). The shared-KV kernel loads/expands each row once per KV head, uses 16-byte loads and tile prefetch, and fixes the chunk count per capture. Represented K/V values are unchanged; FP32 reduction order differs, so results are not bitwise identical. Sliding D256, widths >=64 and groups wider than 8 retain their existing paths. Invalid values warn and retain the default. Set before graph capture. Qualification scope and measurements are below. |
 | `NINFER_EXPERT_VRAM_GIB` | Flash-Next only. GiB of VRAM for the hottest routed experts. Decode computes a miss on the CPU. Prefill copies the misses a layer needs into a VRAM scratch, then runs the GPU kernels. `0` or unset keeps every expert in VRAM. The cold copy is pinned and counts toward `NINFER_PIN_CEILING_GIB`. |
 | `NINFER_EXPERT_PROFILE` | Path of a JSON file whose integers are `[layer, expert]` pairs, hottest first. Used only with `NINFER_EXPERT_VRAM_GIB`. Missing or empty falls back to expert-id order. |
 | `NINFER_EXPERT_CPU_THREADS` | Workers for the CPU experts. Default 8. |
@@ -430,3 +430,30 @@ capture. Functional fit does not establish model quality or vision support.
 ## CLI
 
 `ninfer-spo` takes the artifact path first. Flags that also exist on the server mean the same thing. The CLI-only flags are `--prompt`, `--messages`, `--max-new` (default 128), `--grammar-file`, `--json-object`, `--json-schema-file`, `--regex`, `--choice`, `--raw-output`, `--print-token-ids`, `--thinking-budget`, `--reasoning-effort`, `--stop`, `--reasoning-stop`, and `--stop-token-id`. Its context and KV defaults are 2048, and its prefill chunk default is 1024. The definitions are in `apps/cli/options.h`.
+
+## Default shared-KV Gemma decode kernel
+
+The global D512 small-width shared-KV kernel is the default after RTX 5090 qualification on one
+GPTQ-g256 Gemma fine-tune. Explicit `NINFER_GEMMA4_DECODE_ATTN=old` retains the original comparison path;
+unset/new selects the qualified path. This changes reduction order, not KV/QK precision.
+
+Same-session no-MTP HTTP ABAB, FP8 KV/FP8 QK/chunk auto: decode 46.59→57.53 tok/s at ~32k
+and 30.64→49.26 at ~100k. A separate old/new d1 pair measured 78.63→102.25 and 46.14→81.75;
+sampling/output/acceptance and system state affect rates, so do not compare absolute values across those campaigns.
+D1 acceptance at100k was74.83%/74.60%; shorter-context candidate acceptance was3–5 percentage points lower
+on divergent greedy outputs, despite faster decode. No universal acceptance-equivalence claim.
+
+Six attention/FP8/INT8 correctness invocations passed, including graph replay and partial/empty partitions.
+Teacher-forced chunk16 English/code scoring at512/32768 context passed the predeclared mean-NLL
+limit: new minus old-repeat <=0.001 nat/token in every cell, about98k scored positions per cell.
+The largest observed increase beyond repeat was0.000461 nat/token.
+Top-1 changes exceed repeat noise; this is bounded likelihood qualification, not bitwise or semantic equivalence.
+Generation checks passed30/30 retrieval and10/10 Python/JSON integrity cases per arm; Python was parsed, not executed.
+
+With d1, both kernels retained131072 native KV capacity. New generated2048/4096 tokens near125k without
+CUDA/OOM errors; sampled peak memory27917 versus27882 MiB old. Six abort/recovery trials per mode passed;
+new prefill cancellation0.219–0.756s and decode0.003–0.025s from logged completion after socket abort.
+One early generation ended normally; the existing retry reached its2048-token budget.
+Prompt-over-capacity still returns400; excessive output budgets are clamped, not rejected.
+No claim for other GPUs, artifacts, all tasks or sanitizer coverage.
+

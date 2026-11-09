@@ -162,6 +162,12 @@ ninfer-spo-serve <file>.ninfer --host 127.0.0.1 --port 8080 --model-id 131k --mo
 vision tower. The launcher command accepts `--draft-tokens auto|1..7`, default `1`. Explicit `auto` uses six
 drafts for Gemma and can hurt long-context speed; one draft is the conservative roleplay default.
 
+Qualified builds use the shared-KV global D512 decode kernel by default; no launcher flag is needed.
+`NINFER_GEMMA4_DECODE_ATTN=old` selects the original path for comparison before process startup.
+It changes reduction order, not KV/QK precision; measured gains and qualification limits are in
+[configuration.md](configuration.md#default-shared-kv-gemma-decode-kernel).
+
+
 After it starts, read the startup log: the line that begins `capacity | KV` shows how many tokens of context really fit.
 The model list can show more than the pool actually holds.
 
