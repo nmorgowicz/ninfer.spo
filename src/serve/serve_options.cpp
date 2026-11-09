@@ -128,7 +128,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--model-match exact|any] [--max-context N] [--kv-capacity N|auto] "
            "[--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N|auto] [--log-stats-interval-ms N] [--device N] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
@@ -172,6 +172,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
+           "       --prefill-chunk auto is Gemma4-only: selects 2048/1024/512/256/128 after "
+           "weights load without shrinking requested context or sizing headroom\n"
            "       --no-prefix-reuse disables cross-request history; request pause/replay "
            "resources remain available\n"
            "       context defaults: device-state=max-concurrency; Host budget is resolved from "
@@ -247,8 +249,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
         } else if (arg == "--prefill-chunk") {
-            options.prefill_chunk = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+            const char* text = require_value("--prefill-chunk");
+            if (std::string_view(text) == "auto") {
+                options.prefill_chunk = kAutoPrefillChunk;
+            } else {
+                const int chunk = parse_nonnegative_int(text, "prefill-chunk");
+                if (chunk == 0) {
+                    throw std::invalid_argument("--prefill-chunk must be auto or a positive multiple of 128");
+                }
+                options.prefill_chunk = static_cast<std::uint32_t>(chunk);
+            }
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {
@@ -468,8 +478,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
     }
-    if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
-        throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+    if (options.prefill_chunk % 128 != 0) {
+        throw std::invalid_argument("--prefill-chunk must be auto or a positive multiple of 128");
     }
     product::apply_speculative_cli_defaults(options.speculative);
     product::validate_speculative_cli_options(options.speculative);

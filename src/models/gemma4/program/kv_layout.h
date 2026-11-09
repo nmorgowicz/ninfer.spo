@@ -112,4 +112,62 @@ struct KvPageCapacity {
             static_cast<std::uint32_t>(spare_pages * page)};
 }
 
+struct PrefillBudget {
+    std::uint32_t chunk = 0;
+    std::size_t fixed_bytes = 0;
+    std::size_t fit_tokens = 0;
+};
+
+// fixed_bytes must use the Program's real workspace/ring/snapshot accounting for each width.
+// Auto reserves the entire page-rounded caller context before considering a wider chunk.
+// Explicit widths bypass selection and retain the existing KV-capacity policy behavior.
+template<class FixedBytes>
+[[nodiscard]] PrefillBudget prefill_budget(std::uint32_t requested_chunk,
+                                           std::uint32_t max_context,
+                                           std::size_t free_bytes,
+                                           std::size_t headroom_bytes,
+                                           std::size_t per_token,
+                                           FixedBytes&& fixed_bytes) {
+    if (per_token == 0) {
+        throw std::invalid_argument("gemma4 needs at least one global KV layer");
+    }
+    const auto budget_for = [&](std::uint32_t chunk) {
+        const std::size_t fixed = fixed_bytes(chunk);
+        const std::size_t fit =
+            free_bytes >= fixed && free_bytes - fixed >= headroom_bytes
+                ? (free_bytes - fixed - headroom_bytes) / per_token : 0;
+        return PrefillBudget{chunk, fixed, fit};
+    };
+    if (requested_chunk != kAutoPrefillChunk) { return budget_for(requested_chunk); }
+    constexpr std::uint64_t page = ops::kGemma4KvPageTokens;
+    const std::uint64_t required_tokens =
+        ((static_cast<std::uint64_t>(max_context) + page - 1U) / page) * page;
+    for (const std::uint32_t chunk : {2048U, 1024U, 512U, 256U, 128U}) {
+        const auto budget = budget_for(chunk);
+        if (required_tokens != 0 && budget.fit_tokens >= required_tokens) { return budget; }
+    }
+    throw std::invalid_argument(
+        "gemma4 --prefill-chunk auto: no candidate (2048/1024/512/256/128) fits the "
+        "requested max_context with current headroom; reduce max_context explicitly or free "
+        "device memory");
+}
+
+// Auto chunking must not inherit automatic KV sizing's context-shrinking behavior.
+[[nodiscard]] inline KvPageCapacity prefill_kv_capacity(const KvCapacityPolicy& policy,
+                                                        std::uint32_t max_context,
+                                                        std::uint64_t native_context,
+                                                        std::uint64_t fit_tokens,
+                                                        std::uint32_t slots,
+                                                        bool automatic_chunk) {
+    const auto sizing_policy = automatic_chunk && policy.mode == KvCapacityMode::Automatic
+                                   ? KvCapacityPolicy::explicit_capacity(max_context) : policy;
+    const auto capacity =
+        kv_page_capacity(sizing_policy, max_context, native_context, fit_tokens, slots);
+    if (automatic_chunk && capacity.tokens < max_context) {
+        throw std::invalid_argument(
+            "gemma4 --prefill-chunk auto requires KV capacity for the full requested max_context");
+    }
+    return capacity;
+}
+
 } // namespace ninfer::models::gemma4

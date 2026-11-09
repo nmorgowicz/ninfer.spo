@@ -383,21 +383,31 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
     const std::uint32_t explicit_pages =
         options.kv_capacity.mode == KvCapacityMode::Explicit
             ? (options.kv_capacity.explicit_tokens + 63U) / 64U : 0U;
-    const std::size_t fixed = models::gemma4::Program::fixed_bytes(
-        *loaded, options.prefill_chunk, slots, explicit_pages);
+    const bool automatic_chunk = options.prefill_chunk == kAutoPrefillChunk;
     const std::size_t per_token =
         models::gemma4::Program::kv_bytes_per_token(*loaded, options.kv_cache);
-    if (per_token == 0) {
-        throw std::invalid_argument("gemma4 needs at least one global KV layer");
+    models::gemma4::PrefillBudget prefill;
+    try {
+        prefill = models::gemma4::prefill_budget(
+            options.prefill_chunk, options.max_context, free_bytes, kHeadroom, per_token,
+            [&](std::uint32_t chunk) {
+                return models::gemma4::Program::fixed_bytes(*loaded, chunk, slots, explicit_pages);
+            });
+    } catch (const std::invalid_argument& error) {
+        throw std::invalid_argument(
+            std::string(error.what()) + " (device free after weights " +
+            std::to_string(free_bytes) + " B, headroom " + std::to_string(kHeadroom) +
+            " B, KV " + std::to_string(per_token) + " B/token, max_context " +
+            std::to_string(options.max_context) + ")");
     }
-    // Headroom also covers lazy prefill/decode/MTP graph instantiation and small allocations.
-    const std::size_t fit = free_bytes > fixed && free_bytes - fixed > kHeadroom
-                               ? (free_bytes - fixed - kHeadroom) / per_token : 0;
+    options.prefill_chunk = prefill.chunk;
+    const std::size_t fixed = prefill.fixed_bytes;
+    const std::size_t fit = prefill.fit_tokens;
     const std::uint32_t requested_context = options.max_context;
     models::gemma4::KvPageCapacity capacity;
     try {
-        capacity = models::gemma4::kv_page_capacity(options.kv_capacity, requested_context,
-                                                    native_context, fit, slots);
+        capacity = models::gemma4::prefill_kv_capacity(
+            options.kv_capacity, requested_context, native_context, fit, slots, automatic_chunk);
     } catch (const std::invalid_argument& error) {
         constexpr double kMiB = 1048576.0;
         throw std::invalid_argument(
@@ -407,8 +417,16 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
             std::to_string(static_cast<double>(kHeadroom) / kMiB) + " MiB, KV " +
             std::to_string(per_token) + " B/token)");
     }
-    options.max_context = capacity.tokens;
+    if (!automatic_chunk) { options.max_context = capacity.tokens; }
     const auto extra_tokens = capacity.extra_tokens;
+    if (automatic_chunk) {
+        std::clog << "gemma4 prefill chunk auto: selected " << options.prefill_chunk
+                  << " tokens; device free after weights " << free_bytes
+                  << " B, fixed rings+workspace+snapshots " << fixed << " B, headroom "
+                  << kHeadroom << " B, KV " << per_token << " B/token, max_context "
+                  << options.max_context << ", KV capacity " << capacity.tokens
+                  << ", checkpoint spare tokens " << extra_tokens << '\n';
+    }
     auto program = std::make_unique<models::gemma4::Program>(
         *loaded, options.max_context, options.prefill_chunk, draft_tokens, device.stream,
         models::gemma4::CacheBudget{.history      = history.enabled,
@@ -464,6 +482,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
     const auto architecture = peek_architecture(reader);
+    validate_prefill_chunk_architecture(options.prefill_chunk,
+                                         architecture == models::Architecture::Gemma4);
     validate_gemma4_qk(options.gemma4_qk, options.kv_cache,
                       architecture == models::Architecture::Gemma4);
     if (architecture == models::Architecture::Qwen3_8FlashNext) {

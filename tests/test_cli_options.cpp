@@ -33,6 +33,36 @@ int check(bool condition, const char* message) {
 
 int main() {
     int failures      = 0;
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).prefill_chunk ==
+                          1024, "prefill chunk default changed");
+    const auto auto_chunk = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                   "--prefill-chunk", "auto", "--max-context", "8192",
+                                   "--kv-capacity", "auto", "--kv-headroom-mib", "512",
+                                   "--kv-dtype", "fp8", "--gemma4-qk", "fp8",
+                                   "--spec", "mtp", "--draft-tokens", "3", "--no-cuda-graph"});
+    failures += check(auto_chunk.prefill_chunk == ninfer::kAutoPrefillChunk &&
+                          auto_chunk.max_context == 8192 &&
+                          auto_chunk.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          auto_chunk.kv_capacity.automatic_headroom_bytes == (512ULL << 20) &&
+                          auto_chunk.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256 &&
+                          auto_chunk.gemma4_qk == ninfer::ops::Gemma4QkMode::Fp8 &&
+                          auto_chunk.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          auto_chunk.speculative.draft_tokens == 3 && !auto_chunk.use_cuda_graph,
+                      "CLI auto prefill lost caller context, precision, spec or graph settings");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                             "--prefill-chunk", "auto", "--prefill-chunk", "384"}).prefill_chunk ==
+                          384, "explicit prefill integer did not replace auto request");
+    for (const auto value : {"0", "127", "-128", "AUTO", "auto!", "4294967296", ""}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                         "--prefill-chunk", value});
+        }), "invalid CLI prefill chunk accepted");
+    }
+    failures += check(rejects([] {
+        (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--prefill-chunk"});
+    }), "missing CLI prefill value accepted");
+    failures += check(ninfer::cli::usage_text("ninfer-cli").find("--prefill-chunk N|auto") !=
+                          std::string::npos, "CLI help omits auto prefill chunk");
     using Qk = ninfer::ops::Gemma4QkMode;
     failures += check(parse({"ninfer", "model.ninfer", "--prompt", "hello"}).gemma4_qk == Qk::BFloat16, "Gemma QK default changed");
     for (const auto& mode : {"bf16", "fp8"}) {

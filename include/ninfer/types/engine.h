@@ -72,6 +72,16 @@ enum class KvCapacityMode : std::uint8_t {
 
 inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
 
+// Keep integer assignments source-compatible. Zero is an explicit Gemma4-only request to
+// choose a width after weights load; Engine::options() returns the resolved positive width.
+inline constexpr std::uint32_t kAutoPrefillChunk = 0;
+
+inline void validate_prefill_chunk_architecture(std::uint32_t chunk, bool gemma4) {
+    if (chunk == kAutoPrefillChunk && !gemma4) {
+        throw std::invalid_argument("--prefill-chunk auto is supported only for Gemma4");
+    }
+}
+
 struct KvCapacityPolicy {
     KvCapacityMode mode                  = KvCapacityMode::Explicit;
     std::uint32_t explicit_tokens        = 2048;
@@ -219,6 +229,7 @@ struct EngineOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
+    // Positive integer: fixed width (default unchanged). kAutoPrefillChunk: opt-in Gemma4 sizing.
     std::uint32_t prefill_chunk        = 1024;
     // CausalScoring only: nonzero replaces the default 3 GiB device headroom used to size KV.
     std::size_t scoring_headroom_bytes = 0;

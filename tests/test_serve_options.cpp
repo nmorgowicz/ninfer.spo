@@ -29,6 +29,41 @@ ServeOptions parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures = 0;
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).prefill_chunk == 1024,
+                      "serving prefill chunk default changed");
+    const auto auto_chunk = parse({"ninfer-serve", "model.ninfer", "--prefill-chunk", "auto",
+                                   "--max-context", "8192", "--kv-capacity", "auto",
+                                   "--kv-headroom-mib", "512", "--kv-dtype", "fp8",
+                                   "--gemma4-qk", "fp8", "--spec", "mtp", "--draft-tokens", "3",
+                                   "--device-state-slots", "2", "--host-context-mib", "64",
+                                   "--no-prefix-reuse", "--no-cuda-graph"});
+    failures += check(auto_chunk.prefill_chunk == ninfer::kAutoPrefillChunk &&
+                          auto_chunk.max_context == 8192 &&
+                          auto_chunk.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          auto_chunk.kv_capacity.automatic_headroom_bytes == (512ULL << 20) &&
+                          auto_chunk.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256 &&
+                          auto_chunk.gemma4_qk == ninfer::ops::Gemma4QkMode::Fp8 &&
+                          auto_chunk.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          auto_chunk.speculative.draft_tokens == 3 &&
+                          auto_chunk.context_cache.device_state_slots == 2 &&
+                          auto_chunk.context_cache.host_capacity_bytes == (64ULL << 20) &&
+                          !auto_chunk.context_cache.enabled && !auto_chunk.use_cuda_graph,
+                      "serving auto prefill changed caller context, precision, spec or checkpoints");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-chunk", "auto",
+                             "--prefill-chunk", "384"}).prefill_chunk == 384,
+                      "serving explicit prefill integer did not replace auto request");
+    for (const auto value : {"0", "127", "-128", "AUTO", "auto!", "4294967296", ""}) {
+        bool rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--prefill-chunk", value}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid serving prefill chunk accepted");
+    }
+    bool missing_chunk = false;
+    try { (void)parse({"ninfer-serve", "model.ninfer", "--prefill-chunk"}); }
+    catch (const std::invalid_argument&) { missing_chunk = true; }
+    failures += check(missing_chunk, "missing serving prefill chunk accepted");
+    failures += check(serve_usage_text("ninfer-serve").find("--prefill-chunk N|auto") !=
+                          std::string::npos, "serving help omits auto prefill chunk");
     using Qk = ninfer::ops::Gemma4QkMode;
     failures += check(parse({"ninfer-serve", "model.ninfer"}).gemma4_qk == Qk::BFloat16, "Gemma QK default changed");
     for (const auto& mode : {"bf16", "fp8"}) {

@@ -13,11 +13,84 @@ template<class F> void rejects(F&& operation, const char* label) {
     try { operation(); check(false, label); }
     catch (const std::invalid_argument&) {}
 }
+
+void prefill_auto_selection_thresholds() {
+    using namespace ninfer;
+    namespace g4 = models::gemma4;
+    constexpr std::size_t headroom = 4096;
+    constexpr std::size_t per_token = 16;
+    constexpr std::uint32_t context = 4096;
+    const auto fixed = [](std::uint32_t chunk) { return std::size_t{chunk} * 32; };
+    const std::uint32_t ladder[] = {2048, 1024, 512, 256, 128};
+    for (int i = 0; i < 5; ++i) {
+        const auto width = ladder[i];
+        const auto threshold = fixed(width) + headroom + context * per_token;
+        const auto selected =
+            g4::prefill_budget(kAutoPrefillChunk, context, threshold, headroom, per_token, fixed);
+        check(selected.chunk == width && selected.fixed_bytes == fixed(width) &&
+                  selected.fit_tokens == context, "auto exact selection threshold");
+        if (i < 4) {
+            check(g4::prefill_budget(kAutoPrefillChunk, context, threshold - 1,
+                                     headroom, per_token, fixed).chunk == ladder[i + 1],
+                  "auto one byte below selection threshold");
+        } else {
+            rejects([&] {
+                (void)g4::prefill_budget(kAutoPrefillChunk, context, threshold - 1,
+                                         headroom, per_token, fixed);
+            }, "auto cannot shrink context to fit minimum width");
+        }
+    }
+    for (const auto free : {std::size_t{0}, headroom - 1}) {
+        rejects([&] { (void)g4::prefill_budget(kAutoPrefillChunk, context, free,
+                                               headroom, per_token, fixed); },
+                "auto subtraction cannot underflow");
+    }
+    const auto explicit_width =
+        g4::prefill_budget(384, context, 0, headroom, per_token, fixed);
+    check(explicit_width.chunk == 384 && explicit_width.fixed_bytes == fixed(384) &&
+              explicit_width.fit_tokens == 0, "explicit integer bypasses auto ladder");
+    rejects([&] { (void)g4::prefill_budget(kAutoPrefillChunk, context, 1000000,
+                                           headroom, 0, fixed); },
+            "zero KV byte cost rejected");
+    validate_prefill_chunk_architecture(kAutoPrefillChunk, true);
+    validate_prefill_chunk_architecture(1024, false);
+    bool clear_rejection = false;
+    try { validate_prefill_chunk_architecture(kAutoPrefillChunk, false); }
+    catch (const std::invalid_argument& error) {
+        clear_rejection = std::string_view(error.what()).find("only for Gemma4") !=
+                          std::string_view::npos;
+    }
+    check(clear_rejection, "non-Gemma auto rejected clearly");
+}
+
+void prefill_auto_capacity_policy() {
+    using namespace ninfer;
+    namespace g4 = models::gemma4;
+    const auto policy = KvCapacityPolicy::automatic(12345);
+    const auto capacity = g4::prefill_kv_capacity(policy, 65, 262144, 256, 1, true);
+    check(capacity.tokens == 128 && capacity.extra_tokens == 128 &&
+              policy.mode == KvCapacityMode::Automatic &&
+              policy.automatic_headroom_bytes == 12345,
+          "auto chunk preserves full non-page-aligned context, checkpoint pool and KV policy");
+    rejects([&] { (void)g4::prefill_kv_capacity(policy, 4096, 262144, 4095, 0, true); },
+            "auto KV policy cannot shrink requested context for auto chunk");
+    check(g4::prefill_kv_capacity(policy, 4096, 262144, 4095, 0, false).tokens == 4032,
+          "explicit chunk retains existing auto KV context behavior");
+    rejects([&] {
+        (void)g4::prefill_kv_capacity(KvCapacityPolicy::explicit_capacity(64),
+                                     128, 262144, 256, 0, true);
+    }, "auto chunk rejects explicit KV capacity smaller than caller context");
+    check(g4::prefill_kv_capacity(KvCapacityPolicy::explicit_capacity(4096),
+                                  4096, 262144, 8192, 1, true).extra_tokens == 4096,
+          "auto chunk retains requested checkpoint slot budget");
+}
 }
 
 int main() {
     using namespace ninfer;
     namespace g4 = models::gemma4;
+    prefill_auto_selection_thresholds();
+    prefill_auto_capacity_policy();
     const auto bf16 = g4::kv_layer_layout(KvCacheStorage::BFloat16, true, 512, 4);
     const auto fp8 = g4::kv_layer_layout(KvCacheStorage::Fp8E4M3Row256, true, 512, 4);
     const auto sliding = g4::kv_layer_layout(KvCacheStorage::Fp8E4M3Row256, false, 256, 16);
@@ -74,6 +147,25 @@ int main() {
     const auto fixed = g4::Program::fixed_bytes(model, 128, 0);
     const auto snapshots = g4::Program::fixed_bytes(model, 128, 1) - fixed;
     check(snapshots == (900ULL << 20), "one slot retains the unquantized 18-page ring snapshot");
+    for (const auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4M3Row256,
+                               KvCacheStorage::Int8Group64}) {
+        const auto per_token = g4::Program::kv_bytes_per_token(model, storage);
+        constexpr std::size_t headroom = 1ULL << 30;
+        constexpr std::uint32_t context = 8192;
+        const auto actual_fixed = [&](std::uint32_t chunk) {
+            return g4::Program::fixed_bytes(model, chunk, 1, context / 64);
+        };
+        const auto free = actual_fixed(512) + headroom + context * per_token;
+        const auto selected = g4::prefill_budget(kAutoPrefillChunk, context, free,
+                                                 headroom, per_token, actual_fixed);
+        check(selected.chunk == 512 && selected.fixed_bytes == actual_fixed(512) &&
+                  selected.fit_tokens == context,
+              "auto consumes actual Program fixed bytes and chosen KV precision");
+        const auto preserved = g4::prefill_kv_capacity(KvCapacityPolicy::automatic(headroom),
+                                                       context, 262144, selected.fit_tokens, 1, true);
+        check(preserved.tokens == context && preserved.extra_tokens == 0,
+              "real Program budget cannot consume reserved headroom or shrink context");
+    }
 
     const auto automatic = KvCapacityPolicy::automatic();
     const auto rounded = g4::kv_page_capacity(KvCapacityPolicy::explicit_capacity(65),

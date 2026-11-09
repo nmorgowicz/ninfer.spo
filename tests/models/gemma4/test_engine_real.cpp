@@ -475,6 +475,58 @@ bool usable(const char* path) {
     return path != nullptr && path[0] != '\0' && std::ifstream(path).good();
 }
 
+// Standalone quantized-artifact smoke path for constrained GPUs; no BF16 fixture requirement.
+void prefill_auto_smoke(const char* artifact, ninfer::KvCacheStorage storage, bool mtp) {
+    ninfer::EngineOptions options;
+    options.artifact_path = artifact;
+    options.max_context = 8192;
+    options.kv_capacity = ninfer::KvCapacityPolicy::automatic();
+    options.prefill_chunk = ninfer::kAutoPrefillChunk;
+    options.kv_cache = storage;
+    options.context_cache.device_state_slots = 1;
+    options.context_cache.host_capacity_bytes = 0;
+    options.use_cuda_graph = false;
+    if (mtp) {
+        options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens = 3;
+    }
+    ninfer::Engine engine(options);
+    const auto& resolved = engine.options();
+    const auto memory = engine.memory_summary();
+    check(resolved.prefill_chunk == 2048 || resolved.prefill_chunk == 1024 ||
+              resolved.prefill_chunk == 512 || resolved.prefill_chunk == 256 ||
+              resolved.prefill_chunk == 128, "auto resolves to a ladder width");
+    check(resolved.max_context == options.max_context &&
+              memory.max_context == options.max_context, "auto preserves requested context");
+    check(resolved.kv_cache == storage &&
+              resolved.gemma4_qk == ninfer::ops::Gemma4QkMode::BFloat16 &&
+              resolved.speculative.backend == options.speculative.backend &&
+              resolved.speculative.draft_tokens == options.speculative.draft_tokens &&
+              resolved.context_cache.device_state_slots == 1 &&
+              resolved.context_cache.host_capacity_bytes == 0 && !resolved.use_cuda_graph,
+          "auto preserves precision, speculative and checkpoint settings");
+    check(memory.kv_capacity_headroom_bytes ==
+              options.kv_capacity.automatic_headroom_bytes &&
+              memory.planned_slack_bytes >= memory.kv_capacity_headroom_bytes,
+          "auto preserves conservative headroom in memory ledger");
+    std::string text = "Remember the secret word BLUEBERRY.\n";
+    for (int i = 0; i < 220; ++i) {
+        text += "The quick brown fox jumps over the lazy dog near the river.\n";
+    }
+    text += "What is the secret word? Answer with the word only.";
+    const auto prepared = engine.prepare(chat(text));
+    check(prepared.summary().prompt_tokens > resolved.prefill_chunk,
+          "auto smoke prompt spans multiple selected chunks");
+    const auto result = engine.generate(engine.prepare(chat(text)), greedy(16));
+    check(!result.generated_token_ids.empty() &&
+              (result.content.find("BLUEBERRY") != std::string::npos ||
+               result.content.find("Blueberry") != std::string::npos),
+          "auto selected width executes multi-chunk generation");
+    std::cout << "auto width " << resolved.prefill_chunk << ", context " << resolved.max_context
+              << ", free after weights " << memory.available_after_weights_bytes
+              << ", headroom " << memory.kv_capacity_headroom_bytes << '\n';
+}
+
 } // namespace
 
 std::vector<std::uint8_t> solid_ppm(std::uint8_t r, std::uint8_t g, std::uint8_t b) {
@@ -523,7 +575,32 @@ void vision_checks(const char* artifact) {
           "vision answers red");
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc >= 2 && std::string_view(argv[1]) == "--prefill-auto-smoke") {
+        try {
+            if (argc < 3 || argc > 5) {
+                throw std::invalid_argument(
+                    "usage: --prefill-auto-smoke ARTIFACT [bf16|fp8|int8] [mtp]");
+            }
+            const std::string_view format = argc >= 4 ? argv[3] : "fp8";
+            auto storage = ninfer::KvCacheStorage::Fp8E4M3Row256;
+            if (format == "bf16") {
+                storage = ninfer::KvCacheStorage::BFloat16;
+            } else if (format == "int8") {
+                storage = ninfer::KvCacheStorage::Int8Group64;
+            } else if (format != "fp8") {
+                throw std::invalid_argument("expected bf16, fp8 or int8 KV");
+            }
+            if (argc == 5 && std::string_view(argv[4]) != "mtp") {
+                throw std::invalid_argument("expected mtp as final smoke argument");
+            }
+            prefill_auto_smoke(argv[2], storage, argc == 5);
+        } catch (const std::exception& error) {
+            std::cerr << "EXC " << error.what() << '\n';
+            return 1;
+        }
+        return failures ? 1 : 0;
+    }
     const char* artifact = std::getenv("NINFER_GEMMA4_WEIGHTS");
     const char* mtp      = std::getenv("NINFER_GEMMA4_MTP_WEIGHTS");
     const char* vision   = std::getenv("NINFER_GEMMA4_VISION_WEIGHTS");

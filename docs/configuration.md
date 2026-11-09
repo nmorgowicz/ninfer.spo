@@ -85,7 +85,7 @@ The engine does not read these. The scripts, tests, and probes that do are named
 | `--max-concurrency` | 1 | Resident lanes. The engine caps this at 8. `scripts/serve.cmd` passes 3. |
 | `--max-pending-requests` | 16 | Queue length. |
 | `--pending-timeout-ms` | 30000 | How long a queued request waits. |
-| `--prefill-chunk` | 1024 | Prefill unit size, a multiple of 128. `scripts/serve.cmd` passes 8192. |
+| `--prefill-chunk` | 1024 | Positive multiple of 128, or explicit Gemma-only `auto`. An integer bypasses automatic selection. `scripts/serve.cmd` passes 8192. |
 | `--capture-path` | | Directory for activation captures. A request records only when its JSON sets `capture.record` to true. The record id comes back as `capture.record_id` on the chat completion, the responses object, the last streamed chat chunk, and the Anthropic message. Capture turns do not reuse another request's prefix. |
 | `--capture-sites` | `prompt_last,completion_last` | Which positions to record. Each site is `prompt_last` or `completion_last`. |
 | `--steering-pack` | | Steering pack to load at startup. A request may set `steering.strength` in `[0,1]`. |
@@ -129,6 +129,32 @@ The engine does not read these. The scripts, tests, and probes that do are named
 | `--host-ram-budget-gib` | 200 | `0` skips the host RAM check. |
 
 `ninfer-spo`, `ninfer-spo-perplexity`, and `ninfer_bench` resolve the NUMA node the same way and tune the process before loading. `ninfer-spo` and `ninfer_bench` also take the four host flags above.
+
+### Gemma 4 automatic prefill width
+
+CLI and serving accept explicit `--prefill-chunk auto`; the default remains
+1024. After loading weights, Gemma chooses the largest fitting candidate from
+2048, 1024, 512, 256 and 128. Selection uses the Program's actual fixed
+workspace/ring/device-snapshot reservation at each width, the selected KV
+format's per-token bytes, and the existing minimum of CUDA/NVML free-memory
+probes. It retains the current headroom contract: 3 GiB when the policy has
+no override; the existing automatic-KV reservation (including its 1 GiB
+default) or an explicit scoring reservation takes precedence.
+
+Every candidate must fit the full page-rounded requested `--max-context`.
+Even with `--kv-capacity auto`, this mode fails rather than reducing context
+to obtain a wider chunk. Precision, QK, speculative decoding, checkpoint
+slots, host cache and graph settings remain the caller's. Spare checkpoint
+pages use the remaining budget under the existing cap. Startup logs the
+selected width, after-weights free bytes, fixed bytes, headroom, KV bytes per
+token, unchanged context and spare tokens. This is a memory-fit policy,
+not a throughput autotuner or model-quality qualification.
+
+An explicit integer retains the previous integer/KV sizing behavior.
+Non-Gemma models reject the new `auto` request; their existing integer paths
+and defaults are unchanged. Engine callers may request `kAutoPrefillChunk`;
+after successful construction `Engine::options().prefill_chunk` contains the
+resolved positive integer. CLI literal `0` is not an alias for `auto`.
 
 ### Experimental Gemma 4 FP8 KV
 
