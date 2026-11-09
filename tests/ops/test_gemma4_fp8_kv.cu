@@ -761,7 +761,7 @@ int attention_benchmark(int history, int Chunk) {
                   << " occupancy_source=cuda_runtime_limit_not_measured\n";
     }
     std::vector<float> timings[ModeCount];
-    for (int sample = 0; sample < Samples; ++sample) {
+    for (int sample = 0; sample < Samples && Chunk >= 64; ++sample) {
         for (int order = 0; order < ModeCount; ++order) {
             const int mode = (sample + order) % ModeCount;
             cuda_check(cudaEventRecord(begin, stream), "cudaEventRecord");
@@ -776,7 +776,7 @@ int attention_benchmark(int history, int Chunk) {
                       << " repetitions=" << Repetitions << " ms_per_op=" << ms / Repetitions << '\n';
         }
     }
-    for (int mode = 0; mode < ModeCount; ++mode) {
+    for (int mode = 0; mode < ModeCount && Chunk >= 64; ++mode) {
         std::sort(timings[mode].begin(), timings[mode].end());
         std::cout << "GEMMA4_QK_EVENT_MEDIAN history=" << history << " chunk=" << Chunk
                   << " q_heads=" << QHeads << " kv_heads=" << KvHeads << " mode=" << labels[mode]
@@ -821,8 +821,58 @@ int attention_benchmark(int history, int Chunk) {
                       << " rms_error=" << std::sqrt(squared / sampled.size()) << '\n';
         }
     }
+    const bool saved_decode_new = runtime_switches().gemma4_decode_attn_new;
+    if (Chunk < 64) {
+        // Decode / MTP-verify widths run the SIMT kernels; the QK/raw-V modes above do not
+        // apply. Time the original and the KV-head-shared kernel on identical inputs in this
+        // process, alternating pair order, and check that the outputs agree.
+        constexpr int ab_formats[]{0, 1}; // BF16 and FP8 KV (QK mode is ignored below width 64)
+        for (int mode : ab_formats) {
+            std::vector<float> ab_times[2];
+            std::vector<double> ab_output[2];
+            for (int sample = 0; sample < Samples; ++sample) {
+                for (int order = 0; order < 2; ++order) {
+                    const int variant = (sample + order) % 2; // 0 = old, 1 = new
+                    RuntimeSwitchFlags flags;
+                    flags.gemma4_decode_attn_new = variant == 1;
+                    apply_runtime_switch_flags(flags);
+                    cuda_check(cudaEventRecord(begin, stream), "cudaEventRecord");
+                    for (int repeat = 0; repeat < Repetitions; ++repeat) { launch(mode); }
+                    cuda_check(cudaEventRecord(end, stream), "cudaEventRecord");
+                    cuda_check(cudaEventSynchronize(end), "cudaEventSynchronize");
+                    float ms = 0.0f;
+                    cuda_check(cudaEventElapsedTime(&ms, begin, end), "cudaEventElapsedTime");
+                    ab_times[variant].push_back(ms / Repetitions);
+                }
+            }
+            for (int variant = 0; variant < 2; ++variant) {
+                RuntimeSwitchFlags flags;
+                flags.gemma4_decode_attn_new = variant == 1;
+                apply_runtime_switch_flags(flags);
+                launch(mode);
+                cuda_synchronize(stream);
+                ab_output[variant] = from_device_bf16(output.p, query.size());
+                std::sort(ab_times[variant].begin(), ab_times[variant].end());
+            }
+            failures += verify_pointwise("decode new versus old kernel", ab_output[1], ab_output[0],
+                                         PointwiseCriterion{2.0e-5, 8.0e-3});
+            const float old_ms = ab_times[0][Samples / 2];
+            const float new_ms = ab_times[1][Samples / 2];
+            std::cout << "GEMMA4_DECODE_AB history=" << history << " width=" << Chunk
+                      << " q_heads=" << QHeads << " kv_heads=" << KvHeads
+                      << " kv=" << (mode == 0 ? "bf16" : "fp8") << " warmups=" << Warmups
+                      << " samples=" << Samples << " repetitions=" << Repetitions
+                      << " old_median_ms=" << old_ms << " old_min_ms=" << ab_times[0].front()
+                      << " old_max_ms=" << ab_times[0].back() << " new_median_ms=" << new_ms
+                      << " new_min_ms=" << ab_times[1].front()
+                      << " new_max_ms=" << ab_times[1].back()
+                      << " old_over_new=" << old_ms / new_ms
+                      << " execution=eager data=synthetic_represented_equal\n";
+        }
+    }
     RuntimeSwitchFlags restore;
     restore.gemma4_attn_raw_v = saved_raw_v;
+    restore.gemma4_decode_attn_new = saved_decode_new;
     apply_runtime_switch_flags(restore);
     cuda_check(cudaEventDestroy(begin), "cudaEventDestroy");
     cuda_check(cudaEventDestroy(end), "cudaEventDestroy");
@@ -883,26 +933,44 @@ int main(int argc, char** argv) {
     failures += codec_test() + expansion_boundary_test() + qkv_test() + append_test();
     failures += qk_probe_test(2, 63) + qk_probe_test(0, 52) + qk_probe_test(-1, 63);
     failures += qk_probe_test(2, 63, true);
+    // Decode (width < 64) has two SIMT kernels; every attention case runs under both. The
+    // environment (NINFER_GEMMA4_DECODE_ATTN) only picks the starting mode.
+    const bool saved_decode_new = runtime_switches().gemma4_decode_attn_new;
     const bool saved_raw_v = runtime_switches().gemma4_attn_raw_v;
-    for (bool raw_v : {false, true}) {
-        RuntimeSwitchFlags flags;
-        flags.gemma4_attn_raw_v = raw_v;
-        apply_runtime_switch_flags(flags);
-        for (int tokens : {1, 63, 64, 65, 129}) { failures += attention_test(tokens); }
-        failures += attention_test(129, false);
-        for (int tokens : {1, 63, 64, 65, 127, 128, 129}) {
-            failures += attention_test(tokens, true, true);
+    for (bool decode_new : {false, true}) {
+        RuntimeSwitchFlags decode_flags;
+        decode_flags.gemma4_decode_attn_new = decode_new;
+        apply_runtime_switch_flags(decode_flags);
+        // Widths 1..16: causal tails, unmapped pages inside a tile, poisoned unwritten rows.
+        for (int tokens = 1; tokens <= 16; ++tokens) { failures += attention_test(tokens); }
+        failures += attention_test(16, false);
+        failures += attention_test(63, false);
+        for (int tokens : {1, 5, 16}) {
+            // Captured grid, positions rewritten on the device; all-empty block table.
+            failures += attention_test(tokens, false, false, true);
+            failures += attention_test(tokens, true, false, true, true);
         }
-        failures += attention_test(129, false, true);
-        for (bool fp8_qk : {false, true}) {
-            for (int tokens : {64, 65, 128, 129}) {
-                failures += attention_test(tokens, false, fp8_qk, true);
+        for (bool raw_v : {false, true}) {
+            RuntimeSwitchFlags flags;
+            flags.gemma4_attn_raw_v = raw_v;
+            apply_runtime_switch_flags(flags);
+            for (int tokens : {1, 63, 64, 65, 129}) { failures += attention_test(tokens); }
+            failures += attention_test(129, false);
+            for (int tokens : {1, 63, 64, 65, 127, 128, 129}) {
+                failures += attention_test(tokens, true, true);
             }
-            failures += attention_test(65, true, fp8_qk, true, true);
+            failures += attention_test(129, false, true);
+            for (bool fp8_qk : {false, true}) {
+                for (int tokens : {64, 65, 128, 129}) {
+                    failures += attention_test(tokens, false, fp8_qk, true);
+                }
+                failures += attention_test(65, true, fp8_qk, true, true);
+            }
         }
     }
     RuntimeSwitchFlags restore;
     restore.gemma4_attn_raw_v = saved_raw_v;
+    restore.gemma4_decode_attn_new = saved_decode_new;
     apply_runtime_switch_flags(restore);
     std::cout << (failures ? "FAIL" : "OK") << " gemma4_fp8_kv\n";
     return failures ? 1 : 0;

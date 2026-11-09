@@ -293,6 +293,13 @@ int gemma4_attention_chunks(std::int32_t tokens, std::int32_t kv_heads) {
     return static_cast<int>(std::min<std::int64_t>(kMaxChunks, kTargetBlocks / blocks));
 }
 
+int gemma4_attention_simt_chunks(std::int32_t tokens, std::int32_t q_heads,
+                                 std::int32_t kv_heads, std::int32_t head_dim) {
+    return gemma4_decode_d512_selected(head_dim, q_heads, kv_heads)
+               ? gemma4_decode_d512_chunks(tokens, kv_heads)
+               : gemma4_attention_chunks(tokens, kv_heads);
+}
+
 void gemma4_attention_launch(const Tensor& q, const Gemma4CacheView& cache,
                              const Tensor& positions, int window, float scale, Tensor& out,
                              float* partial, float* stats, cudaStream_t stream) {
@@ -302,6 +309,11 @@ void gemma4_attention_launch(const Tensor& q, const Gemma4CacheView& cache,
     if (q.ne[2] >= kMmaMinTokens) {
         gemma4_attention_mma_launch(q, cache, positions, window, scale, out, partial, stats,
                                     stream);
+        return;
+    }
+    if (gemma4_decode_d512_selected(q.ne[0], q.ne[1], cache.k_pages->ne[2])) {
+        gemma4_attention_decode_d512_launch(q, cache, positions, window, scale, out, partial,
+                                            stats, stream);
         return;
     }
     if (q.ne[0] == 256) {

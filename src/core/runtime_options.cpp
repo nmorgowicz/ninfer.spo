@@ -75,7 +75,8 @@ void log_if_set(const RuntimeSwitches& switches) {
                        switches.expert_vram_gib == 0 && switches.expert_profile.empty() &&
                        switches.expert_cpu_threads == 0 && switches.expert_adapt &&
                        switches.gemma4_attn_split_k && switches.gemma4_attn_segments == 0 &&
-                       switches.routing_dump.empty() && !switches.gemma4_attn_raw_v;
+                       switches.routing_dump.empty() && !switches.gemma4_attn_raw_v &&
+                       !switches.gemma4_decode_attn_new;
     if (quiet) { return; }
     std::fprintf(stderr, "ninfer switches:");
     if (switches.cuda_sync) { std::fprintf(stderr, " cuda_sync=%s", switches.cuda_sync->c_str()); }
@@ -131,6 +132,7 @@ void log_if_set(const RuntimeSwitches& switches) {
         std::fprintf(stderr, " gemma4_attn_segments=%d", switches.gemma4_attn_segments);
     }
     if (switches.gemma4_attn_raw_v) { std::fprintf(stderr, " gemma4_attn_raw_v=1"); }
+    if (switches.gemma4_decode_attn_new) { std::fprintf(stderr, " gemma4_decode_attn=new"); }
     std::fprintf(stderr, "\n");
 }
 
@@ -185,6 +187,12 @@ RuntimeSwitches& mutable_switches() {
             out.gemma4_attn_segments = segments < 1 ? 0 : (segments > 32 ? 32 : segments);
         }
         out.gemma4_attn_raw_v = env_flag("NINFER_GEMMA4_ATTN_RAW_V");
+        const std::string decode_attn = env_string("NINFER_GEMMA4_DECODE_ATTN");
+        if (decode_attn == "new") {
+            out.gemma4_decode_attn_new = true;
+        } else if (!decode_attn.empty() && decode_attn != "old") {
+            warn_ignored("NINFER_GEMMA4_DECODE_ATTN", decode_attn.c_str());
+        }
         out.routing_dump = env_string("NINFER_ROUTING_DUMP");
         return out;
     }();
@@ -223,6 +231,7 @@ void apply_runtime_switch_flags(const RuntimeSwitchFlags& flags) {
     if (flags.expert_profile) { out.expert_profile = *flags.expert_profile; }
     if (flags.gemma4_attn_split_k) { out.gemma4_attn_split_k = *flags.gemma4_attn_split_k; }
     if (flags.gemma4_attn_raw_v) { out.gemma4_attn_raw_v = *flags.gemma4_attn_raw_v; }
+    if (flags.gemma4_decode_attn_new) { out.gemma4_decode_attn_new = *flags.gemma4_decode_attn_new; }
 }
 
 } // namespace ninfer

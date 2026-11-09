@@ -1,5 +1,6 @@
 // INT8-G64 global-layer KV cache for Gemma4 (D512, 8 FP16 scales per vector, SIMT/MMA
 // dequant-to-BF16 reads, no rotation). Mirrors test_gemma4_fp8_kv.cu without the FP8 QK path.
+#include "core/runtime_options.h"
 #include "ninfer/ops/gemma4_attention.h"
 #include "ninfer/ops/gemma4_kv_append.h"
 #include "ninfer/ops/gemma4_qkv_prep.h"
@@ -429,11 +430,30 @@ int main() {
     int failures = validation_test();
     if (cuda_unavailable()) { std::cout << "SKIP: no usable CUDA device\n"; return failures ? 1 : 77; }
     failures += codec_test() + qkv_test() + append_test();
-    for (int tokens : {1, 2, 63, 64, 65, 127, 128, 129}) { failures += attention_test(tokens); }
-    failures += attention_test(129, false);
-    for (int tokens : {1, 63, 64, 129}) { failures += attention_vs_original_bf16_test(tokens); }
-    for (int tokens : {64, 65, 128, 129}) { failures += attention_test(tokens, false, true); }
-    failures += attention_test(65, true, true, true);
+    // Decode (width < 64) has two SIMT kernels; every attention case runs under both. The
+    // environment (NINFER_GEMMA4_DECODE_ATTN) only picks the starting mode.
+    const bool saved_decode_new = runtime_switches().gemma4_decode_attn_new;
+    for (bool decode_new : {false, true}) {
+        RuntimeSwitchFlags flags;
+        flags.gemma4_decode_attn_new = decode_new;
+        apply_runtime_switch_flags(flags);
+        // Widths 1..16: causal tails, unmapped pages inside a tile, poisoned unwritten rows.
+        for (int tokens = 1; tokens <= 16; ++tokens) { failures += attention_test(tokens); }
+        failures += attention_test(16, false);
+        for (int tokens : {1, 5, 16}) {
+            // Captured grid, device-side empty partitions, all-empty block table.
+            failures += attention_test(tokens, false, true);
+            failures += attention_test(tokens, true, true, true);
+        }
+        for (int tokens : {63, 64, 65, 127, 128, 129}) { failures += attention_test(tokens); }
+        failures += attention_test(129, false);
+        for (int tokens : {1, 63, 64, 129}) { failures += attention_vs_original_bf16_test(tokens); }
+        for (int tokens : {64, 65, 128, 129}) { failures += attention_test(tokens, false, true); }
+        failures += attention_test(65, true, true, true);
+    }
+    RuntimeSwitchFlags restore;
+    restore.gemma4_decode_attn_new = saved_decode_new;
+    apply_runtime_switch_flags(restore);
     std::cout << (failures ? "FAIL" : "OK") << " gemma4_int8_kv\n";
     return failures ? 1 : 0;
 }

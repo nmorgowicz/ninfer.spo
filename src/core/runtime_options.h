@@ -56,6 +56,10 @@ struct RuntimeSwitches {
     int gemma4_attn_segments = 0;
     // Opt-in compact FP8 V staging with the same FP32-product/BF16 rounding in registers.
     bool gemma4_attn_raw_v = false;
+    // Gemma 4 SIMT decode attention for the global D=512 layers (query widths below 64).
+    // false keeps the original per-head-warp kernel; true selects the KV-head-shared kernel
+    // (NINFER_GEMMA4_DECODE_ATTN=old|new).
+    bool gemma4_decode_attn_new = false;
 };
 
 struct RuntimeSwitchFlags {
@@ -72,6 +76,7 @@ struct RuntimeSwitchFlags {
     std::optional<std::string> expert_profile;
     std::optional<bool> gemma4_attn_split_k;
     std::optional<bool> gemma4_attn_raw_v;
+    std::optional<bool> gemma4_decode_attn_new;
 };
 
 [[nodiscard]] const RuntimeSwitches& runtime_switches();

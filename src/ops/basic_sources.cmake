@@ -11,6 +11,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gdn_gating.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gelu.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gemma4_attention.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/launcher/gemma4_attention_decode_d512.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gemma4_attention_mma.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gemma4_attention_mma_d512.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gemma4_kv_append.cu"

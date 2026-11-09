@@ -38,6 +38,11 @@ std::size_t gemma4_attention_workspace_capacity_bytes(std::int32_t head_dim, std
         int parts = 1;
         if (count < detail::kGemma4AttentionMmaMinTokens) {
             parts = detail::gemma4_attention_chunks(count, kv_heads);
+            // Bound both decode kernels so the workspace never depends on the switch.
+            if (head_dim == 512 && q_heads % kv_heads == 0 &&
+                q_heads / kv_heads <= detail::kGemma4DecodeD512MaxGroup) {
+                parts = std::max(parts, detail::gemma4_decode_d512_chunks(count, kv_heads));
+            }
         } else if (head_dim == 512) {
             // Unclamped bound covers every context length a graph bucket can reach. The
             // wave-aware segment search is not monotonic in the width, so scan every
@@ -111,7 +116,8 @@ void gemma4_attention(const Tensor& q, const Gemma4CacheView& cache,
                 workspace.alloc(DType::FP32, {2, segments, q_heads, tokens}).data);
         }
     } else if (tokens < detail::kGemma4AttentionMmaMinTokens) {
-        const int chunks = detail::gemma4_attention_chunks(tokens, kv_heads);
+        const int chunks =
+            detail::gemma4_attention_simt_chunks(tokens, q_heads, kv_heads, head_dim);
         if (chunks > 1) {
             partial = static_cast<float*>(
                 workspace.alloc(DType::FP32, {head_dim, chunks, q_heads, tokens}).data);
