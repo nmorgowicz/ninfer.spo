@@ -60,8 +60,9 @@ struct RuntimeSwitches {
     // The KV-head-shared kernel is the default; NINFER_GEMMA4_DECODE_ATTN=old
     // explicitly selects the original per-head-warp kernel for comparison.
     bool gemma4_decode_attn_new = true;
-    // Experimental bounded-arena sharing of unchanged global host checkpoint pages.
-    bool gemma4_host_delta = false;
+    // Default bounded-arena sharing of unchanged global host checkpoint pages.
+    // NINFER_GEMMA4_HOST_DELTA=0 selects the original full-copy path.
+    bool gemma4_host_delta = true;
 };
 
 struct RuntimeSwitchFlags {

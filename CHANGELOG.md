@@ -2,13 +2,16 @@
 
 ## Unreleased
 
-- Default-off `NINFER_GEMMA4_HOST_DELTA=1` shares immutable global checkpoint payloads in the
-  existing bounded host arena, retaining independent rings and write/COW/restore identities.
+- Default-on Gemma host checkpoint sharing retains immutable global payloads in the existing
+  bounded host arena, independent rings and write/COW/restore identities. Explicit
+  `NINFER_GEMMA4_HOST_DELTA=0` opts out; unset or1 enables sharing.
   On one5090/g256, same-binary ABAB reduced cached-tail prompt latency18.1% without MTP and
   18.9% with d1/FP8-QK; d1 complete follow-up wall time fell8.4%. Real branch/fresh equivalence,
   near125k appends/restores and both cancellation/recovery paths passed. Activity attribution
   observed10.52→2.28GB DtoH per scripted tail; incomplete end metadata is not a no-drop proof.
-  No extra device workspace, precision/default/launcher change or universal speed guarantee.
+  No extra device workspace, precision/launcher change or universal speed guarantee.
+  The operator-authorized default cutover passed4 native default/on/off/capacity cases and
+  live d1/FP8-QK cold/cached HTTP smoke in all3 modes, with identical cached output and131072 KV.
 - Experimental A4 `--scale-rule mse`, `--mlp full|gate-up|down` and `--layers` add bounded real
   K16 reconstruction-error search and selective policies. Native serving-codec probes include
   FP32(1.2) to catch multiplier rounding missed by power-of-two probes.163 Python tests and

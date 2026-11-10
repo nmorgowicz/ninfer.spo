@@ -68,6 +68,18 @@ ninfer_add_op_test(ninfer_gemma4_tool_parser_test
 ninfer_add_op_test(ninfer_gemma4_prefix_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_store.cpp"
   LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_gemma4_prefix_store_test PROPERTIES
+  ENVIRONMENT_MODIFICATION "NINFER_GEMMA4_HOST_DELTA=unset:")
+add_test(NAME ninfer_gemma4_prefix_store_optout_test
+  COMMAND ninfer_gemma4_prefix_store_test --expect-legacy)
+set_tests_properties(ninfer_gemma4_prefix_store_optout_test PROPERTIES
+  ENVIRONMENT "NINFER_GEMMA4_HOST_DELTA=0"
+  RUN_SERIAL TRUE LABELS "gpu")
+add_test(NAME ninfer_gemma4_prefix_store_explicit_on_test
+  COMMAND ninfer_gemma4_prefix_store_test)
+set_tests_properties(ninfer_gemma4_prefix_store_explicit_on_test PROPERTIES
+  ENVIRONMENT "NINFER_GEMMA4_HOST_DELTA=1"
+  RUN_SERIAL TRUE LABELS "gpu")
 
 ninfer_add_op_test(ninfer_gemma4_top_tokens_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_top_tokens.cpp"

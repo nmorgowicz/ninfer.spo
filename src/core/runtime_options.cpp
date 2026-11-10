@@ -76,7 +76,7 @@ void log_if_set(const RuntimeSwitches& switches) {
                        switches.expert_cpu_threads == 0 && switches.expert_adapt &&
                        switches.gemma4_attn_split_k && switches.gemma4_attn_segments == 0 &&
                        switches.routing_dump.empty() && !switches.gemma4_attn_raw_v &&
-                       !switches.gemma4_host_delta &&
+                       !switches.gemma4_host_delta && !env_present("NINFER_GEMMA4_HOST_DELTA") &&
                        !switches.gemma4_decode_attn_new && !env_present("NINFER_GEMMA4_DECODE_ATTN");
     if (quiet) { return; }
     std::fprintf(stderr, "ninfer switches:");
@@ -134,7 +134,7 @@ void log_if_set(const RuntimeSwitches& switches) {
     }
     if (switches.gemma4_attn_raw_v) { std::fprintf(stderr, " gemma4_attn_raw_v=1"); }
     std::fprintf(stderr, " gemma4_decode_attn=%s", switches.gemma4_decode_attn_new ? "new" : "old");
-    if (switches.gemma4_host_delta) { std::fprintf(stderr, " gemma4_host_delta=1"); }
+    std::fprintf(stderr, " gemma4_host_delta=%d", switches.gemma4_host_delta ? 1 : 0);
     std::fprintf(stderr, "\n");
 }
 
@@ -189,7 +189,12 @@ RuntimeSwitches& mutable_switches() {
             out.gemma4_attn_segments = segments < 1 ? 0 : (segments > 32 ? 32 : segments);
         }
         out.gemma4_attn_raw_v = env_flag("NINFER_GEMMA4_ATTN_RAW_V");
-        out.gemma4_host_delta = env_flag("NINFER_GEMMA4_HOST_DELTA");
+        const std::string host_delta = env_string("NINFER_GEMMA4_HOST_DELTA");
+        if (host_delta == "0" || host_delta == "1") {
+            out.gemma4_host_delta = host_delta == "1";
+        } else if (!host_delta.empty()) {
+            warn_ignored("NINFER_GEMMA4_HOST_DELTA", host_delta.c_str());
+        }
         const std::string decode_attn = env_string("NINFER_GEMMA4_DECODE_ATTN");
         if (decode_attn == "new" || decode_attn == "old") {
             out.gemma4_decode_attn_new = decode_attn == "new";

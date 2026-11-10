@@ -419,16 +419,17 @@ Source weights and existing launchers were unchanged. Evidence in the workstatio
 Cell-boundary clock/throttle snapshots are not continuous monitoring. This rejects this design
 on this workload/GPU, not every possible overlap design.
 
-## Experimental shared host checkpoint pages
+## Default shared host checkpoint pages
 
-`NINFER_GEMMA4_HOST_DELTA=1` is an explicit, default-off Gemma host-checkpoint option.
+Gemma host checkpoint sharing is default-on after the2026-11-10 operator-approved cutover.
+Unset or `NINFER_GEMMA4_HOST_DELTA=1` enables it; explicit0 retains the original full-copy path.
 It shares immutable global-page payloads inside the existing bounded pinned-host arena.
 Physical-page write identities—not matching tokens—determine reuse; allocation, partial writes
 and COW invalidate identities, and host restore propagates the restored identity. Each
 checkpoint retains its own complete ring snapshot and original coverage/LRU rules.
 This changes neither weight/KV/QK precision nor which mathematical positions a snapshot covers.
 
-The default path is unchanged. No host arena, or no sliding ring, leaves the option inactive.
+No host arena, or no sliding ring, leaves sharing inactive.
 There is no second pinned allocation or new device workspace; host payload blocks are reference
 counted and returned to the same arena when their last checkpoint releases them. Cold global
 capture batches consecutive physical/host pages with pitched per-region copies; reused pages
@@ -465,15 +466,20 @@ The first cold ingest still copied5.23GB in both modes; rings and changed pages 
 Traces lack final end metadata after forced teardown: no completeness/no-drop guarantee, and
 instrumented timings are not the performance benchmark.
 
-This is a qualified opt-in on this configuration, not a general latency/default recommendation.
-Set the environment before starting the existing server; unset or0 retains the comparison path:
+The measurements above qualified the unchanged algorithm while it was opt-in. The subsequent
+default-selection cutover passed4 native default/explicit-on/opt-out/capacity cases and live
+d1/FP8-KV/FP8-QK cold/cached HTTP requests in all3 modes. All starts retained131072 native KV;
+cached content, token/cache counts and draft/acceptance counts matched. This is selection and
+compatibility smoke, not a new performance estimate or universal semantic qualification.
+No environment setting is needed. To opt out before starting the existing server:
 
 ```powershell
-$env:NINFER_GEMMA4_HOST_DELTA = '1'
+$env:NINFER_GEMMA4_HOST_DELTA = '0'
 # Start your existing server command with its existing precision/context/MTP flags.
 ```
 
 Existing launchers, preset choices and the released shared-KV decode default are unchanged.
 Evidence: `pp-bench-20261108/additive-next-20261110/checkpoint-decision.json` and
-`checkpoint-{native,nomtp,d1,stress,attribution}/`.
+`checkpoint-{native,nomtp,d1,stress,attribution}/`. Default-selection evidence:
+`pp-bench-20261108/host-default-20261110/{ctest.log,results.json}`.
 

@@ -484,8 +484,11 @@ void pool_pressure_restore() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        // Exercise the selected startup policy through actual capture bytes, budget and
+        // independent branch restoration before the explicit in-process A/B cases.
+        host_delta_branches(!(argc == 2 && std::string(argv[1]) == "--expect-legacy"));
         const bool saved = ninfer::runtime_switches().gemma4_host_delta;
         for (const bool delta : {false, true}) {
             ninfer::RuntimeSwitchFlags flags;
