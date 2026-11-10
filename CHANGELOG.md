@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Default-off `NINFER_GEMMA4_HOST_DELTA=1` shares immutable global checkpoint payloads in the
+  existing bounded host arena, retaining independent rings and write/COW/restore identities.
+  On one5090/g256, same-binary ABAB reduced cached-tail prompt latency18.1% without MTP and
+  18.9% with d1/FP8-QK; d1 complete follow-up wall time fell8.4%. Real branch/fresh equivalence,
+  near125k appends/restores and both cancellation/recovery paths passed. Activity attribution
+  observed10.52→2.28GB DtoH per scripted tail; incomplete end metadata is not a no-drop proof.
+  No extra device workspace, precision/default/launcher change or universal speed guarantee.
+- Experimental A4 `--scale-rule mse`, `--mlp full|gate-up|down` and `--layers` add bounded real
+  K16 reconstruction-error search and selective policies. Native serving-codec probes include
+  FP32(1.2) to catch multiplier rounding missed by power-of-two probes.163 Python tests and
+  real400×512 collection passed; all710 original encoded objects matched in each of4 candidates.
+  All4 failed the predeclared joint KL/NLL quality gate, so none proceeded to speed qualification.
+  Down-only improved PPL1.88% but did not establish KL non-inferiority; no default/preset promotion.
+
 - Opt-in `tools.convert.gemma4_a4 collect|candidate` collects actual normalized gate/up and BF16
   GEGLU-product inputs with the eager-only `ninfer-spo-gemma4-calibrate` target (excluded from
   default builds). Receipts bind full A16-source artifact hashes, exact calibration/prefix,

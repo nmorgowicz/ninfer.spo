@@ -1,11 +1,13 @@
 // Offline eager-only collection. Production serving never instantiates this sink.
 #include "core/device.h"
 #include "models/gemma4/load.h"
+#include "ops/linear/nvfp4/nvfp4_codec.cuh"
 
 #include <cuda_bf16.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -22,6 +24,51 @@ using namespace ninfer::models::gemma4;
 using Json = nlohmann::json;
 constexpr int kBlocks = 128;
 constexpr int kThreads = 256;
+constexpr int kSamplesPerCall = 8;
+constexpr int kSampleCapacity = 1024;
+constexpr int kProbeCount = 3;
+// Unlike the power-of-two probes, 1.2F exercises product rounding for BF16 inputs.
+__host__ __device__ constexpr float probe_divisor(int index) {
+    return index == 0 ? 1.0F : index == 1 ? 256.0F : 1.2F;
+}
+constexpr std::array<float, kProbeCount> kProbeDivisors = {
+    probe_divisor(0), probe_divisor(1), probe_divisor(2)};
+
+// Fixed seed and integer algorithm make the offline sample reproducible.
+__host__ __device__ std::uint64_t mix(std::uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+struct Sample {
+    float values[16];
+    std::uint32_t lo[kProbeCount], hi[kProbeCount];
+    std::uint8_t scales[kProbeCount];
+    std::uint64_t call, block;
+};
+
+__global__ void sample_inputs(const __nv_bfloat16* values, std::uint64_t blocks,
+                              std::uint64_t call, Sample* samples) {
+    const unsigned slot = threadIdx.x;
+    const unsigned count = blocks < kSamplesPerCall ? static_cast<unsigned>(blocks) : kSamplesPerCall;
+    if (slot >= count) { return; }
+    const auto begin = blocks * slot / count;
+    const auto end = blocks * (slot + 1) / count;
+    const auto block = begin + mix(call * kSamplesPerCall + slot) % (end - begin);
+    auto& sample = samples[slot];
+    sample.call = call;
+    sample.block = block;
+    for (int i = 0; i < 16; ++i) { sample.values[i] = __bfloat162float(values[block * 16 + i]); }
+    // These come from the serving codec, not a second implementation of its rounding rules.
+    for (int i = 0; i < kProbeCount; ++i) {
+        const auto encoded = ops::detail::quantize_nvfp4_k16(values + block * 16, probe_divisor(i));
+        sample.lo[i] = encoded.codes_lo;
+        sample.hi[i] = encoded.codes_hi;
+        sample.scales[i] = encoded.scale;
+    }
+}
 
 // Absmax is reduction-order independent. A NaN/Inf is recorded separately, never ignored by max.
 __global__ void input_absmax(const __nv_bfloat16* values, std::int64_t size,
@@ -57,18 +104,25 @@ struct Stat {
     std::uint64_t tokens = 0;
     std::uint64_t calls = 0;
     int width = 0;
+    std::uint64_t samples_seen = 0;
+    std::vector<Sample> samples;
 };
 
 class Collector final : public Gemma4MlpInputSink {
 public:
     explicit Collector(std::size_t layers) : stats(layers * 2),
         device(kBlocks * (sizeof(float) + sizeof(unsigned))),
-        host(kBlocks * (sizeof(float) + sizeof(unsigned))) {}
+        host(kBlocks * (sizeof(float) + sizeof(unsigned))),
+        sample_device(kSamplesPerCall * sizeof(Sample)),
+        sample_host(kSamplesPerCall * sizeof(Sample)) {
+        for (auto& stat : stats) { stat.samples.reserve(kSampleCapacity); }
+    }
 
     void observe(std::size_t layer, Gemma4MlpInput input, const Tensor& value,
                  cudaStream_t stream) override {
         if (value.dtype != DType::BF16 || !value.is_contiguous() ||
-            value.ne[2] != 1 || value.ne[3] != 1 || value.ne[0] <= 0 || value.ne[1] <= 0) {
+            value.ne[2] != 1 || value.ne[3] != 1 || value.ne[0] <= 0 || value.ne[1] <= 0 ||
+            value.ne[0] % 16 != 0) {
             throw std::runtime_error("calibration tap requires contiguous BF16 [K,T]");
         }
         auto* maxima = static_cast<float*>(device.p);
@@ -76,15 +130,31 @@ public:
         input_absmax<<<kBlocks, kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(value.data), value.numel(), maxima, invalid);
         CUDA_CHECK(cudaGetLastError());
+        auto& stat = stats.at(layer * 2 + (input == Gemma4MlpInput::Down ? 1 : 0));
+        sample_inputs<<<1, 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(value.data), value.numel() / 16, stat.calls,
+            static_cast<Sample*>(sample_device.p));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpyAsync(sample_host.data(), sample_device.p, sample_device.bytes,
+                                   cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(host.data(), device.p, device.bytes,
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         const auto* max_host = static_cast<const float*>(host.data());
         const auto* bad_host = reinterpret_cast<const unsigned*>(max_host + kBlocks);
-        auto& stat = stats.at(layer * 2 + (input == Gemma4MlpInput::Down ? 1 : 0));
         for (int block = 0; block < kBlocks; ++block) {
             if (bad_host[block]) { throw std::runtime_error("nonfinite logical MLP input"); }
             stat.absmax = std::max(stat.absmax, max_host[block]);
+        }
+        const auto* samples = static_cast<const Sample*>(sample_host.data());
+        const auto count = std::min<std::int64_t>(kSamplesPerCall, value.numel() / 16);
+        for (int i = 0; i < count; ++i) {
+            ++stat.samples_seen;
+            if (stat.samples.size() < kSampleCapacity) { stat.samples.push_back(samples[i]); }
+            else {
+                const auto slot = mix(stat.samples_seen) % stat.samples_seen;
+                if (slot < kSampleCapacity) { stat.samples[slot] = samples[i]; }
+            }
         }
         if (stat.width && stat.width != value.ne[0]) {
             throw std::runtime_error("logical MLP input width changed");
@@ -98,6 +168,8 @@ public:
 private:
     DeviceBuffer device;
     PinnedHostBuffer host;
+    DeviceBuffer sample_device;
+    PinnedHostBuffer sample_host;
 };
 
 int collect(const char* artifact, const char* input, const char* output) {
@@ -180,12 +252,26 @@ int collect(const char* artifact, const char* input, const char* output) {
         }
         const auto name = "text/layers/" + std::to_string(i / 2) + "/mlp/" +
                           (i % 2 ? "down" : "gate_up");
+        Json samples = Json::array();
+        for (const auto& sample : stat.samples) {
+            Json probes = Json::array();
+            for (std::size_t p = 0; p < kProbeDivisors.size(); ++p) {
+                probes.push_back({{"scale", sample.scales[p]}, {"codes", {sample.lo[p], sample.hi[p]}}});
+            }
+            samples.push_back({{"call", sample.call}, {"block", sample.block},
+                               {"values", Json::array_t(sample.values, sample.values + 16)},
+                               {"probes", probes}});
+        }
         statistics[name] = {{"absmax", stat.absmax}, {"tokens", stat.tokens},
-                            {"calls", stat.calls}, {"width", stat.width}};
+                            {"calls", stat.calls}, {"width", stat.width},
+                            {"samples_seen", stat.samples_seen}, {"samples", samples}};
     }
-    Json result = {{"schema", "ninfer.gemma4.mlp-input-absmax/v1"},
+    Json result = {{"schema", "ninfer.gemma4.mlp-input-k16/v2"},
                    {"rows", rows.size()}, {"context", context}, {"kv_dtype", "bf16"},
-                   {"qk", "bf16"}, {"statistics", statistics}};
+                   {"qk", "bf16"}, {"statistics", statistics},
+                   {"sampling", {{"method", "stratified-k16-reservoir-splitmix64/v1"},
+                                 {"block_size", 16}, {"blocks_per_call", kSamplesPerCall},
+                                 {"capacity", kSampleCapacity}, {"probe_divisors", kProbeDivisors}}}};
     std::ofstream out(output);
     if (!out) { throw std::runtime_error("cannot create statistics output"); }
     out << result.dump(2) << '\n';

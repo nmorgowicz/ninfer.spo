@@ -277,9 +277,9 @@ The native sink reduces actual absolute maxima on the GPU, refuses nonfinite val
 records width, token and call coverage. A zero/nonpositive maximum is rejected by the handoff;
 there is no invented scale fallback. The activation consumer computes
 `E4M3(divisor * block_absmax / 6)` and `E2M1(input * divisor / block_scale)`, then corrects
-the GEMM by `1/(weight_divisor * divisor)`. The handoff uses `FP32(448*6/absmax)`, matching
-the existing `gemma4_nvfp4_a4_mlp` override and the consumer's `/6` rule, not the weight
-encoder's `/4` versus `/6` error search. This is absmax calibration, not clipping/GPTQ.
+the GEMM by `1/(weight_divisor * divisor)`. The default `--scale-rule absmax` uses
+`FP32(448*6/absmax)`, matching the existing `gemma4_nvfp4_a4_mlp` override and the consumer's
+`/6` rule, not the weight encoder's `/4` versus `/6` search. The optional MSE recipe is below.
 
 Example (paths are operator choices; keep all new evidence under a new campaign directory):
 
@@ -315,6 +315,66 @@ Declare a quality margin before inspecting results; inspect per-domain/tail KL, 
 then gate long-context retrieval/continuation and MTP separately. Only after quality should
 interleaved no-speculation and MTP serving runs measure fresh/cached-tail PP, TG and memory.
 Keep the source A16 artifact and deployed GPTQ model/launchers intact throughout.
+
+### Error-aware scales and selective projections
+
+New collections also retain eight stratified, contiguous K16 blocks per tap/call in a
+deterministic1024-block reservoir per logical input. Full-input absmax and coverage remain
+checked. Each retained block has native scale/code probes at divisors1,256 and FP32(1.2),
+computed by the actual serving `quantize_nvfp4_k16` helper. The third probe exercises
+divisor-dependent product rounding; powers of two cannot. The handoff reproduces coordinates and
+requires exact probe agreement before writing a candidate; old absmax-only statistics cannot
+supply MSE samples or invented percentiles.
+
+`candidate --scale-rule mse` searches FP32 divisors `absmax_divisor * 2^(step/16)`, steps-16..48,
+minimizing sampled activation reconstruction NMSE with FP32 arithmetic and RN-even/SATFINITE
+E4M3 block scales/E2M1 codes. Without scale rounding/range limits the divisor cancels; this
+search targets scale phase, underflow and saturation effects, not a weight-aware GPTQ objective.
+Search grids, baseline/selected errors, sampled energy and saturation/zero-scale counts go
+into provenance and the sidecar. Sampling does not exhaustively cover tails or downstream drift.
+
+`--mlp full|gate-up|down` (default `full`) and `--layers all|0,2-5,...` (default `all`, zero-based)
+restrict the changed NVFP4 uses. Gate/up remain an inseparable shared-input pair. Nonselected
+layers and protected components stay A16; a parent shared with an unselected/protected use
+is refused rather than silently granting it A4 permission.
+
+```powershell
+python -m tools.convert.gemma4_a4 candidate --artifact D:\experiments\mixed-a16.ninfer `
+  --receipt D:\experiments\a4-full\receipt.json --scale-rule mse --mlp gate-up `
+  --layers all --output D:\experiments\mixed-mse-gate-up.ninfer
+```
+
+Choose and record any calibration-only layer ranking before inspecting held-out scores.
+Lower reconstruction error is not model-quality or speed qualification. Quality gates still
+apply to each candidate; serving comparisons must include both its own A16 control and the
+deployed GPTQ artifact, since different weight recipes are not isolated kernel comparisons.
+
+### Measured MSE/selective matrix: no rollout
+
+Real400×512 collection passed all three native-codec probes across120 logical inputs and
+1024 retained blocks/input. All710 original encoded objects matched in each candidate.
+163 Python tests passed, plus53 focused tests after direct-caller argument migration.
+The lowest-NMSE gate/up quarter was14 eligible layers selected from calibration before scoring.
+
+Held-out protocol: identical mixed-A16 control/repeat, FP8-row-A16 full-vocabulary reference,
+47 windows/13728 positions, FP8 KV/BF16 QK, context512/stride256/chunk128. The repeat was identical.
+Upper95CI limits1.01 KL ratio and+0.001nat/token NLL applied overall and every domain:
+
+| Candidate | KL ratio [95%CI] | Delta NLL nat/token [95%CI] | Gate |
+|---|---|---|---|
+| MSE full | 1.17174 [1.10720,1.23969] | +0.001318 [-0.012665,+0.013366] | Fail |
+| MSE gate/up | 1.18780 [1.14306,1.23776] | +0.004514 [-0.005687,+0.015174] | Fail |
+| MSE down | 1.02022 [0.97977,1.06033] | -0.018997 [-0.032525,-0.007462] | Fail |
+| MSE gate/up quarter | 1.03954 [1.01022,1.06570] | +0.005730 [+0.000010,+0.012133] | Fail |
+
+Down-only improved held-out PPL1.88%, but did not establish required distributional fidelity;
+likelihood and reference KL are different instruments. Sample reconstruction NMSE fell a median
+1.88% per calibrated input, not a model-quality guarantee. No candidate proceeded to speed,
+long-context/MTP or default qualification. Source/deployed weights and launchers remain unchanged.
+Full per-domain/tail diagnostics and encoded identity:
+`pp-bench-20261108/additive-next-20261110/a4-error-aware/`.
+
+
 
 ### First measured absmax result: rejected for rollout
 
@@ -358,4 +418,62 @@ Source weights and existing launchers were unchanged. Evidence in the workstatio
 `pp-bench-20261108/owner-bake-20261109/{candidate.patch,tests.log,serving-summary.json,decision.json,restored-release-smoke.json}`.
 Cell-boundary clock/throttle snapshots are not continuous monitoring. This rejects this design
 on this workload/GPU, not every possible overlap design.
+
+## Experimental shared host checkpoint pages
+
+`NINFER_GEMMA4_HOST_DELTA=1` is an explicit, default-off Gemma host-checkpoint option.
+It shares immutable global-page payloads inside the existing bounded pinned-host arena.
+Physical-page write identities—not matching tokens—determine reuse; allocation, partial writes
+and COW invalidate identities, and host restore propagates the restored identity. Each
+checkpoint retains its own complete ring snapshot and original coverage/LRU rules.
+This changes neither weight/KV/QK precision nor which mathematical positions a snapshot covers.
+
+The default path is unchanged. No host arena, or no sliding ring, leaves the option inactive.
+There is no second pinned allocation or new device workspace; host payload blocks are reference
+counted and returned to the same arena when their last checkpoint releases them. Cold global
+capture batches consecutive physical/host pages with pitched per-region copies; reused pages
+submit no new global DtoH copy. Cold captures and independent ring copies still cost time.
+
+Parent CUDA13.5 builds and tiny-buffer ownership/budget/byte-restoration tests passed.
+The real Engine checkpoint scenario passed with the option off and on at16k/BF16 KV/MTP5:
+displaced conversations, changed memory, explicit boundaries, eviction and token outputs matching
+fresh prefills. This is the existing fixture's explicit MTP5, not a launcher recommendation.
+
+On one5090/g256, same-binary off/on/off/on, FP8 KV/BF16 QK/chunk2048/noMTP,
+host8192MiB/device0, the fixed100k scripted-reply-divergence workload completed16 requests.
+Both sessions per arm used identical prompt hashes and token/cache counts; each arm contributed
+four cached tails. Pooled median tail prompt time fell1682.62→1378.29ms (-18.1%); complete tail
+wall time3.170→2.856s (-9.9%). Fresh-ingest and decode medians stayed within1%; individual
+cells varied and were not discarded. All starts retained131072 native KV,8.96GiB runtime,
+and8GiB pinned host storage. Boundary memory-clock samples were13801MHz; no continuous
+clock-stability claim or cross-session comparison with earlier14001MHz results.
+
+A second ABAB with actual d1/FP8-QK flags passed16 matching requests and identical draft/
+acceptance counts per repetition. Tail prompt1482.08→1201.59ms (-18.9%), complete tail
+wall2.751→2.519s (-8.4%). Fresh prompt median+1.34%, ingest decode-2.58%, tail decode-1.50%;
+these are bounded workload observations, not a decode-kernel speed claim.
+
+Near-capacity d1 smoke ingested124824 prompt tokens, appended twice, displaced the conversation,
+then reused125917 tokens on return and after both prefill/decode cancellations. Recorded recovery
+content matched, and no native errors appeared in that server log. Both cancellation follow-ups
+succeeded; this is not exhaustive CUDA-error or universal semantic qualification.
+
+One exact-window Activity pair observed tail DtoH10,524,057,856→2,275,983,616B (-78.37%),
+425.54→87.38ms summed copy time, with39950 model kernel calls in each arm. Initial ingestion
+already captured the host frontier, allowing both subsequent captures to share its global prefix.
+The first cold ingest still copied5.23GB in both modes; rings and changed pages still transfer.
+Traces lack final end metadata after forced teardown: no completeness/no-drop guarantee, and
+instrumented timings are not the performance benchmark.
+
+This is a qualified opt-in on this configuration, not a general latency/default recommendation.
+Set the environment before starting the existing server; unset or0 retains the comparison path:
+
+```powershell
+$env:NINFER_GEMMA4_HOST_DELTA = '1'
+# Start your existing server command with its existing precision/context/MTP flags.
+```
+
+Existing launchers, preset choices and the released shared-KV decode default are unchanged.
+Evidence: `pp-bench-20261108/additive-next-20261110/checkpoint-decision.json` and
+`checkpoint-{native,nomtp,d1,stress,attribution}/`.
 

@@ -35,6 +35,8 @@ struct PagedTensor {
 // prompt that diverges a little before the frontier still resume. Snapshots sit in device slots;
 // the least recently used checkpoint moves to a pinned host arena (pages and snapshot) when the
 // slots or the pool run out, and is dropped when the arena is full too.
+// Experimental host_delta shares immutable global page payloads in that same bounded arena,
+// using write identities rather than token equality. Rings, coverage, and LRU remain per point.
 class PrefixStore {
 public:
     struct Config {
@@ -62,6 +64,10 @@ public:
         std::uint64_t drops         = 0;
         std::uint32_t device_points = 0;
         std::uint32_t host_points   = 0;
+        std::uint64_t host_global_copied_bytes = 0;
+        std::uint64_t host_global_reused_bytes = 0;
+        std::size_t host_bytes_used = 0;
+        std::size_t host_bytes_peak = 0;
     };
 
     explicit PrefixStore(Config config);
@@ -82,6 +88,9 @@ public:
     [[nodiscard]] bool shared(int page) const noexcept;
     // Copies page `from` to `to` in every global tensor.
     void copy_page(int from, int to);
+    // Invalidates the identity of a pool page before any forward can write it. Required even
+    // for exclusive pages: a host checkpoint may retain the previous bytes without a pool ref.
+    void will_write(int page) noexcept;
 
     // The checkpoint that resumes the most of `prompt`, at most `limit` positions.
     [[nodiscard]] std::optional<Match> best_match(std::span<const PositionKey> prompt,

@@ -84,7 +84,10 @@ void PrefixCache::prepare_write(std::uint32_t first, std::uint32_t count) {
     for (std::size_t page = low; page <= high; ++page) {
         if (page < live_pages_.size()) {
             const int held = live_pages_[page];
-            if (!store_.shared(held)) { continue; }
+            if (!store_.shared(held)) {
+                store_.will_write(held);
+                continue;
+            }
             const int owned = store_.allocate_page();
             if (page == low && first % kKvPageTokens != 0) { store_.copy_page(held, owned); }
             store_.release(held);
@@ -94,6 +97,7 @@ void PrefixCache::prepare_write(std::uint32_t first, std::uint32_t count) {
             live_pages_.push_back(store_.allocate_page());
         }
         table_dirty_ = true;
+        store_.will_write(live_pages_[page]);
     }
     if (table_dirty_) { upload_table(); }
 }

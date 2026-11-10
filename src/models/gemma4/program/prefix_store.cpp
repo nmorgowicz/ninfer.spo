@@ -1,5 +1,6 @@
 #include "models/gemma4/program/prefix_store.h"
 
+#include "core/runtime_options.h"
 #include "models/gemma4/program/sliding_ring.h"
 
 #include <algorithm>
@@ -32,6 +33,8 @@ public:
         for (auto it = free_.begin(); it != free_.end(); ++it) {
             if (it->second < bytes) { continue; }
             const std::size_t at = it->first;
+            used_ += bytes;
+            peak_ = std::max(peak_, used_);
             it->first += bytes;
             it->second -= bytes;
             if (it->second == 0) { free_.erase(it); }
@@ -41,6 +44,7 @@ public:
     }
 
     void give(std::size_t at, std::size_t bytes) {
+        used_ -= bytes;
         auto it = std::lower_bound(free_.begin(), free_.end(), std::pair{at, std::size_t{0}});
         it      = free_.insert(it, {at, bytes});
         if (const auto next = std::next(it);
@@ -56,9 +60,25 @@ public:
             }
         }
     }
+    [[nodiscard]] std::size_t used() const noexcept { return used_; }
+    [[nodiscard]] std::size_t peak() const noexcept { return peak_; }
 
 private:
     std::vector<std::pair<std::size_t, std::size_t>> free_;
+    std::size_t used_ = 0;
+    std::size_t peak_ = 0;
+};
+
+// Blocks own arena ranges, not additional pinned allocations. Shared globals are immutable;
+// each checkpoint still owns a complete ring snapshot.
+struct HostBlock {
+    std::size_t at = 0;
+    std::uint64_t identity = 0;
+};
+
+struct HostSnapshot {
+    std::shared_ptr<HostBlock> ring;
+    std::vector<std::shared_ptr<HostBlock>> pages;
 };
 
 struct Point {
@@ -73,12 +93,14 @@ struct Point {
     std::vector<int> pages;
     std::optional<std::size_t> host_at;
     std::size_t host_bytes = 0;
+    HostSnapshot delta;
 };
 
 } // namespace
 
 struct PrefixStore::Impl {
     Config config;
+    bool host_delta = false;
     int snapshot_pages     = 0;
     std::size_t slot_bytes = 0;
     std::vector<std::size_t> ring_offset;
@@ -86,6 +108,9 @@ struct PrefixStore::Impl {
     std::vector<std::size_t> global_offset;
     std::vector<int> refs;
     std::vector<int> free_pages;
+    std::vector<std::uint64_t> identity;
+    std::vector<std::weak_ptr<HostBlock>> host_page;
+    std::uint64_t next_identity = 1;
     DeviceBuffer slots;
     std::vector<bool> slot_used;
     std::unique_ptr<PinnedHostBuffer> host;
@@ -181,7 +206,7 @@ struct PrefixStore::Impl {
             std::optional<std::size_t> oldest;
             for (std::size_t index = 0; index < points.size(); ++index) {
                 const Point& point = points[index];
-                if (!point.host_at || point.id == pinned) { continue; }
+                if (point.slot >= 0 || point.id == pinned) { continue; }
                 if (!oldest || point.last_use < points[*oldest].last_use) { oldest = index; }
             }
             if (!oldest) { return std::nullopt; }
@@ -189,8 +214,95 @@ struct PrefixStore::Impl {
         }
     }
 
+    [[nodiscard]] std::shared_ptr<HostBlock> host_block(std::size_t bytes,
+                                                       std::uint64_t identity = 0) {
+        const auto at = host_take(bytes);
+        if (!at) { return {}; }
+        return std::shared_ptr<HostBlock>(new HostBlock{*at, identity},
+                                         [this, bytes](HostBlock* block) {
+                                             host_ranges.give(block->at, bytes);
+                                             delete block;
+                                         });
+    }
+
+    // Resolve all reusable pages before eviction can remove their former checkpoints. The
+    // local shared owners keep those arena ranges alive while host_take makes room.
+    [[nodiscard]] std::optional<HostSnapshot> save_delta(std::span<const int> pages) {
+        HostSnapshot result;
+        result.pages.resize(pages.size());
+        std::vector<bool> copied(pages.size(), false);
+        for (std::size_t page = 0; page < pages.size(); ++page) {
+            const auto physical = static_cast<std::size_t>(pages[page]);
+            auto held = host_page[physical].lock();
+            if (held && held->identity == identity[physical]) {
+                result.pages[page] = std::move(held);
+            }
+        }
+        result.ring = host_block(slot_bytes);
+        if (!result.ring) { return std::nullopt; }
+        for (std::size_t page = 0; page < pages.size(); ++page) {
+            if (result.pages[page]) { continue; }
+            const auto physical = static_cast<std::size_t>(pages[page]);
+            result.pages[page] = host_block(page_set_bytes, identity[physical]);
+            if (!result.pages[page]) { return std::nullopt; }
+            copied[page] = true;
+        }
+        auto* base = static_cast<std::uint8_t*>(host->data());
+        // The page-major host layout lets all tensors share one range/refcount per KV page.
+        // Coalesce consecutive new physical/host pages with a pitched copy per tensor.
+        for (std::size_t page = 0; page < pages.size();) {
+            if (!copied[page]) {
+                stats.host_global_reused_bytes += page_set_bytes;
+                ++page;
+                continue;
+            }
+            std::size_t run = 1;
+            while (page + run < pages.size() && copied[page + run] &&
+                   pages[page + run] == pages[page] + static_cast<int>(run) &&
+                   result.pages[page + run]->at ==
+                       result.pages[page]->at + run * page_set_bytes) {
+                ++run;
+            }
+            for (std::size_t tensor = 0; tensor < config.global.size(); ++tensor) {
+                const PagedTensor& global = config.global[tensor];
+                check(cudaMemcpy2DAsync(
+                          base + result.pages[page]->at + global_offset[tensor], page_set_bytes,
+                          global.base + static_cast<std::size_t>(pages[page]) * global.page_bytes,
+                          global.page_bytes, global.page_bytes, run, cudaMemcpyDeviceToHost,
+                          config.stream),
+                      "delta page capture");
+            }
+            stats.host_global_copied_bytes += run * page_set_bytes;
+            page += run;
+        }
+        for (std::size_t page = 0; page < pages.size(); ++page) {
+            host_page[static_cast<std::size_t>(pages[page])] = result.pages[page];
+        }
+        return result;
+    }
+
     // Moves a device checkpoint to the host arena, or drops it when the arena has no room.
     void demote(std::size_t index) {
+        if (host_delta) {
+            const std::uint64_t id = points[index].id;
+            auto snapshot = save_delta(points[index].pages);
+            index = index_of(id);
+            if (!snapshot) {
+                drop(index);
+                return;
+            }
+            Point& point = points[index];
+            point.delta = std::move(*snapshot);
+            check(cudaMemcpyAsync(static_cast<std::uint8_t*>(host->data()) + point.delta.ring->at,
+                                  slot_base(point.slot), slot_bytes, cudaMemcpyDeviceToHost,
+                                  config.stream),
+                  "delta snapshot demotion");
+            slot_used[static_cast<std::size_t>(point.slot)] = false;
+            point.slot = -1;
+            release_pages(point);
+            ++stats.demotions;
+            return;
+        }
         const std::size_t bytes = slot_bytes + points[index].pages.size() * page_set_bytes;
         const std::uint64_t id  = points[index].id;
         const auto at           = host_take(bytes);
@@ -209,6 +321,7 @@ struct PrefixStore::Impl {
                   "snapshot demotion");
         }
         global_transfer(to + slot_bytes, point.pages, true);
+        stats.host_global_copied_bytes += point.pages.size() * page_set_bytes;
         slot_used[static_cast<std::size_t>(point.slot)] = false;
         point.slot                                      = -1;
         release_pages(point);
@@ -238,6 +351,10 @@ PrefixStore::PrefixStore(Config config) : impl_(std::make_unique<Impl>()) {
         throw std::invalid_argument("gemma4 prefix store needs a page pool");
     }
     impl.config         = std::move(config);
+    // Without a ring there is no independently budgeted snapshot range to bound the number
+    // of checkpoints sharing all their global pages.
+    impl.host_delta = impl.config.host_bytes > 0 && !impl.config.ring.empty() &&
+                      runtime_switches().gemma4_host_delta;
     const Config& setup = impl.config;
     impl.snapshot_pages = setup.ring.empty() ? 0 : snapshot_pages(setup.ring_pages, setup.window);
     for (const PagedTensor& ring : setup.ring) {
@@ -249,6 +366,10 @@ PrefixStore::PrefixStore(Config config) : impl_(std::make_unique<Impl>()) {
         impl.page_set_bytes += global.page_bytes;
     }
     impl.refs.assign(static_cast<std::size_t>(setup.pool_pages), 0);
+    if (impl.host_delta) {
+        impl.identity.resize(static_cast<std::size_t>(setup.pool_pages));
+        impl.host_page.resize(static_cast<std::size_t>(setup.pool_pages));
+    }
     for (int page = setup.pool_pages - 1; page >= 0; --page) { impl.free_pages.push_back(page); }
     if (setup.device_slots > 0 && impl.slot_bytes > 0) {
         impl.slots = DeviceBuffer(impl.slot_bytes * setup.device_slots);
@@ -284,6 +405,9 @@ int PrefixStore::allocate_page() {
     const int page = impl.free_pages.back();
     impl.free_pages.pop_back();
     impl.refs[static_cast<std::size_t>(page)] = 1;
+    if (impl.host_delta) {
+        impl.identity[static_cast<std::size_t>(page)] = impl.next_identity++;
+    }
     return page;
 }
 
@@ -301,6 +425,12 @@ void PrefixStore::copy_page(int from, int to) {
                               global.base + static_cast<std::size_t>(from) * global.page_bytes,
                               global.page_bytes, cudaMemcpyDeviceToDevice, impl_->config.stream),
               "page copy-on-write");
+    }
+}
+
+void PrefixStore::will_write(int page) noexcept {
+    if (impl_->host_delta) {
+        impl_->identity[static_cast<std::size_t>(page)] = impl_->next_identity++;
     }
 }
 
@@ -382,6 +512,16 @@ bool PrefixStore::capture(std::vector<PositionKey> keys, std::span<const int> li
         *slot      = true;
         impl.ring_transfer(impl.slot_base(point.slot), point.first_page, point.snapshot_count,
                            true, cudaMemcpyDeviceToDevice);
+    } else if (impl.host_delta) {
+        auto snapshot = impl.save_delta(point.pages);
+        if (!snapshot) {
+            impl.release_pages(point);
+            return false;
+        }
+        point.delta = std::move(*snapshot);
+        impl.ring_transfer(static_cast<std::uint8_t*>(impl.host->data()) + point.delta.ring->at,
+                           point.first_page, point.snapshot_count, true, cudaMemcpyDeviceToHost);
+        impl.release_pages(point);
     } else {
         const std::size_t bytes = impl.slot_bytes + pages * impl.page_set_bytes;
         const auto at           = impl.host_take(bytes);
@@ -395,6 +535,7 @@ bool PrefixStore::capture(std::vector<PositionKey> keys, std::span<const int> li
         impl.ring_transfer(to, point.first_page, point.snapshot_count, true,
                            cudaMemcpyDeviceToHost);
         impl.global_transfer(to + impl.slot_bytes, point.pages, true);
+        impl.stats.host_global_copied_bytes += pages * impl.page_set_bytes;
         impl.release_pages(point);
     }
     point.keys     = std::move(keys);
@@ -424,20 +565,41 @@ std::int64_t PrefixStore::restore(const Match& match, std::vector<int>& live_pag
         for (std::size_t page = 0; page < pages; ++page) { live_pages.push_back(allocate_page()); }
         index        = impl.index_of(match.id);
         Point& point = impl.points[index];
-        std::uint8_t* from = impl.host_base(point);
-        impl.ring_transfer(from, point.first_page, point.snapshot_count, false,
-                           cudaMemcpyHostToDevice);
-        const std::size_t stored = (point.host_bytes - impl.slot_bytes) / impl.page_set_bytes;
-        // Host pages are laid out per tensor for all `stored` pages; restore the first `pages`.
-        for (std::size_t tensor = 0; tensor < impl.config.global.size(); ++tensor) {
-            const PagedTensor& global = impl.config.global[tensor];
-            std::uint8_t* region      = from + impl.slot_bytes + impl.global_offset[tensor] * stored;
+        if (impl.host_delta) {
+            auto* base = static_cast<std::uint8_t*>(impl.host->data());
+            impl.ring_transfer(base + point.delta.ring->at, point.first_page, point.snapshot_count,
+                               false, cudaMemcpyHostToDevice);
             for (std::size_t page = 0; page < pages; ++page) {
-                check(cudaMemcpyAsync(
-                          global.base + static_cast<std::size_t>(live_pages[page]) * global.page_bytes,
-                          region + page * global.page_bytes, global.page_bytes,
-                          cudaMemcpyHostToDevice, impl.config.stream),
-                      "page restore");
+                const auto physical = static_cast<std::size_t>(live_pages[page]);
+                const auto& held = point.delta.pages[page];
+                for (std::size_t tensor = 0; tensor < impl.config.global.size(); ++tensor) {
+                    const PagedTensor& global = impl.config.global[tensor];
+                    check(cudaMemcpyAsync(global.base + physical * global.page_bytes,
+                                          base + held->at + impl.global_offset[tensor],
+                                          global.page_bytes, cudaMemcpyHostToDevice,
+                                          impl.config.stream),
+                          "delta page restore");
+                }
+                impl.identity[physical] = held->identity;
+                impl.host_page[physical] = held;
+            }
+        } else {
+            std::uint8_t* from = impl.host_base(point);
+            impl.ring_transfer(from, point.first_page, point.snapshot_count, false,
+                               cudaMemcpyHostToDevice);
+            const std::size_t stored = (point.host_bytes - impl.slot_bytes) / impl.page_set_bytes;
+            // Host pages are laid out per tensor for all `stored` pages; restore the first `pages`.
+            for (std::size_t tensor = 0; tensor < impl.config.global.size(); ++tensor) {
+                const PagedTensor& global = impl.config.global[tensor];
+                std::uint8_t* region = from + impl.slot_bytes + impl.global_offset[tensor] * stored;
+                for (std::size_t page = 0; page < pages; ++page) {
+                    check(cudaMemcpyAsync(
+                              global.base + static_cast<std::size_t>(live_pages[page]) *
+                                                global.page_bytes,
+                              region + page * global.page_bytes, global.page_bytes,
+                              cudaMemcpyHostToDevice, impl.config.stream),
+                          "page restore");
+                }
             }
         }
         ++impl.stats.host_hits;
@@ -450,6 +612,8 @@ std::int64_t PrefixStore::restore(const Match& match, std::vector<int>& live_pag
 
 PrefixStore::Stats PrefixStore::stats() const noexcept {
     Stats stats = impl_->stats;
+    stats.host_bytes_used = impl_->host_ranges.used();
+    stats.host_bytes_peak = impl_->host_ranges.peak();
     for (const Point& point : impl_->points) {
         if (point.slot >= 0) {
             ++stats.device_points;

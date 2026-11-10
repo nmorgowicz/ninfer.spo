@@ -76,6 +76,7 @@ void log_if_set(const RuntimeSwitches& switches) {
                        switches.expert_cpu_threads == 0 && switches.expert_adapt &&
                        switches.gemma4_attn_split_k && switches.gemma4_attn_segments == 0 &&
                        switches.routing_dump.empty() && !switches.gemma4_attn_raw_v &&
+                       !switches.gemma4_host_delta &&
                        !switches.gemma4_decode_attn_new && !env_present("NINFER_GEMMA4_DECODE_ATTN");
     if (quiet) { return; }
     std::fprintf(stderr, "ninfer switches:");
@@ -133,6 +134,7 @@ void log_if_set(const RuntimeSwitches& switches) {
     }
     if (switches.gemma4_attn_raw_v) { std::fprintf(stderr, " gemma4_attn_raw_v=1"); }
     std::fprintf(stderr, " gemma4_decode_attn=%s", switches.gemma4_decode_attn_new ? "new" : "old");
+    if (switches.gemma4_host_delta) { std::fprintf(stderr, " gemma4_host_delta=1"); }
     std::fprintf(stderr, "\n");
 }
 
@@ -187,6 +189,7 @@ RuntimeSwitches& mutable_switches() {
             out.gemma4_attn_segments = segments < 1 ? 0 : (segments > 32 ? 32 : segments);
         }
         out.gemma4_attn_raw_v = env_flag("NINFER_GEMMA4_ATTN_RAW_V");
+        out.gemma4_host_delta = env_flag("NINFER_GEMMA4_HOST_DELTA");
         const std::string decode_attn = env_string("NINFER_GEMMA4_DECODE_ATTN");
         if (decode_attn == "new" || decode_attn == "old") {
             out.gemma4_decode_attn_new = decode_attn == "new";
@@ -232,6 +235,7 @@ void apply_runtime_switch_flags(const RuntimeSwitchFlags& flags) {
     if (flags.gemma4_attn_split_k) { out.gemma4_attn_split_k = *flags.gemma4_attn_split_k; }
     if (flags.gemma4_attn_raw_v) { out.gemma4_attn_raw_v = *flags.gemma4_attn_raw_v; }
     if (flags.gemma4_decode_attn_new) { out.gemma4_decode_attn_new = *flags.gemma4_decode_attn_new; }
+    if (flags.gemma4_host_delta) { out.gemma4_host_delta = *flags.gemma4_host_delta; }
 }
 
 } // namespace ninfer
