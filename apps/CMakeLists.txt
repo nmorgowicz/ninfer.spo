@@ -19,3 +19,8 @@ add_executable(ninfer-spo-perplexity
 ninfer_internal_includes(ninfer-spo-perplexity)
 target_link_libraries(ninfer-spo-perplexity PRIVATE
   ninfer_engine ninfer_product_logging ninfer::json)
+
+# Offline calibration is opt-in; this target is not part of the default app build.
+add_executable(ninfer-spo-gemma4-calibrate EXCLUDE_FROM_ALL gemma4_calibrate.cu)
+ninfer_internal_includes(ninfer-spo-gemma4-calibrate)
+target_link_libraries(ninfer-spo-gemma4-calibrate PRIVATE ninfer_model_runtime ninfer::json)

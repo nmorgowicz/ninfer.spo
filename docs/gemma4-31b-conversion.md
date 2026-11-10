@@ -247,3 +247,89 @@ More cases are in the [technical reference](gemma4-31b-conversion-technical.md#8
 - [Technical reference](gemma4-31b-conversion-technical.md): all measured builds, paired intervals, caveats, the manual
   commands, how to reproduce the numbers, known limits.
 - [weight-conversion.md](weight-conversion.md): the general converter and the other Gemma 4 recipes.
+
+## Experimental calibrated NVFP4 A4-MLP (not a preset)
+
+This is a separate opt-in artifact experiment, **not** a change to the recommended GPTQ builds.
+Start with an existing **all-A16Only NVFP4** Gemma artifact, not a GPTQ-g256 artifact: activation
+ranges depend on the actual weights that produced them. The first measured absmax candidate failed
+the held-out quality gate below; this is not a recommended preset or a qualified speed improvement.
+
+Build the offline target explicitly in your existing configured CUDA build:
+
+```powershell
+cmake --build D:\AI\loaders\build-spo-splitk-cuda13.5 --config Release --target ninfer-spo-gemma4-calibrate -j 2
+```
+
+It is excluded from default builds. `gemma4_a4 collect` executes that GPU program; run it only
+when the GPU is free. It uses the existing GPTQ calibration-text parser (including recovery of
+the first chunk's omitted BOS), requires the artifact's exact tokenizer, and resets each row's
+causal positions. Collection is eager, BF16 KV/BF16 QK, without generation, prefix reuse, MTP or
+vision. The two boundaries in every layer are:
+
+- `text/layers/L/ffn_input`: the represented BF16 pre-FFN norm output, after the attention
+  residual. Gate and up consume the very same tensor, so packed gate/up receive identical
+  FP32 divisor bytes.
+- `text/layers/L/mlp/product`: the represented BF16 GEGLU product, before down projection.
+  Neither the gate/up outputs nor the post-FFN residual is a substitute.
+
+The native sink reduces actual absolute maxima on the GPU, refuses nonfinite values, and
+records width, token and call coverage. A zero/nonpositive maximum is rejected by the handoff;
+there is no invented scale fallback. The activation consumer computes
+`E4M3(divisor * block_absmax / 6)` and `E2M1(input * divisor / block_scale)`, then corrects
+the GEMM by `1/(weight_divisor * divisor)`. The handoff uses `FP32(448*6/absmax)`, matching
+the existing `gemma4_nvfp4_a4_mlp` override and the consumer's `/6` rule, not the weight
+encoder's `/4` versus `/6` error search. This is absmax calibration, not clipping/GPTQ.
+
+Example (paths are operator choices; keep all new evidence under a new campaign directory):
+
+```powershell
+python -m tools.convert.gemma4_a4 collect --artifact D:\experiments\mixed-a16.ninfer `
+  --collector D:\AI\loaders\build-spo-splitk-cuda13.5\apps\ninfer-spo-gemma4-calibrate.exe `
+  --text D:\calibration\templated-400x512.txt --tokenizer D:\models\my-31b-bf16\tokenizer.json `
+  --context 512 --rows 2 --out D:\experiments\a4-smoke
+# Repeat without --rows for the full corpus and with a NEW output directory.
+python -m tools.convert.gemma4_a4 candidate --artifact D:\experiments\mixed-a16.ninfer `
+  --receipt D:\experiments\a4-full\receipt.json --output D:\experiments\mixed-a4-mlp.ninfer
+```
+
+Use `--prefix-ids` for a different explicit prefix; the default is the existing Gemma GPTQ
+chat prefix. `--rows` selects an explicitly recorded leading-row smoke subset, never a hidden
+calibration shortcut. `tokens.json`, `statistics.json`, `collector.log`, `invocation.json` and
+`receipt.json` retain the exact input/coverage and source/binary/tokenizer/text hashes.
+Do not qualify a two-row smoke candidate as a 400-row candidate.
+
+`candidate` is a CPU-only, bounded `ArtifactWriter` copy of all original encoded objects:
+no model weights are decoded, recalibrated, or re-rounded. It checks the receipt against the
+source's full file hashes and native ID, and enables `AllowA4` **only** on NVFP4 text MLP uses.
+FP8-sensitive MLP layers stay A16; attention, vocabulary, MTP and vision remain unchanged.
+Logical widths, row slices, complete per-layer coverage and shared-parent input identity must
+agree. A new artifact ID and `.a4.json` receipt identify the candidate; no existing output or
+source is overwritten. The normal forward path has no collector, hence no collection buffers,
+copies, synchronizations or new runtime option. Host-observing taps explicitly reject CUDA
+graph capture rather than collecting only the graph's first execution.
+
+Before choosing this artifact, compare it and an A16 repeat against the same held-out full-
+vocabulary reference (identical corpus windows, prefix, KV/QK, context, stride and chunk).
+Declare a quality margin before inspecting results; inspect per-domain/tail KL, top-1 and NLL,
+then gate long-context retrieval/continuation and MTP separately. Only after quality should
+interleaved no-speculation and MTP serving runs measure fresh/cached-tail PP, TG and memory.
+Keep the source A16 artifact and deployed GPTQ model/launchers intact throughout.
+
+### First measured absmax result: rejected for rollout
+
+On one mixed-NVFP4 Gemma fine-tune/RTX5090, the collector completed both a2×512 smoke and
+400×512 real calibration, covering120 logical inputs. The encoded-copy candidate changed168 NVFP4
+MLP uses with112 shared/independent FP32 divisors; protected components and encoded weights were retained.
+The collector-only target built successfully and128 Python calibration/builder tests passed.
+The existing released serving/perplexity executables were not rebuilt or replaced.
+
+Matched held-out full-vocabulary comparison:47 windows/13,728 positions, FP8-row-A16 reference,
+FP8 KV/BF16 QK, context512/stride256/chunk128. A16 repeat was identical. Mean KL rose
+0.127818→0.165489 (ratio1.29473,95%CI[1.23124,1.35862]); delta NLL+0.019077nat/token,
+95%CI[0.007051,0.032367], approximately+1.93% PPL.
+This fails the predeclared upper-CI limits of1.01 KL ratio and+0.001nat/token NLL.
+No long-context/MTP/default promotion or performance qualification followed that failure.
+This rejects this absmax recipe, not all possible calibrated A4/clipping/Hessian-aware methods.
+Camp evidence: `a4-mlp-collector-20261109/{full400x512,quality-verdict.json,paired-a4-mlp.json}`.
+

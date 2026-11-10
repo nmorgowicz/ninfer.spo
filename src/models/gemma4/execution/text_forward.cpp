@@ -1,5 +1,6 @@
 #include "models/gemma4/execution/text_forward.h"
 
+#include "core/device.h"
 #include "models/gemma4/execution/projection.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gemma4_attention.h"
@@ -72,7 +73,8 @@ namespace {
 void layer_body(Tensor& x, Tensor& hidden_n, const Gemma4LayerWeights& weights,
                 const void* next_input_norm, const Tensor& positions,
                 const ops::Gemma4CacheView& cache, ops::Bf16GemmContext& gemm,
-                WorkspaceArena& workspace, cudaStream_t stream) {
+                WorkspaceArena& workspace, cudaStream_t stream,
+                Gemma4MlpInputSink* mlp_inputs = nullptr, std::size_t layer = 0) {
     const int tokens = x.ne[1];
     const int hidden = weights.hidden;
     const int dim    = weights.head_dim;
@@ -107,6 +109,9 @@ void layer_body(Tensor& x, Tensor& hidden_n, const Gemma4LayerWeights& weights,
                               &pre_ff_norm, weights.rms_eps, x, &hidden_n, stream);
 
     auto gate_up = workspace.alloc(DType::BF16, {2 * inter, tokens});
+    if (mlp_inputs != nullptr) {
+        mlp_inputs->observe(layer, Gemma4MlpInput::GateUp, hidden_n, stream);
+    }
     project(hidden_n, weights.gate_up, weights.gate_up_policy, gate_up, gemm, workspace, stream);
     const Tensor gate = gate_up.slice(0, 0, inter);
     const Tensor up   = gate_up.slice(0, inter, inter);
@@ -116,6 +121,9 @@ void layer_body(Tensor& x, Tensor& hidden_n, const Gemma4LayerWeights& weights,
     const DownA8 down_codes =
         fused_down ? prepare_down_a8(workspace, inter, tokens) : DownA8{};
     ops::geglu(gate, up, activated, stream, down_codes.codes, down_codes.scales);
+    if (mlp_inputs != nullptr) {
+        mlp_inputs->observe(layer, Gemma4MlpInput::Down, activated, stream);
+    }
     if (fused_down) {
         project_down_ready(activated, weights.down, weights.down_policy, projected, down_codes,
                            gemm, workspace, stream);
@@ -147,9 +155,17 @@ void gemma4_layers(const Tensor& ids, Tensor& hidden, const Gemma4Embedding& tok
                    std::span<const Gemma4LayerWeights> layers,
                    std::span<const Gemma4CacheLayer> caches, const Tensor& positions,
                    ops::Bf16GemmContext& gemm, WorkspaceArena& workspace, cudaStream_t stream,
-                   const Tensor* visual_embeddings, const Tensor* visual_indices) {
+                   const Tensor* visual_embeddings, const Tensor* visual_indices,
+                   Gemma4MlpInputSink* mlp_inputs) {
     if (layers.size() != caches.size()) {
         throw std::invalid_argument("gemma4_layers: one cache per layer");
+    }
+    if (mlp_inputs != nullptr) {
+        cudaStreamCaptureStatus status;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
+        if (status != cudaStreamCaptureStatusNone) {
+            throw std::invalid_argument("gemma4 calibration requires eager execution");
+        }
     }
     ops::embedding(ids, token_embedding.table, token_embedding.scale, hidden, stream);
     if (visual_embeddings != nullptr || visual_indices != nullptr) {
@@ -167,7 +183,7 @@ void gemma4_layers(const Tensor& ids, Tensor& hidden, const Gemma4Embedding& tok
         auto layer_scope = workspace.scope();
         const void* next = layer + 1 < layers.size() ? layers[layer + 1].input_norm : nullptr;
         layer_body(hidden, hidden_n, layers[layer], next, positions, caches[layer], gemm,
-                   workspace, stream);
+                   workspace, stream, mlp_inputs, layer);
     }
 }
 

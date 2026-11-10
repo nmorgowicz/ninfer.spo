@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Opt-in `tools.convert.gemma4_a4 collect|candidate` collects actual normalized gate/up and BF16
+  GEGLU-product inputs with the eager-only `ninfer-spo-gemma4-calibrate` target (excluded from
+  default builds). Receipts bind full A16-source artifact hashes, exact calibration/prefix,
+  tokenizer and collector identity. The CPU candidate handoff preserves encoded weights and
+  protected components, enables only calibrated NVFP4 MLP uses, and rejects identity/coverage/
+  packed-input mismatches and overwrites. No A4 quality/performance qualification or default
+  permission change is implied; commands and limitations are in `docs/gemma4-31b-conversion.md`.
+  Native2×512/400×512 collection and encoded-copy candidate loading were exercised on RTX5090;
+  128 calibration/builder tests passed. The first absmax A4-MLP candidate failed held-out quality
+  (KL+29.5%, PPL+1.93% versus its A16 source; identical A16 repeat), so it stays unqualified/off.
+
 - Gemma launcher generation now defaults to one MTP draft instead of engine `auto` (six for Gemma).
   The `launcher --draft-tokens auto|1..7` option preserves explicit overrides; `--no-mtp` still omits speculation.
 

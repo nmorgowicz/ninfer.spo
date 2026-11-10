@@ -66,6 +66,17 @@ struct Gemma4Embedding {
 
 using Gemma4CacheLayer = ops::Gemma4CacheView;
 
+enum class Gemma4MlpInput { GateUp, Down };
+
+// Explicit eager-only calibration tap. The borrowed BF16 logical input is valid only during
+// observe(); a sink must finish any host read before returning. Never attach to graph capture.
+// Gate and up share one input and therefore one calibrated divisor even when packed together.
+struct Gemma4MlpInputSink {
+    virtual ~Gemma4MlpInputSink() = default;
+    virtual void observe(std::size_t layer, Gemma4MlpInput input, const Tensor& value,
+                         cudaStream_t stream) = 0;
+};
+
 // Embed ids into `hidden` [hidden,T] and run every layer, appending K/V at `positions`.
 // visual_embeddings [hidden,V] and visual_indices [V] overwrite those columns after embed.
 void gemma4_layers(const Tensor& ids, Tensor& hidden, const Gemma4Embedding& token_embedding,
@@ -73,7 +84,8 @@ void gemma4_layers(const Tensor& ids, Tensor& hidden, const Gemma4Embedding& tok
                    std::span<const Gemma4CacheLayer> caches, const Tensor& positions,
                    ops::Bf16GemmContext& gemm, WorkspaceArena& workspace, cudaStream_t stream,
                    const Tensor* visual_embeddings = nullptr,
-                   const Tensor* visual_indices    = nullptr);
+                   const Tensor* visual_indices    = nullptr,
+                   Gemma4MlpInputSink* mlp_inputs   = nullptr);
 
 // Final norm, output head, and logit softcap for the columns of `hidden` [hidden,C] into
 // `logits` [vocab,C]. `hidden` is not modified.
