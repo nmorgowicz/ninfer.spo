@@ -333,3 +333,29 @@ No long-context/MTP/default promotion or performance qualification followed that
 This rejects this absmax recipe, not all possible calibrated A4/clipping/Hessian-aware methods.
 Camp evidence: `a4-mlp-collector-20261109/{full400x512,quality-verdict.json,paired-a4-mlp.json}`.
 
+## Follow-on scheduling investigation: no bake-overlap rollout
+
+A temporary Program-owned two-slot Q4 bake pipeline passed four targeted CTests, including
+bitwise original/prepared projection outputs, reuse/cancellation/destruction and memory budgeting.
+It was then measured on the same fixed-path candidate EXE in off/on/off/on order, FP8 KV/BF16 QK,
+explicit chunk2048, no speculation:32 successful fresh requests, two sessions per arm and three
+timed requests after warmup at each context, with identical prompt hashes and token counts.
+
+| Context | Off prompt tok/s | On prompt tok/s | Change |
+|---|---:|---:|---:|
+| ~32k | 3865.51 | 3856.88 | -0.22% |
+| ~100k | 1984.40 | 1983.10 | -0.07% |
+
+Those small deltas do not establish a regression, but show no useful gain for the additional
+462,594,048 device bytes (441.16MiB). Both arms retained131072 native KV; startup runtime
+allocation increased8.96→9.39GiB. The implementation, switch and experimental tests were removed;
+there is no bake-overlap setting to enable. No full-model quality or MTP/cached-tail rollout
+qualification followed the failed performance gate.
+
+The three fixed-path EXEs were restored byte-identically to release16ff8fc. Actual d1 HTTP chat
+returned40 tokens with24 drafts/15 accepted, default shared-KV attention and131072 native KV.
+Source weights and existing launchers were unchanged. Evidence in the workstation camp:
+`pp-bench-20261108/owner-bake-20261109/{candidate.patch,tests.log,serving-summary.json,decision.json,restored-release-smoke.json}`.
+Cell-boundary clock/throttle snapshots are not continuous monitoring. This rejects this design
+on this workload/GPU, not every possible overlap design.
+

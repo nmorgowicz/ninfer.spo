@@ -12,6 +12,12 @@
   Native2×512/400×512 collection and encoded-copy candidate loading were exercised on RTX5090;
   128 calibration/builder tests passed. The first absmax A4-MLP candidate failed held-out quality
   (KL+29.5%, PPL+1.93% versus its A16 source; identical A16 repeat), so it stays unqualified/off.
+  Independent collector/consumer/real-receipt review found no actionable defects in the supported workflow.
+
+- Performance investigation only: an owned two-slot Q4 bake-overlap candidate passed four targeted
+  CTests but showed no useful serving gain in off/on/off/on runs at32k/100k, while adding441MiB.
+  The implementation and switch were removed, and the fixed-path16ff8fc release EXEs restored
+  byte-identically and exercised with d1 chat. No new runtime option/default or launcher change.
 
 - Gemma launcher generation now defaults to one MTP draft instead of engine `auto` (six for Gemma).
   The `launcher --draft-tokens auto|1..7` option preserves explicit overrides; `--no-mtp` still omits speculation.
