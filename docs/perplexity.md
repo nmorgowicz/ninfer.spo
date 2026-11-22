@@ -30,6 +30,11 @@ ninfer-spo-perplexity <artifact> \
   --kv-dtype int8
 ```
 
+`--score-window-tail N` (default 0 = every target) keeps each window's input and context exactly as
+planned but scores only the last `N` targets of that window (all of them when a window has fewer).
+It is a distinct protocol: the KL reference cache records `score_window_tail`, so a tail cache and a
+full-window run refuse each other, and positions are counted after trimming.
+
 Run `ninfer-spo-perplexity --help` for the complete command surface. `<artifact>` is a text artifact from the [README](../README.md). The evaluator loads
 the model once, reads and tokenizes every selected stream before scoring, and writes readable
 startup, corpus, scoring, and per-stream summaries to stderr. Interactive weight loading and
@@ -129,8 +134,8 @@ are mutually exclusive and cannot be combined with `--dump-topk`.
    signed values.
 
 The cache header binds a **protocol**: corpus id and mode, per-stream ids/domains/token counts, an FNV-64
-hash of every token and window boundary, context, stride, prefix ids, KV dtype, resolved Gemma QK mode,
-scored-position count and vocab. A candidate run with any difference is refused with the differing field
+hash of every token and window boundary (after any `--score-window-tail` trimming), context, stride, prefix ids,
+KV dtype, resolved Gemma QK mode, `score_window_tail` when non-zero, scored-position count and vocab. A candidate run with any difference is refused with the differing field
 named; a truncated, never-finished or foreign file is refused. A filename is not identity. The
 reference artifact's path, file size, formats and prefill signature are stored as informational provenance
 and copied into candidate reports (`kl.reference_artifact`); hash the artifact separately for a published

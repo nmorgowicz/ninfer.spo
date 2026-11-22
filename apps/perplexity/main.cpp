@@ -55,6 +55,7 @@ struct Options {
     std::vector<ninfer::TokenId> prefix;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
+    std::uint32_t score_tail            = 0;
     int device                          = 0;
     ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
     ninfer::ops::Gemma4QkMode gemma4_qk = ninfer::ops::Gemma4QkMode::BFloat16;
@@ -72,6 +73,7 @@ std::string usage_text() {
     return "usage: ninfer-spo-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--prefill-chunk N] [--headroom-mib N] [--device N]\n"
+           "       [--score-window-tail N] (last N targets per unchanged window; 0 scores all)\n"
            "       [--gemma4-qk bf16|fp8] (default bf16)\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
            "       [--dump-topk <file>] [--prefix-ids <id,id,...>]\n"
@@ -119,6 +121,8 @@ Options parse_options(int argc, char** argv) {
             out.context = parse_integer<std::uint32_t>(value("--context"), "context");
         } else if (option == "--stride") {
             out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
+        } else if (option == "--score-window-tail") {
+            out.score_tail = parse_integer<std::uint32_t>(value("--score-window-tail"), "score-window-tail");
         } else if (option == "--prefill-chunk") {
             out.prefill_chunk = parse_integer<std::uint32_t>(value("--prefill-chunk"), "prefill chunk");
             if (out.prefill_chunk < 16) { usage_error("--prefill-chunk must be at least 16"); }
@@ -333,6 +337,7 @@ public:
                      {"kv_dtype", kv_name(options.kv)},
                      {"gemma4_qk", ninfer::gemma4_qk_name(engine.gemma4_qk)},
                      {"positions", total_positions}};
+        if (options.score_tail != 0) { protocol_["score_window_tail"] = options.score_tail; }
         std::error_code size_error;
         const auto bytes = std::filesystem::file_size(options.artifact, size_error);
         reference_ = {{"artifact",
@@ -541,10 +546,12 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         if (tokens.size() < 2) {
             throw std::runtime_error("stream tokenized to fewer than two tokens: " + source.id);
         }
-        std::vector<WindowPlan> windows =
-            ninfer::perplexity::plan_windows(tokens.size(), options.context, options.stride);
+        std::vector<WindowPlan> windows = ninfer::perplexity::plan_windows(
+            tokens.size(), options.context, options.stride, options.score_tail);
+        for (const WindowPlan& window : windows) {
+            total_scored_tokens += static_cast<std::uint64_t>(window.target_end - window.target_begin);
+        }
         total_input_tokens += static_cast<std::uint64_t>(tokens.size());
-        total_scored_tokens += static_cast<std::uint64_t>(tokens.size() - 1);
         total_windows += static_cast<std::uint64_t>(windows.size());
         streams.push_back(EvaluationStream{.source  = std::move(source),
                                            .tokens  = std::move(tokens),
@@ -672,7 +679,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         stream_report["domain"]          = stream.source.domain;
         stream_report["path"]            = stream.source.path.string();
         stream_report["input_tokens"]    = stream.tokens.size();
-        stream_report["unscored_tokens"] = 1;
+        stream_report["unscored_tokens"] = stream.tokens.size() - stream_score.scored_tokens;
         stream_report["seconds"]         = stream_seconds;
         stream_report["windows"]         = std::move(window_reports);
         stream_reports.push_back(std::move(stream_report));
@@ -713,6 +720,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"context_tokens", options.context},
           {"stride_tokens", options.stride},
           {"prefix_ids", options.prefix},
+          {"score_window_tail", options.score_tail},
           {"prefill_chunk_tokens", options.prefill_chunk},
           {"score_tile_tokens", 1024},
           {"gemma4_qk_requested", ninfer::gemma4_qk_name(options.gemma4_qk)},

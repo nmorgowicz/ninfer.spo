@@ -61,6 +61,30 @@ int main() {
                             "window boundaries match the protocol");
     }
 
+    // --score-window-tail keeps each window's input and scores only its last N targets.
+    const auto tailed = ninfer::perplexity::plan_windows(10, 6, 2, 3);
+    failures += require(tailed.size() == expected.size(), "tail keeps the window count");
+    const std::array<ninfer::perplexity::WindowPlan, 3> expected_tail{{
+        {.input_begin = 0, .input_end = 6, .target_begin = 3, .target_end = 6, .first_target = 3},
+        {.input_begin = 2, .input_end = 8, .target_begin = 6, .target_end = 8, .first_target = 4},
+        {.input_begin = 4, .input_end = 10, .target_begin = 8, .target_end = 10, .first_target = 4},
+    }};
+    for (std::size_t index = 0; index < std::min(tailed.size(), expected_tail.size()); ++index) {
+        const auto& actual = tailed[index];
+        const auto& wanted = expected_tail[index];
+        failures += require(actual.input_begin == wanted.input_begin &&
+                                actual.input_end == wanted.input_end &&
+                                actual.target_begin == wanted.target_begin &&
+                                actual.target_end == wanted.target_end &&
+                                actual.first_target == wanted.first_target,
+                            "tail windows keep input and trim only the target prefix");
+    }
+    const auto one_window = ninfer::perplexity::plan_windows(65536, 65536, 65535, 1024);
+    failures += require(one_window.size() == 1 && one_window[0].target_begin == 64512 &&
+                            one_window[0].target_end == 65536 &&
+                            one_window[0].first_target == 64512,
+                        "last-1024 of one 65536-token window");
+
     const std::vector<float> first{-1.0F, -2.0F};
     const std::vector<float> second{-3.0F};
     ninfer::perplexity::ScoreAggregate a;
