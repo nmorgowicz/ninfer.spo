@@ -103,3 +103,70 @@ def test_streamed_nvfp4_conversion_rereads_the_same_values(tmp_path) -> None:
     expected = quantize_nvfp4_rows(source.float(), divisor, device="cpu")
     assert torch.equal(codes, expected.codes)
     assert torch.equal(scales, expected.scales)
+
+
+def test_exhaustive_search_never_loses_to_mse46_and_importance_one_is_unweighted() -> None:
+    from tools.convert.quantization.nvfp4 import quantize_nvfp4_rows_search
+
+    for name, values in matrices().items():
+        host = values.double().numpy()
+        divisor = nvfp4_divisor(float(values.abs().max()))
+        best = quantize_nvfp4_rows(values, divisor, mse_46=True, device="cpu")
+        every = quantize_nvfp4_rows_search(values, divisor, device="cpu")
+        ones = quantize_nvfp4_rows_search(values, divisor, importance=torch.ones(values.shape[1]), device="cpu")
+        assert torch.equal(every.codes, ones.codes) and torch.equal(every.scales, ones.scales), name
+        blocks = host.reshape(host.shape[0], -1, 16)
+        old = decode(best.codes, best.scales, divisor, values.shape[1]).reshape(blocks.shape)
+        new = decode(every.codes, every.scales, divisor, values.shape[1]).reshape(blocks.shape)
+        assert (((new - blocks) ** 2).sum(-1) <= ((old - blocks) ** 2).sum(-1) + 1e-18).all(), name
+
+
+def test_weighted_search_follows_the_weights_and_zero_blocks_store_word_zero() -> None:
+    from tools.convert.quantization.nvfp4 import quantize_nvfp4_rows_search
+
+    row = torch.zeros(2, 32)
+    row[0, :16] = torch.tensor([0.9, 0.31, -0.22, 0.05, 0.4, -0.7, 0.18, 0.61, -0.33, 0.27, 0.12, -0.5, 0.44, -0.08, 0.2, 0.36])
+    divisor = nvfp4_divisor(1.0)
+    plain = quantize_nvfp4_rows_search(row, divisor, device="cpu")
+    weights = torch.full((32,), 1e-6)
+    weights[2] = 1.0
+    focus = quantize_nvfp4_rows_search(row, divisor, importance=weights, device="cpu")
+    assert plain.scales[1].tolist() == [0, 0] and focus.scales[1].tolist() == [0, 0]
+    assert plain.scales[0, 0].item() != 0 and plain.scales[0, 1].item() == 0
+
+    def weighted_error(encoded):
+        decoded = decode(encoded.codes, encoded.scales, divisor, 32)[0, :16]
+        return float(((decoded - row[0, :16].double().numpy()) ** 2 * weights[:16].double().numpy()).sum())
+
+    assert weighted_error(focus) <= weighted_error(plain)
+
+
+def test_streamed_exhaustive_conversion_matches_the_encoder(tmp_path) -> None:
+    from tools.convert.quantization.nvfp4 import quantize_nvfp4_rows_search
+
+    name = "model.layers.0.mlp.down_proj.weight"
+    source = matrices()["outliers"].to(torch.bfloat16)
+    shard = "model.safetensors"
+    save_file({name: source}, tmp_path / shard)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: shard}}), encoding="utf-8"
+    )
+    (tmp_path / "config.json").write_text("{}")
+    model = Model({"text": {"config": {}}})
+    shape = tuple(source.shape)
+    with SafetensorsSource(tmp_path) as reader:
+        model.add(
+            Parameter("down", shape, tensor_source(reader, name, shape), inputs=("input",))
+        )
+        recipe = Recipe(model)
+        recipe.assign("down", format="nvfp4", method="nvfp4_mse_all")
+        path = tmp_path / "down.ninfer"
+        convert(model, recipe, path, device="cpu", rows_per_chunk=128)
+    with Artifact(path) as artifact:
+        object_id = artifact.directory.bindings["down"]["object"]
+        codes, scales, stored = decode_nvfp4_words(artifact.read_object(object_id), shape)
+    divisor = float(stored)
+    assert divisor == nvfp4_divisor(float(source.float().abs().max()))
+    expected = quantize_nvfp4_rows_search(source.float(), divisor, device="cpu")
+    assert torch.equal(codes, expected.codes)
+    assert torch.equal(scales, expected.scales)

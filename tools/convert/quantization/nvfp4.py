@@ -84,3 +84,66 @@ def quantize_nvfp4_rows(
     packed = flat[:, 0::2] | (flat[:, 1::2] << 4)
     scales = best_words.reshape(n, k // BLOCK)
     return Nvfp4Rows(packed.cpu().contiguous(), scales.cpu().contiguous())
+
+
+_SEARCH_WORDS = torch.arange(1, 0x7F, dtype=torch.uint8)  # all 126 positive finite E4M3FN words
+
+
+def quantize_nvfp4_rows_search(
+    values: torch.Tensor,
+    divisor: float,
+    *,
+    importance: torch.Tensor | None = None,
+    device: str = "cuda",
+    candidate_chunk: int = 18,
+    cap_elements: int = 48_000_000,
+) -> Nvfp4Rows:
+    """Choose each 16-element block's E4M3 scale by exhaustive search over every positive finite word.
+
+    The block error is the (importance-weighted) squared reconstruction error at the given ``divisor``;
+    ``importance`` is one non-negative weight per input column (``None`` means every weight is 1). The lowest
+    word wins ties and an all-zero block stores word 0. E2M1 rounding (midpoint ties toward the smaller code)
+    and the divisor policy are those of ``quantize_nvfp4_rows``; only the scale choice differs from it.
+    """
+    if values.dim() != 2 or values.shape[1] % BLOCK:
+        raise ValueError("NVFP4 rows must be [N, K] with K divisible by 16")
+    n, k = values.shape
+    groups = k // BLOCK
+    blocks = values.to(device=device, dtype=torch.float32).reshape(n, groups, BLOCK)
+    if not bool(torch.isfinite(blocks).all()):
+        raise ValueError("NVFP4 source contains NaN or infinity")
+    weights = None
+    if importance is not None:
+        if tuple(importance.shape) != (k,) or not bool(torch.isfinite(importance).all()) or bool((importance < 0).any()):
+            raise ValueError("importance must be one finite non-negative weight per column")
+        weights = importance.to(device=device, dtype=torch.float32).reshape(1, groups, 1, BLOCK)
+    words = _SEARCH_WORDS.to(device)
+    scales = words.view(torch.float8_e4m3fn).float()
+    block_max = blocks.abs().amax(-1)
+    best_words = torch.zeros((n, groups), dtype=torch.uint8, device=device)
+    per_chunk = max(1, cap_elements // (groups * BLOCK * candidate_chunk))
+    for r0 in range(0, n, per_chunk):
+        sub = blocks[r0 : r0 + per_chunk].unsqueeze(-2)  # [r, G, 1, 16]
+        best_error = torch.full(sub.shape[:2], float("inf"), device=device)
+        best = torch.zeros(sub.shape[:2], dtype=torch.uint8, device=device)
+        for c0 in range(0, words.numel(), candidate_chunk):
+            scale = scales[c0 : c0 + candidate_chunk].reshape(1, 1, -1, 1)
+            codes = _codes(sub * divisor / scale)
+            residual = (_decode(codes, scale, divisor) - sub).square()
+            if weights is not None:
+                residual = residual * weights
+            error, which = residual.sum(-1).min(-1)
+            take = error < best_error
+            best = torch.where(take, words[c0 : c0 + candidate_chunk][which], best)
+            best_error = torch.where(take, error, best_error)
+        best_words[r0 : r0 + per_chunk] = torch.where(
+            block_max[r0 : r0 + per_chunk] > 0, best, torch.zeros_like(best)
+        )
+    scale = best_words.view(torch.float8_e4m3fn).float().unsqueeze(-1)
+    safe = torch.where(scale > 0, scale, torch.ones_like(scale))
+    codes = torch.where(
+        scale > 0, _codes(blocks * divisor / safe), torch.zeros_like(blocks, dtype=torch.uint8)
+    )
+    flat = codes.reshape(n, k)
+    packed = flat[:, 0::2] | (flat[:, 1::2] << 4)
+    return Nvfp4Rows(packed.cpu().contiguous(), best_words.cpu().contiguous())

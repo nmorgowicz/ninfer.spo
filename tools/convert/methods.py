@@ -35,7 +35,7 @@ from .quantization.groupwise import (
     to_native_scale6,
 )
 from .quantization.importance import importance_for
-from .quantization.nvfp4 import nvfp4_divisor, quantize_nvfp4_rows
+from .quantization.nvfp4 import nvfp4_divisor, quantize_nvfp4_rows, quantize_nvfp4_rows_search
 from .sources.logical import EncodedRows, LogicalSource
 
 UseKey = tuple[str, str]
@@ -406,7 +406,9 @@ def _a4_overrides(request: PrepareRequest) -> dict[AuxiliaryKey, AuxiliaryValue]
     return auxiliaries
 
 
-def _nvfp4_quantized(request: PrepareRequest, mse_46: bool) -> PreparedMethod:
+def _nvfp4_quantized(
+    request: PrepareRequest, mse_46: bool, *, exhaustive: bool = False, weighted: bool = False
+) -> PreparedMethod:
     if request.target.format != "nvfp4" or len(request.target.shape) != 2:
         raise ValueError("NVFP4 quantization requires the nvfp4 matrix format")
     _preflight(request)
@@ -414,6 +416,9 @@ def _nvfp4_quantized(request: PrepareRequest, mse_46: bool) -> PreparedMethod:
     if k % 16:
         raise ValueError(f"{request.target.id}: NVFP4 K must be divisible by 16")
     auxiliaries = _a4_overrides(request)
+    importance = (
+        importance_for(tuple(item.parameter for item in request.inputs), k) if weighted else None
+    )
     chunk = max(128, request.rows_per_chunk // 128 * 128)
 
     def rows(begin: int) -> torch.Tensor:
@@ -427,9 +432,14 @@ def _nvfp4_quantized(request: PrepareRequest, mse_46: bool) -> PreparedMethod:
         divisor = nvfp4_divisor(amax)
         word = struct.pack("<f", divisor)
         for begin in range(0, n, chunk):
-            encoded = quantize_nvfp4_rows(
-                rows(begin), divisor, mse_46=mse_46, device=request.device
-            )
+            if exhaustive:
+                encoded = quantize_nvfp4_rows_search(
+                    rows(begin), divisor, importance=importance, device=request.device
+                )
+            else:
+                encoded = quantize_nvfp4_rows(
+                    rows(begin), divisor, mse_46=mse_46, device=request.device
+                )
             output.write_codes(begin, encoded.codes, encoded.scales, word)
 
     return request.job(produce=produce, auxiliaries=auxiliaries)
@@ -443,6 +453,16 @@ def nvfp4_mse46(request: PrepareRequest) -> PreparedMethod:
 def nvfp4_absmax(request: PrepareRequest) -> PreparedMethod:
     """NVFP4 with one tensor divisor and block scale block_max/6."""
     return _nvfp4_quantized(request, False)
+
+
+def nvfp4_mse_all(request: PrepareRequest) -> PreparedMethod:
+    """NVFP4 with one tensor divisor; each block keeps the E4M3 word of lowest squared error over all 126."""
+    return _nvfp4_quantized(request, True, exhaustive=True)
+
+
+def nvfp4_wgt_all(request: PrepareRequest) -> PreparedMethod:
+    """Like nvfp4_mse_all, with each column's error weighted by the imatrix importance registered for the inputs."""
+    return _nvfp4_quantized(request, True, exhaustive=True, weighted=True)
 
 
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
@@ -506,5 +526,7 @@ METHODS: dict[str, Method] = {
     "fp8_row_maxabs": fp8_row_maxabs,
     "nvfp4_mse46": nvfp4_mse46,
     "nvfp4_absmax": nvfp4_absmax,
+    "nvfp4_mse_all": nvfp4_mse_all,
+    "nvfp4_wgt_all": nvfp4_wgt_all,
     "import_encoded": import_encoded,
 }
