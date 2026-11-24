@@ -170,3 +170,57 @@ def test_streamed_exhaustive_conversion_matches_the_encoder(tmp_path) -> None:
     expected = quantize_nvfp4_rows_search(source.float(), divisor, device="cpu")
     assert torch.equal(codes, expected.codes)
     assert torch.equal(scales, expected.scales)
+
+
+def _precomputed_model(tmp_path, source, words_path):
+    from tools.convert.quantization.nvfp4_words import set_words
+
+    name = "model.layers.0.mlp.down_proj.weight"
+    shard = "model.safetensors"
+    save_file({name: source}, tmp_path / shard)
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {name: shard}}), encoding="utf-8")
+    (tmp_path / "config.json").write_text("{}")
+    set_words({"down": words_path})
+    model = Model({"text": {"config": {}}})
+    shape = tuple(source.shape)
+    reader = SafetensorsSource(tmp_path)
+    reader.__enter__()
+    model.add(Parameter("down", shape, tensor_source(reader, name, shape), inputs=("input",)))
+    recipe = Recipe(model)
+    recipe.assign("down", format="nvfp4", method="nvfp4_precomputed")
+    return model, recipe, reader, shape
+
+
+def test_precomputed_words_are_stored_verbatim_and_a_wrong_order_is_refused(tmp_path) -> None:
+    import pytest
+
+    source = matrices()["gaussian"].to(torch.bfloat16)
+    divisor = nvfp4_divisor(float(source.float().abs().max()))
+    encoded = quantize_nvfp4_rows(source.float(), divisor, device="cpu")
+    good = tmp_path / "good.safetensors"
+    save_file({"down.codes": encoded.codes, "down.scales": encoded.scales,
+               "down.divisor": torch.tensor([divisor], dtype=torch.float32)}, good)
+    model, recipe, reader, shape = _precomputed_model(tmp_path, source, good)
+    try:
+        path = tmp_path / "down.ninfer"
+        convert(model, recipe, path, device="cpu", rows_per_chunk=128)
+    finally:
+        reader.__exit__(None, None, None)
+    with Artifact(path) as artifact:
+        object_id = artifact.directory.bindings["down"]["object"]
+        codes, scales, stored = decode_nvfp4_words(artifact.read_object(object_id), shape)
+    assert float(stored) == divisor
+    assert torch.equal(codes, encoded.codes) and torch.equal(scales, encoded.scales)
+
+    shuffled = tmp_path / "shuffled.safetensors"
+    perm = torch.randperm(shape[0], generator=torch.Generator().manual_seed(3))
+    save_file({"down.codes": encoded.codes[perm].contiguous(), "down.scales": encoded.scales[perm].contiguous(),
+               "down.divisor": torch.tensor([divisor], dtype=torch.float32)}, shuffled)
+    other = tmp_path / "other"
+    other.mkdir()
+    model, recipe, reader, shape = _precomputed_model(other, source, shuffled)
+    try:
+        with pytest.raises(ValueError, match="do not describe"):
+            convert(model, recipe, other / "down.ninfer", device="cpu", rows_per_chunk=128)
+    finally:
+        reader.__exit__(None, None, None)

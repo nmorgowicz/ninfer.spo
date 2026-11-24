@@ -36,6 +36,7 @@ from .quantization.groupwise import (
 )
 from .quantization.importance import importance_for
 from .quantization.nvfp4 import nvfp4_divisor, quantize_nvfp4_rows, quantize_nvfp4_rows_search
+from .quantization.nvfp4_words import decode_packed, read_divisor, read_words
 from .sources.logical import EncodedRows, LogicalSource
 
 UseKey = tuple[str, str]
@@ -465,6 +466,56 @@ def nvfp4_wgt_all(request: PrepareRequest) -> PreparedMethod:
     return _nvfp4_quantized(request, True, exhaustive=True, weighted=True)
 
 
+def nvfp4_precomputed(request: PrepareRequest) -> PreparedMethod:
+    """Store externally solved NVFP4 words (see quantization/nvfp4_words.py) after proving they decode to this matrix.
+
+    Every logical input of the packed parent must have registered words and one common divisor; each chunk of rows is
+    decoded and compared with the logical source values (relative squared error must stay below 0.25, which no genuine FP4
+    solution of the same matrix approaches but a wrong row/column order always exceeds).
+    """
+    if request.target.format != "nvfp4" or len(request.target.shape) != 2:
+        raise ValueError("nvfp4_precomputed requires the nvfp4 matrix format")
+    _preflight(request)
+    n, k = request.target.shape
+    if k % 16:
+        raise ValueError(f"{request.target.id}: NVFP4 K must be divisible by 16")
+    auxiliaries = _a4_overrides(request)
+    spans, cursor = [], 0
+    for item in request.inputs:
+        rows = item.source.shape[0]
+        spans.append((item.parameter, cursor, cursor + rows))
+        cursor += rows
+    if cursor != n:
+        raise ValueError(f"{request.target.id}: logical inputs cover {cursor} rows, parent has {n}")
+    divisors = {read_divisor(parameter) for parameter, _, _ in spans}
+    if len(divisors) != 1:
+        raise ValueError(f"{request.target.id}: pre-solved divisors differ inside one packed parent")
+    word = divisors.pop()
+    divisor = struct.unpack("<f", word)[0]
+    chunk = max(128, request.rows_per_chunk // 128 * 128)
+
+    def produce(output):
+        for begin in range(0, n, chunk):
+            end = min(n, begin + chunk)
+            pieces = [
+                read_words(parameter, max(begin, low) - low, min(end, high) - low, k)
+                for parameter, low, high in spans
+                if max(begin, low) < min(end, high)
+            ]
+            codes = torch.cat([c for c, _ in pieces])
+            scales = torch.cat([s for _, s in pieces])
+            values = request.values(begin * k, end * k).reshape(end - begin, k).to(request.device).float()
+            decoded = decode_packed(codes.to(request.device), scales.to(request.device), divisor)
+            relative = float((decoded - values).square().sum() / values.square().sum().clamp_min(1e-30))
+            if not relative < 0.25:
+                raise ValueError(
+                    f"{request.target.id}: pre-solved words do not describe rows [{begin},{end}) (relative error {relative:.3f})"
+                )
+            output.write_codes(begin, codes, scales, word)
+
+    return request.job(produce=produce, auxiliaries=auxiliaries)
+
+
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
     """Preserve the current FP8/NVFP4/q4 source codes, scales and weight divisor."""
     if (
@@ -528,5 +579,6 @@ METHODS: dict[str, Method] = {
     "nvfp4_absmax": nvfp4_absmax,
     "nvfp4_mse_all": nvfp4_mse_all,
     "nvfp4_wgt_all": nvfp4_wgt_all,
+    "nvfp4_precomputed": nvfp4_precomputed,
     "import_encoded": import_encoded,
 }
