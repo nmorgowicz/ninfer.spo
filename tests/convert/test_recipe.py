@@ -277,3 +277,18 @@ def test_private_component_storage_cannot_be_packed_with_target_weights():
     prepared = shared.prepare(device="cpu")
     assert len(prepared.weights) == 1
     assert prepared.bindings["draft"] == prepared.bindings["target"]
+
+
+@pytest.mark.parametrize("name", ["nvfp4_mse46", "nvfp4_mse_all"])
+def test_nvfp4_search_methods_pack_fused_parents_like_the_base_method(name):
+    from tools.convert import methods
+
+    model = Model({"text": {"config": {}}})
+    generator = torch.Generator().manual_seed(7)
+    for name_ in ("gate", "up"):
+        values = torch.randn(128, 128, generator=generator).to(torch.bfloat16)
+        model.add(Parameter(name_, (128, 128), array_source(values, name_), inputs=("input",)))
+    model.packing_groups = [("gate", "up")]
+    recipe = Recipe(model)
+    recipe.assign("*", format="nvfp4", method=getattr(methods, name))
+    assert len(recipe.prepare(device="cpu", rows_per_chunk=128).weights) == 1

@@ -26,6 +26,9 @@ from .methods import (
     q4_g32_qat,
     nvfp4_absmax,
     nvfp4_mse46,
+    nvfp4_mse_all,
+    nvfp4_precomputed,
+    nvfp4_wgt_all,
 )
 from .model import Model
 from .sources.logical import LogicalSource, select_rows
@@ -394,6 +397,9 @@ class Recipe:
             q4_g32_qat,
             nvfp4_mse46,
             nvfp4_absmax,
+            nvfp4_mse_all,
+            nvfp4_wgt_all,
+            nvfp4_precomputed,
         )
         for names in self.model.packing_groups:
             if any(
